@@ -7,6 +7,8 @@
 
 set -euo pipefail
 
+exec > >(tee -a output.log) 2>&1
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 timestamp="$(date +%Y%m%d_%H%M%S)"
 
@@ -46,12 +48,20 @@ torchrun_cmd="$(resolve_cmd torchrun "${repo_root}/.venv/bin/torchrun")"
 
 rwkv7_path="/mnt/raid0_8t/rwkv7-g1/rwkv7-g1d-0.4b-20260210-ctx8192.pth"
 vision_model="/home/rwkv/models/Qwen3.5-0.8B"
-dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/iconqa(cauldron,llava_format)"
+dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/chartqa(cauldron,llava_format)"
 
 split="train"
-ngpu="2"
+ngpu="4"
 seq_len="4096"
-batch_size="8"
+batch_size="32"
+# Sequence packing is controlled by the multimodal dataloader, not by CP.
+# packing_buffer_size is the number of tokenized samples kept in a CPU-side
+# buffer before greedily combining them into seq_len rows. Larger values usually
+# improve non-padding token occupancy, but increase preprocessing latency and
+# host memory use. Set to "0" to disable packing and pad each sample normally.
+# This is not batch size; batch_size still controls the number of packed rows
+# per step/CP group.
+packing_buffer_size="64"
 # Set to an integer for a fixed-step run, or "epoch" to run until the finite
 # dataloader is exhausted. With sequence packing, exact epoch steps are not known
 # until samples are filtered, resized, tokenized, and packed.
@@ -82,7 +92,10 @@ lr_min_factor="0.1"
 image_processor=""
 min_pixels="65536"
 max_pixels="2097152"
-max_images_per_batch=""
+# 0 means no image-count cap. max_pixels is a shared per-sample pixel budget
+# across all images in one chat example; set a positive image cap only as an
+# emergency batch-memory guard.
+max_images_per_batch="0"
 max_position_embeddings=""
 max_shard_size="1000GB"
 output_root="${repo_root}/outputs/rwkv_vl_train_${timestamp}"
@@ -127,6 +140,11 @@ fi
 
 if ! [[ "${seq_len}" =~ ^[0-9]+$ ]] || (( seq_len < 1 )); then
     echo "seq_len must be a positive integer, got: ${seq_len}" >&2
+    exit 2
+fi
+
+if ! [[ "${packing_buffer_size}" =~ ^[0-9]+$ ]]; then
+    echo "packing_buffer_size must be a non-negative integer, got: ${packing_buffer_size}" >&2
     exit 2
 fi
 
@@ -226,6 +244,7 @@ train_args=(
     --training.seq-len "${seq_len}"
     --training.steps "${training_steps}"
     --training.local-batch-size "${batch_size}"
+    --dataloader.packing-buffer-size "${packing_buffer_size}"
     --activation-checkpoint.mode "${activation_checkpoint_mode}"
     --checkpoint.enable
     --checkpoint.initial-load-path "${dcp_dir}"
@@ -284,6 +303,7 @@ if [[ ! -d "${trained_dcp_dir}" ]]; then
     echo "Training may have ended before a checkpoint was saved. Check ${train_dump_dir}." >&2
     exit 1
 fi
+echo "Using trained DCP checkpoint: ${trained_dcp_dir}"
 
 echo
 echo "==> Step 4/4: Converting trained DCP checkpoint back to HF"
