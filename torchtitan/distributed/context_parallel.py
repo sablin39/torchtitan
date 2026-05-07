@@ -152,6 +152,144 @@ def prepare_context_parallel_input(
     return inputs, labels, extra_kwargs
 
 
+def _build_flattened_cu_seqlens(
+    *,
+    batch_size: int,
+    seq_len: int,
+    positions: torch.Tensor | None,
+    device: torch.device,
+) -> torch.Tensor:
+    if positions is None:
+        return torch.arange(
+            0,
+            (batch_size + 1) * seq_len,
+            seq_len,
+            dtype=torch.long,
+            device=device,
+        )
+
+    if positions.shape != (batch_size, seq_len):
+        raise ValueError(
+            f"RWKV/FLA CP expected positions shape {(batch_size, seq_len)}, "
+            f"got {tuple(positions.shape)}"
+        )
+
+    starts: list[int] = [0]
+    positions_cpu = positions.detach().to("cpu")
+    for batch_idx in range(batch_size):
+        row = positions_cpu[batch_idx]
+        row_offset = batch_idx * seq_len
+        if batch_idx > 0:
+            starts.append(row_offset)
+        nonzero_positions = torch.nonzero(row, as_tuple=False).flatten()
+        if nonzero_positions.numel() == 0:
+            continue
+        padding_start = int(nonzero_positions[-1].item()) + 1
+        for idx in range(1, seq_len):
+            if row[idx] > row[idx - 1]:
+                continue
+            starts.append(row_offset + idx)
+            # Collators pad positions with zeros; represent the whole padding
+            # tail as one ignored sequence instead of many one-token sequences.
+            if idx >= padding_start:
+                break
+    starts.append(batch_size * seq_len)
+    starts = sorted(set(int(x) for x in starts))
+    return torch.tensor(starts, dtype=torch.long, device=device)
+
+
+def prepare_fla_context_parallel_input(
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    extra_kwargs: dict[str, Any],
+    cp_mesh: DeviceMesh,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Prepare contiguous sequence shards for FLA linear-attention CP.
+
+    FLA CP expects a single flattened token stream shaped ``[1, total_tokens]``.
+    The global cumulative sequence lengths are built before partitioning and are
+    kept replicated so the model can call ``fla.ops.cp.build_cp_context``.
+    """
+    positions = extra_kwargs.pop("positions", None)
+    batch_size, seq_len = inputs.shape
+    total_tokens = batch_size * seq_len
+    cp_world_size = cp_mesh.size(0)
+    if total_tokens % cp_world_size != 0:
+        raise ValueError(
+            f"FLA CP requires total flattened tokens ({total_tokens}) to be "
+            f"divisible by CP degree ({cp_world_size})"
+        )
+
+    cu_seqlens_global = _build_flattened_cu_seqlens(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        positions=positions,
+        device=device,
+    )
+    extra_kwargs["cu_seqlens_global"] = cu_seqlens_global
+    extra_kwargs["cu_seqlens_global_cpu"] = cu_seqlens_global.detach().to("cpu")
+
+    # Optional v1 helper for multimodal models: keep a replicated copy so local
+    # CP shards can map image placeholder spans back to global vision item order.
+    if extra_kwargs.get("fla_cp_keep_global_input_ids", False):
+        extra_kwargs["fla_cp_global_input_ids"] = inputs.reshape(1, total_tokens)
+    extra_kwargs.pop("fla_cp_keep_global_input_ids", None)
+
+    rank = dist.get_rank(cp_mesh.get_group())
+    part_len = total_tokens // cp_world_size
+    extra_kwargs["fla_cp_global_start"] = torch.tensor(
+        rank * part_len,
+        dtype=torch.long,
+        device=device,
+    )
+
+    flat_inputs = inputs.reshape(1, total_tokens)
+    flat_labels = labels.reshape(1, total_tokens)
+    (flat_inputs, flat_labels), _ = cp_shard(
+        cp_mesh,
+        (flat_inputs, flat_labels),
+        attention_masks=None,
+        load_balancer_type=None,
+        input_seq_dim=1,
+    )
+    return flat_inputs, flat_labels, extra_kwargs
+
+
+def prepare_fla_varlen_input(
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    extra_kwargs: dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Prepare unsharded FLA variable-length input.
+
+    RWKV/FLA models can train without CP on normal ``[B, S]`` tensors, but
+    packed samples need document boundaries passed to ``token_shift`` and the
+    DPLR recurrent kernel.  FLA represents those boundaries with
+    ``cu_seqlens`` and expects the token stream to be flattened to
+    ``[1, B * S]`` for varlen mode.
+    """
+    positions = extra_kwargs.pop("positions", None)
+    batch_size, seq_len = inputs.shape
+    total_tokens = batch_size * seq_len
+
+    cu_seqlens_global = _build_flattened_cu_seqlens(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        positions=positions,
+        device=device,
+    )
+    extra_kwargs["cu_seqlens_global"] = cu_seqlens_global
+    extra_kwargs["cu_seqlens_global_cpu"] = cu_seqlens_global.detach().to("cpu")
+
+    return (
+        inputs.reshape(1, total_tokens),
+        labels.reshape(1, total_tokens),
+        extra_kwargs,
+    )
+
+
 def cp_shard(
     cp_mesh: DeviceMesh,
     inputs: tuple[torch.Tensor, ...],

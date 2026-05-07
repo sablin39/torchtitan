@@ -40,7 +40,11 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.distributed.context_parallel import (
+    prepare_context_parallel_input,
+    prepare_fla_context_parallel_input,
+    prepare_fla_varlen_input,
+)
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
@@ -183,6 +187,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     # additional training states
     step: int
     ntokens_seen: int
+    n_valid_tokens_seen: int
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -441,6 +446,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
         self.ntokens_seen = 0
+        self.n_valid_tokens_seen = 0
 
         self.checkpointer = config.checkpoint.build(
             dataloader=self.dataloader,
@@ -586,6 +592,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Resolve positions once: per-document positions for block_causal,
         # sequential positions when CP needs them for shard indexing,
         # or None (model uses sequential RoPE slice by default).
+        uses_fla_cp = bool(
+            getattr(self.model_config, "uses_fla_context_parallel", False)
+        )
+
         if isinstance(self.model_config, Decoder.Config):
             layer = self.model_config.layers[0]
             attn_config = layer.attention
@@ -594,7 +604,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         mask_type = getattr(attn_config, "mask_type", "causal")
 
         positions = extra_inputs.pop("positions", None)
-        if mask_type == "block_causal":
+        if uses_fla_cp:
+            if positions is not None:
+                extra_kwargs["positions"] = positions
+            if "pixel_values" in extra_inputs or "pixel_values_videos" in extra_inputs:
+                extra_kwargs["fla_cp_keep_global_input_ids"] = True
+        elif mask_type == "block_causal":
             # Per-document positions from the dataloader
             extra_kwargs["positions"] = positions
         elif self.parallel_dims.cp_enabled:
@@ -624,18 +639,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 )
 
         if self.parallel_dims.cp_enabled:
-            inputs, labels, extra_kwargs = prepare_context_parallel_input(
+            if uses_fla_cp:
+                inputs, labels, extra_kwargs = prepare_fla_context_parallel_input(
+                    inputs,
+                    labels,
+                    extra_kwargs,
+                    self.parallel_dims.get_mesh("cp"),
+                    self.device,
+                )
+            else:
+                inputs, labels, extra_kwargs = prepare_context_parallel_input(
+                    inputs,
+                    labels,
+                    extra_kwargs,
+                    self.parallel_dims.get_mesh("cp"),
+                    self.device,
+                    self.config.parallelism.context_parallel_load_balancer,
+                )
+        elif uses_fla_cp:
+            inputs, labels, extra_kwargs = prepare_fla_varlen_input(
                 inputs,
                 labels,
                 extra_kwargs,
-                self.parallel_dims.get_mesh("cp"),
                 self.device,
-                self.config.parallelism.context_parallel_load_balancer,
             )
 
         # Accumulate after CP sharding so labels.numel() reflects the actual
         # unique tokens this rank processes (not the full pre-split sequence).
         self.ntokens_seen += labels.numel()
+        self.n_valid_tokens_seen += int((labels != IGNORE_INDEX).sum().item())
 
         return inputs, labels, extra_inputs, extra_kwargs
 
@@ -776,12 +808,27 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             #                = (loss * global_valid_tokens) / local_valid_tokens
             # global_max_loss = max(local_avg_loss)
             local_avg_loss = loss * global_valid_tokens / local_valid_tokens
-            global_avg_loss, global_max_loss, global_ntokens_seen = (
+            (
+                global_avg_loss,
+                global_max_loss,
+                global_ntokens_seen,
+                global_nvalid_tokens_seen,
+            ) = (
                 dist_utils.dist_sum(loss, loss_mesh),
                 dist_utils.dist_max(local_avg_loss, loss_mesh),
                 dist_utils.dist_sum(
                     torch.tensor(
-                        self.ntokens_seen, dtype=torch.int64, device=self.device
+                        self.ntokens_seen,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    loss_mesh,
+                ),
+                dist_utils.dist_sum(
+                    torch.tensor(
+                        self.n_valid_tokens_seen,
+                        dtype=torch.int64,
+                        device=self.device,
                     ),
                     loss_mesh,
                 ),
@@ -789,9 +836,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         else:
             global_avg_loss = global_max_loss = float(loss.detach().item())
             global_ntokens_seen = self.ntokens_seen
+            global_nvalid_tokens_seen = self.n_valid_tokens_seen
 
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
+            "n_valid_tokens_seen": global_nvalid_tokens_seen,
             "lr": lr,
         }
         self.metrics_processor.log(
@@ -820,7 +869,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 try:
                     self.train_step(data_iterator)
                 except DataloaderExhaustedError:
-                    logger.warning("Ran out of data; last step was canceled.")
+                    canceled_step = self.step
+                    self.step -= 1
+                    logger.warning(
+                        f"Ran out of data; step {canceled_step} was canceled."
+                    )
+                    if self.step > 0:
+                        self.checkpointer.save(self.step, last_step=True)
                     break
 
                 self.checkpointer.save(
@@ -854,11 +909,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         return self.step < self.config.training.steps
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
+        return {
+            "step": self.step,
+            "ntokens_seen": self.ntokens_seen,
+            "n_valid_tokens_seen": self.n_valid_tokens_seen,
+        }
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
         self.ntokens_seen = state_dict["ntokens_seen"]
+        self.n_valid_tokens_seen = state_dict.get("n_valid_tokens_seen", 0)
 
     def close(self) -> None:
         if hasattr(self, "checkpointer") and self.checkpointer:

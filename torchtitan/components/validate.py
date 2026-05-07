@@ -18,7 +18,11 @@ from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import Configurable, ParallelismConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.distributed.context_parallel import (
+    prepare_context_parallel_input,
+    prepare_fla_context_parallel_input,
+    prepare_fla_varlen_input,
+)
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
@@ -182,12 +186,18 @@ class Validator(BaseValidator):
         # sequential positions when CP needs them for shard indexing,
         # or None (model uses sequential RoPE slice by default).
         model_config = getattr(model_parts[0], "config", None)
+        uses_fla_cp = bool(getattr(model_config, "uses_fla_context_parallel", False))
         layer = getattr(model_config, "layer", None)
         attn_config = getattr(layer, "attention", None) if layer else None
         attn_mask_type = getattr(attn_config, "mask_type", "causal")
 
         positions = extra_inputs.pop("positions", None)
-        if attn_mask_type == "block_causal":
+        if uses_fla_cp:
+            if positions is not None:
+                extra_kwargs["positions"] = positions
+            if "pixel_values" in extra_inputs or "pixel_values_videos" in extra_inputs:
+                extra_kwargs["fla_cp_keep_global_input_ids"] = True
+        elif attn_mask_type == "block_causal":
             # Per-document positions from the dataloader
             extra_kwargs["positions"] = positions
         elif self.parallel_dims.cp_enabled:
@@ -196,26 +206,43 @@ class Validator(BaseValidator):
                 0, inputs.shape[1], dtype=torch.int32, device=inputs.device
             ).expand(inputs.shape)
 
-        try:
-            # pyrefly: ignore [not-callable]
-            extra_kwargs["attention_masks"] = cast(
-                BaseModel, model_parts[0]
-            ).get_attention_masks(
-                input_batch=inputs,
-                tokenizer=self.tokenizer,
-                extra_inputs=extra_inputs,
-            )
-        except TypeError:
-            pass
+        get_attention_masks = getattr(
+            cast(BaseModel, model_parts[0]), "get_attention_masks", None
+        )
+        if callable(get_attention_masks):
+            try:
+                extra_kwargs["attention_masks"] = get_attention_masks(
+                    input_batch=inputs,
+                    tokenizer=self.tokenizer,
+                    extra_inputs=extra_inputs,
+                )
+            except TypeError:
+                pass
 
         if self.parallel_dims.cp_enabled:
-            inputs, labels, extra_kwargs = prepare_context_parallel_input(
+            if uses_fla_cp:
+                inputs, labels, extra_kwargs = prepare_fla_context_parallel_input(
+                    inputs,
+                    labels,
+                    extra_kwargs,
+                    self.parallel_dims.get_mesh("cp"),
+                    inputs.device,
+                )
+            else:
+                inputs, labels, extra_kwargs = prepare_context_parallel_input(
+                    inputs,
+                    labels,
+                    extra_kwargs,
+                    self.parallel_dims.get_mesh("cp"),
+                    inputs.device,
+                    self.parallelism.context_parallel_load_balancer,
+                )
+        elif uses_fla_cp:
+            inputs, labels, extra_kwargs = prepare_fla_varlen_input(
                 inputs,
                 labels,
                 extra_kwargs,
-                self.parallel_dims.get_mesh("cp"),
                 inputs.device,
-                self.parallelism.context_parallel_load_balancer,
             )
 
         return inputs, labels, extra_inputs, extra_kwargs
