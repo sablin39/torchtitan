@@ -24,6 +24,7 @@ dependencies = [
     "tensorboard",
     "wandb",
     "einops",
+    "nvidia-ml-py",
     "pillow",
 ]
 dynamic = ["version"]
