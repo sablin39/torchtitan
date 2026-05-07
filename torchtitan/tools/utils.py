@@ -72,17 +72,20 @@ class GarbageCollection:
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
 
 
-# hardcoded BF16 type peak flops for NVIDIA A100, H20, H100, H200, B200 GPU,
-# AMD MI250, MI300X, MI325X, MI355X, Intel PVC, and AWS Trainium/Inferentia
+# hardcoded BF16 type peak flops for NVIDIA A100, A6000, RTX PRO 6000,
+# H20, H100/H800, H200, B200 GPU, AMD MI250, MI300X, MI325X, MI355X,
+# Intel PVC, and AWS Trainium/Inferentia
 def get_peak_flops(device_name: str) -> float:
     try:
         # Run the lspci command and capture the output
         result = subprocess.run(["lspci"], stdout=subprocess.PIPE, text=True)
-        # Filter the output for lines containing both "NVIDIA" and "H100"
+        # Filter the output for known NVIDIA device strings where CUDA's
+        # device name may omit the exact SKU.
         filtered_lines = [
             line
             for line in result.stdout.splitlines()
-            if "NVIDIA" in line and "H100" in line
+            if "NVIDIA" in line
+            and any(sku in line for sku in ("H100", "H800", "PRO6000", "PRO 6000"))
         ]
         # Join all filtered lines into a single string
         device_name = " ".join(filtered_lines) or device_name
@@ -96,9 +99,13 @@ def get_peak_flops(device_name: str) -> float:
         # quadro-product-literature/proviz-print-nvidia-rtx-a6000-datasheet-us-nvidia-1454980-r9-web%20(1).pdf
         # NOTE: 309.7 TFLOPS is with sparsity; dense value is half.
         return 154.85e12
-    elif "H100" in device_name:
+    elif "PRO6000" in device_name or "PRO 6000" in device_name:
+        # NVIDIA RTX PRO 6000 Blackwell dense BF16/FP16 Tensor performance.
+        return 504e12
+    elif "H100" in device_name or "H800" in device_name:
         # data from https://www.nvidia.com/en-us/data-center/h100/
         # NOTE: Specifications are one-half lower without sparsity.
+        # Treat H800 as H100 for MFU accounting.
         if "NVL" in device_name:
             return 835e12
         elif "PCIe" in device_name:
