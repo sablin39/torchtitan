@@ -19,6 +19,7 @@ from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
+from torchtitan.tools.nvml_metrics import NvmlGpuMetricsMonitor
 from torchtitan.tools.utils import Color, device_module, device_type, NoColor
 
 
@@ -300,10 +301,17 @@ class MetricsProcessor(Configurable):
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
 
+        enable_nvml_metrics: bool = False
+        """
+        Whether to log NVIDIA NVML GPM metrics such as SM and tensor utilization.
+        Requires nvidia-ml-py and a GPU/driver that supports NVML GPM.
+        """
+
     config: Config
     logger: BaseLogger
     parallel_dims: ParallelDims
     device_memory_monitor: DeviceMemoryMonitor
+    nvml_gpu_metrics_monitor: NvmlGpuMetricsMonitor | None
     color: utils.NoColor | utils.Color
 
     gpu_peak_flops: float
@@ -343,6 +351,11 @@ class MetricsProcessor(Configurable):
         self.parallel_dims = parallel_dims
         self.config = config
         self.device_memory_monitor = build_device_memory_monitor()
+        self.nvml_gpu_metrics_monitor = None
+        if config.enable_nvml_metrics:
+            self.nvml_gpu_metrics_monitor = NvmlGpuMetricsMonitor()
+            if self.nvml_gpu_metrics_monitor.gpm_supported:
+                logger.info("NVML GPM metrics logging enabled")
         # used for colorful printing
         self.color = utils.NoColor() if config.disable_color_printing else utils.Color()
 
@@ -518,6 +531,8 @@ class MetricsProcessor(Configurable):
 
         if extra_metrics:
             metrics.update(extra_metrics)
+        if self.nvml_gpu_metrics_monitor is not None:
+            metrics.update(self.nvml_gpu_metrics_monitor.get_metrics())
 
         self.logger.log(metrics, step)
 
@@ -562,6 +577,8 @@ class MetricsProcessor(Configurable):
 
         if extra_metrics:
             metrics.update(extra_metrics)
+        if self.nvml_gpu_metrics_monitor is not None:
+            metrics.update(self.nvml_gpu_metrics_monitor.get_metrics())
 
         self.logger.log(metrics, step)
 
@@ -579,4 +596,6 @@ class MetricsProcessor(Configurable):
         self.device_memory_monitor.reset_peak_stats()
 
     def close(self):
+        if self.nvml_gpu_metrics_monitor is not None:
+            self.nvml_gpu_metrics_monitor.close()
         self.logger.close()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from dataclasses import dataclass
 from types import ModuleType
@@ -21,7 +22,7 @@ from torchtitan.tools.logging import logger, warn_once
 @dataclass(frozen=True, slots=True)
 class NvmlMetric:
     name: str
-    metric_id_name: str
+    metric_id_names: str | tuple[str, ...]
 
 
 DEFAULT_GPM_METRICS = (
@@ -217,7 +218,7 @@ class NvmlGpuMetricsMonitor:
         metric_ids: list[int] = []
         metric_names: list[str] = []
         for metric in self.metric_specs:
-            metric_id = getattr(pynvml, metric.metric_id_name, None)
+            metric_id = self._resolve_metric_id(pynvml, metric.metric_id_names)
             if metric_id is None:
                 continue
             metric_ids.append(metric_id)
@@ -263,8 +264,12 @@ class NvmlGpuMetricsMonitor:
             success = getattr(pynvml, "NVML_SUCCESS", 0)
             for i, name in enumerate(self._gpm_metric_names):
                 metric = result.metrics[i]
-                if getattr(metric, "nvmlReturn", success) == success:
-                    metrics[name] = float(metric.value)
+                value = float(metric.value)
+                if (
+                    getattr(metric, "nvmlReturn", success) == success
+                    and math.isfinite(value)
+                ):
+                    metrics[name] = value
 
             return metrics
         except Exception as e:
@@ -282,6 +287,18 @@ class NvmlGpuMetricsMonitor:
 
     def _metric_name(self, name: str) -> str:
         return f"{self.prefix}{name}" if self.prefix else name
+
+    def _resolve_metric_id(
+        self, pynvml: ModuleType, metric_id_names: str | tuple[str, ...]
+    ) -> int | None:
+        if isinstance(metric_id_names, str):
+            metric_id_names = (metric_id_names,)
+
+        for metric_id_name in metric_id_names:
+            metric_id = getattr(pynvml, metric_id_name, None)
+            if isinstance(metric_id, int):
+                return metric_id
+        return None
 
 
 def build_nvml_gpu_metrics_monitor(

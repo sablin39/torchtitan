@@ -76,6 +76,20 @@ class TestConfigManager(unittest.TestCase):
         )
         assert config.training.steps == 5
 
+    def test_cli_override_enable_nvml_metrics(self):
+        """CLI args can enable NVML metrics."""
+        config_manager = ConfigManager()
+        config = config_manager.parse_args(
+            [
+                "--module",
+                "llama3",
+                "--config",
+                "llama3_debugmodel",
+                "--metrics.enable-nvml-metrics",
+            ]
+        )
+        assert config.metrics.enable_nvml_metrics
+
     def test_cli_override_dump_folder(self):
         """CLI args override config defaults for nested fields."""
         config_manager = ConfigManager()

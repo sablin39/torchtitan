@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import builtins
+import math
 import sys
 import types
 import unittest
@@ -48,6 +49,7 @@ class NvmlMetricsTest(unittest.TestCase):
         fake_pynvml.NVML_GPM_METRICS_GET_VERSION = 1
         fake_pynvml.NVML_GPM_METRIC_SM_UTIL = 2
         fake_pynvml.NVML_GPM_METRIC_ANY_TENSOR_UTIL = 5
+        fake_pynvml.NVML_GPM_METRIC_HMMA_TENSOR_UTIL = 7
         fake_pynvml.c_nvmlGpmMetricsGet_t = _FakeGpmRequest
         fake_pynvml.nvmlInit = mock.Mock()
         fake_pynvml.nvmlShutdown = mock.Mock()
@@ -62,7 +64,7 @@ class NvmlMetricsTest(unittest.TestCase):
         def nvml_gpm_metrics_get(request):
             for i in range(request.numMetrics):
                 request.metrics[i].nvmlReturn = fake_pynvml.NVML_SUCCESS
-                request.metrics[i].value = 10.0 + i
+                request.metrics[i].value = math.nan if i == 1 else 10.0 + i
             return request
 
         fake_pynvml.nvmlGpmMetricsGet = mock.Mock(side_effect=nvml_gpm_metrics_get)
@@ -74,11 +76,18 @@ class NvmlMetricsTest(unittest.TestCase):
                     # Keep the test focused: no dependence on the full default list.
                     types.SimpleNamespace(
                         name="gpu/sm_util(%)",
-                        metric_id_name="NVML_GPM_METRIC_SM_UTIL",
+                        metric_id_names="NVML_GPM_METRIC_SM_UTIL",
                     ),
                     types.SimpleNamespace(
                         name="gpu/tensor_util(%)",
-                        metric_id_name="NVML_GPM_METRIC_ANY_TENSOR_UTIL",
+                        metric_id_names="NVML_GPM_METRIC_ANY_TENSOR_UTIL",
+                    ),
+                    types.SimpleNamespace(
+                        name="gpu/bf16_util(%)",
+                        metric_id_names=(
+                            "NVML_GPM_METRIC_BF16_UTIL",
+                            "NVML_GPM_METRIC_HMMA_TENSOR_UTIL",
+                        ),
                     ),
                 ),
                 warn=False,
@@ -87,7 +96,7 @@ class NvmlMetricsTest(unittest.TestCase):
                 monitor.get_metrics(),
                 {
                     "gpu/sm_util(%)": 10.0,
-                    "gpu/tensor_util(%)": 11.0,
+                    "gpu/bf16_util(%)": 12.0,
                 },
             )
             monitor.close()
