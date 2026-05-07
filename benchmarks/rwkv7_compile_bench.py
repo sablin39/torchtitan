@@ -57,9 +57,9 @@ def _make_model(args, device: torch.device, dtype: torch.dtype):
     return model
 
 
-def _compile_blocks(model, backend: str) -> None:
+def _compile_blocks(model, backend: str, *, fullgraph: bool) -> None:
     for block in model.llm.layers.values():
-        block.compile(backend=backend, fullgraph=False)
+        block.compile(backend=backend, fullgraph=fullgraph)
 
 
 def _step(model, tokens, cu_seqlens_global=None) -> torch.Tensor:
@@ -89,6 +89,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--backend", default="inductor")
+    parser.add_argument("--fullgraph", action="store_true")
     parser.add_argument("--cp", action="store_true")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=512)
@@ -147,7 +148,7 @@ def main() -> None:
     if args.cp:
         eager.set_cp_process_group(dist.group.WORLD)
         compiled.set_cp_process_group(dist.group.WORLD)
-    _compile_blocks(compiled, args.backend)
+    _compile_blocks(compiled, args.backend, fullgraph=args.fullgraph)
 
     for _ in range(args.warmup):
         eager.zero_grad(set_to_none=True)
