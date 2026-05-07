@@ -42,6 +42,15 @@ def get_vision_block_mask_mod(num_patch: torch.Tensor, max_num_patch: int):
     return mask_mod
 
 
+def get_flat_vision_block_mask_mod(patch_to_item: torch.Tensor):
+    """Create a block-diagonal mask for flat concatenated visual patches."""
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return patch_to_item[q_idx] == patch_to_item[kv_idx]
+
+    return mask_mod
+
+
 def _compute_learned_pos_embeds(
     learned_pos_embed: torch.Tensor,
     grid_thw: torch.Tensor,
@@ -124,6 +133,66 @@ def _compute_learned_pos_embeds(
                 pos_embeds[i, :seq_len] = pos_hw_block.repeat(t, 1)
             else:
                 pos_embeds[i, :seq_len] = pos_hw_block
+
+    return pos_embeds
+
+
+def _compute_learned_pos_embeds_flat(
+    learned_pos_embed: torch.Tensor,
+    grid_thw: torch.Tensor,
+    num_grid_per_side: int,
+    spatial_merge_size: int,
+    dim: int,
+) -> torch.Tensor:
+    """Compute learned position embeddings for flat concatenated patches."""
+    total_num_patch = int(grid_thw.prod(-1).sum().item())
+    device = grid_thw.device
+    dtype = learned_pos_embed.dtype
+    merge_size = spatial_merge_size
+    pos_embeds = torch.zeros(total_num_patch, dim, device=device, dtype=dtype)
+
+    hw_to_indices: dict[tuple[int, int], list[int]] = {}
+    for i in range(grid_thw.shape[0]):
+        h, w = int(grid_thw[i, 1].item()), int(grid_thw[i, 2].item())
+        key = (h, w)
+        if key not in hw_to_indices:
+            hw_to_indices[key] = []
+        hw_to_indices[key].append(i)
+
+    pos_grid = (
+        learned_pos_embed.reshape(num_grid_per_side, num_grid_per_side, -1)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .float()
+    )
+    patch_offsets = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.long, device=device),
+            grid_thw.prod(-1).to(torch.long).cumsum(0),
+        ]
+    )
+
+    for (h, w), indices in hw_to_indices.items():
+        pos_hw = F.interpolate(
+            pos_grid,
+            size=(h, w),
+            mode="bilinear",
+            align_corners=True,
+        )
+        pos_hw = pos_hw.squeeze(0).permute(1, 2, 0).reshape(-1, dim).to(dtype)
+        pos_hw_block = (
+            pos_hw.view(h // merge_size, merge_size, w // merge_size, merge_size, -1)
+            .permute(0, 2, 1, 3, 4)
+            .flatten(0, 3)
+        )
+
+        for i in indices:
+            t = int(grid_thw[i, 0].item())
+            seq_len = t * h * w
+            start = int(patch_offsets[i].item())
+            pos_embeds[start : start + seq_len] = (
+                pos_hw_block.repeat(t, 1) if t > 1 else pos_hw_block
+            )
 
     return pos_embeds
 
@@ -224,6 +293,55 @@ def _compute_2d_rope_cache(
     )  # (N, L, 1, head_dim*2)
 
     return rope_cache
+
+
+def _compute_2d_rope_cache_flat(
+    freq_table: torch.Tensor,
+    grid_thw: torch.Tensor,
+    spatial_merge_size: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Compute 2D RoPE cache for flat concatenated visual patches."""
+    device = grid_thw.device
+    merge_size = spatial_merge_size
+    rope_chunks = []
+
+    hw_cache: dict[tuple[int, int], torch.Tensor] = {}
+    for i in range(grid_thw.shape[0]):
+        t = int(grid_thw[i, 0].item())
+        h, w = int(grid_thw[i, 1].item()), int(grid_thw[i, 2].item())
+        key = (h, w)
+        if key not in hw_cache:
+            merged_h, merged_w = h // merge_size, w // merge_size
+            row_base = torch.arange(merged_h, device=device) * merge_size
+            col_base = torch.arange(merged_w, device=device) * merge_size
+            intra_row = torch.arange(merge_size, device=device)
+            intra_col = torch.arange(merge_size, device=device)
+
+            row_idx = (
+                (row_base[:, None, None, None] + intra_row[None, None, :, None])
+                .expand(merged_h, merged_w, merge_size, merge_size)
+                .reshape(-1)
+            )
+            col_idx = (
+                (col_base[None, :, None, None] + intra_col[None, None, None, :])
+                .expand(merged_h, merged_w, merge_size, merge_size)
+                .reshape(-1)
+            )
+            rope_row = freq_table[row_idx]
+            rope_col = freq_table[col_idx]
+            hw_cache[key] = torch.cat([rope_row, rope_col], dim=-1)
+        rope_2d = hw_cache[key]
+        rope_chunks.append(rope_2d.repeat(t, 1) if t > 1 else rope_2d)
+
+    rope_embeds = torch.cat(rope_chunks, dim=0)
+    rope_embeds = torch.cat((rope_embeds, rope_embeds), dim=-1)
+    return torch.cat([rope_embeds.cos(), rope_embeds.sin()], dim=-1).view(
+        1,
+        rope_embeds.shape[0],
+        1,
+        head_dim * 2,
+    )
 
 
 class PatchEmbed(Module):
@@ -524,6 +642,7 @@ class Qwen3VLVisionEncoder(Module):
         # Cached local_map wrapper for learned pos embed computation (created
         # on first use when pos_embed is a DTensor from TP/FSDP wrapping)
         self._local_map_learned_pos_fn = None
+        self._local_map_learned_pos_flat_fn = None
 
         self.layers = ModuleDict(
             {
@@ -637,6 +756,97 @@ class Qwen3VLVisionEncoder(Module):
 
         return learned_pos, rope_cache
 
+    def compute_flat_position_embeddings(
+        self, grid_thw: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute position embeddings for flat concatenated visual patches."""
+        head_dim = self.config.dim // self.config.n_heads
+        max_hw = int(grid_thw[:, 1:].max().item())
+        if self._cached_freq_table is None or self._cached_freq_table.shape[0] < max_hw:
+            self._cached_freq_table = self.rotary_pos_emb(max_hw)
+
+        learned_pos_embed = self.pos_embed
+        if isinstance(learned_pos_embed, DTensor):
+            if self._local_map_learned_pos_flat_fn is None:
+                self._local_map_learned_pos_flat_fn = local_map(
+                    _compute_learned_pos_embeds_flat,
+                    in_placements=((Replicate(),), None, None, None, None),
+                    out_placements=((Replicate(),),),
+                    in_grad_placements=((Replicate(),), None, None, None, None),
+                    device_mesh=learned_pos_embed.device_mesh,
+                )
+            learned_pos = self._local_map_learned_pos_flat_fn(
+                learned_pos_embed,
+                grid_thw,  # pyrefly: ignore [bad-argument-count]
+                self.num_grid_per_side,
+                self.spatial_merge_size,
+                self.config.dim,
+            )
+        else:
+            learned_pos = _compute_learned_pos_embeds_flat(
+                learned_pos_embed,
+                grid_thw,
+                self.num_grid_per_side,
+                self.spatial_merge_size,
+                self.config.dim,
+            )
+        rope_cache = _compute_2d_rope_cache_flat(
+            self._cached_freq_table,
+            grid_thw,
+            self.spatial_merge_size,
+            head_dim,
+        )
+        return learned_pos, rope_cache
+
+    def _forward_flat(
+        self,
+        pixel_values: torch.Tensor,
+        *,
+        grid_thw: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Forward path for flat ``(total_patches, patch_dim)`` inputs."""
+        num_patch = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).to(torch.long)
+        total_num_patch = int(num_patch.sum().item())
+        if pixel_values.shape[0] != total_num_patch:
+            raise ValueError(
+                f"Flat pixel_values has {pixel_values.shape[0]} patches, but "
+                f"grid_thw describes {total_num_patch} patches"
+            )
+
+        hidden_states = self.patch_embed(pixel_values).unsqueeze(0)
+        learned_pos, rope_cache = self.compute_flat_position_embeddings(grid_thw)
+        hidden_states = hidden_states + learned_pos.unsqueeze(0)
+
+        patch_to_item = torch.repeat_interleave(
+            torch.arange(grid_thw.shape[0], device=grid_thw.device),
+            num_patch,
+        )
+        mask_mod = get_flat_vision_block_mask_mod(patch_to_item)
+        attention_mask = _compiled_create_block_mask(
+            mask_mod,
+            1,
+            None,
+            total_num_patch,
+            total_num_patch,
+            device=hidden_states.device,
+        )
+        deepstack_features = []
+
+        for layer_idx, layer in self.layers.items():
+            hidden_states = layer(
+                hidden_states,
+                rope_cache=rope_cache,
+                attention_mask=attention_mask,
+            )
+            if int(layer_idx) in self.deepstack_visual_indices:
+                idx = self.deepstack_visual_indices.index(int(layer_idx))
+                deepstack_features.append(
+                    self.deepstack_merger_list[idx](hidden_states).squeeze(0)
+                )
+
+        merged_hidden_states = self.merger(hidden_states).squeeze(0)
+        return merged_hidden_states, deepstack_features
+
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -656,6 +866,9 @@ class Qwen3VLVisionEncoder(Module):
             merged_hidden_states: (num_vision, max_merged_num_patch, out_hidden_size)
             deepstack_features: List of features from intermediate layers
         """
+        if pixel_values.dim() == 2:
+            return self._forward_flat(pixel_values, grid_thw=grid_thw)
+
         num_vision, max_num_patch, _ = pixel_values.shape
 
         num_patch = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).to(torch.long)

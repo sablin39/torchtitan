@@ -263,6 +263,19 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         else:
             shard_start = int(global_start.item()) if global_start is not None else 0
 
+        feature_offsets = None
+        if merged_embeds.dim() == 2:
+            feature_offsets = torch.cat(
+                [
+                    torch.zeros(
+                        1,
+                        dtype=torch.long,
+                        device=num_tokens_per_item.device,
+                    ),
+                    num_tokens_per_item.to(torch.long).cumsum(0),
+                ]
+            )
+
         shard_end = shard_start + local_tokens.numel()
         for item_idx, start, n_tokens in self._global_vision_positions(
             global_tokens=global_input_ids,
@@ -277,9 +290,21 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             local_start = overlap_start - shard_start
             feature_start = overlap_start - start
             feature_len = overlap_end - overlap_start
+            if feature_offsets is None:
+                vision_slice = merged_embeds[
+                    item_idx, feature_start : feature_start + feature_len
+                ]
+            else:
+                item_offset = int(feature_offsets[item_idx].item())
+                vision_slice = merged_embeds[
+                    item_offset
+                    + feature_start : item_offset
+                    + feature_start
+                    + feature_len
+                ]
             inputs_embeds.view(-1, inputs_embeds.shape[-1])[
                 local_start : local_start + feature_len
-            ] = merged_embeds[item_idx, feature_start : feature_start + feature_len]
+            ] = vision_slice
         return inputs_embeds
 
     def _prepare_inputs_embeds(

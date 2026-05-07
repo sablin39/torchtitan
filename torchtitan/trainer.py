@@ -189,6 +189,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     ntokens_seen: int
     n_valid_tokens_seen: int
     n_nonpad_tokens_seen: int
+    data_metric_sums: dict[str, float]
+    data_metric_count: int
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -449,6 +451,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.ntokens_seen = 0
         self.n_valid_tokens_seen = 0
         self.n_nonpad_tokens_seen = 0
+        self.data_metric_sums = {}
+        self.data_metric_count = 0
 
         self.checkpointer = config.checkpoint.build(
             dataloader=self.dataloader,
@@ -741,6 +745,46 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
 
+    def _record_data_stats(self, stats: dict[str, Any]) -> None:
+        for key, value in stats.items():
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            if isinstance(value, (int, float)):
+                self.data_metric_sums[key] = (
+                    self.data_metric_sums.get(key, 0.0) + float(value)
+                )
+        self.data_metric_count += 1
+
+    def _consume_data_metrics(self) -> dict[str, float]:
+        if self.data_metric_count == 0:
+            return {}
+
+        sums = self.data_metric_sums
+        count = float(self.data_metric_count)
+
+        def avg(key: str) -> float:
+            return sums.get(key, 0.0) / count
+
+        pixel_bytes = sums.get("pixel_values_bytes", 0.0)
+        sequence_tokens = sums.get("sequence_tokens", 0.0)
+        nonpad_tokens = sums.get("nonpad_tokens", 0.0)
+        metrics = {
+            "data/avg_num_images": avg("num_images"),
+            "data/avg_vit_patches": avg("num_vit_patches"),
+            "data/avg_pixel_values_gib": avg("pixel_values_bytes") / (1024**3),
+            "data/avg_packed_docs": avg("packed_docs"),
+            "data/avg_packed_rows": avg("packed_rows"),
+            "data/total_num_images": sums.get("num_images", 0.0),
+            "data/total_vit_patches": sums.get("num_vit_patches", 0.0),
+            "data/total_pixel_values_gib": pixel_bytes / (1024**3),
+        }
+        if sequence_tokens > 0:
+            metrics["data/nonpad_ratio"] = nonpad_tokens / sequence_tokens
+
+        self.data_metric_sums = {}
+        self.data_metric_count = 0
+        return metrics
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -757,6 +801,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
         for _microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
+            data_stats = input_dict.pop("data_stats", None)
+            if isinstance(data_stats, dict):
+                self._record_data_stats(data_stats)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
             microbatches.append((input_dict, labels))
 
@@ -864,6 +911,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_nonpad_tokens_seen": global_nnonpad_tokens_seen,
             "lr": lr,
         }
+        extra_metrics.update(self._consume_data_metrics())
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

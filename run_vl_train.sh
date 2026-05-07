@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-exec > >(tee -a output.log) 2>&1
+# exec > >(tee -a output.log) 2>&1
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 timestamp="$(date +%Y%m%d_%H%M%S)"
@@ -51,9 +51,9 @@ vision_model="/home/rwkv/models/Qwen3.5-0.8B"
 dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/chartqa(cauldron,llava_format)"
 
 split="train"
-ngpu="4"
+ngpu="2"
 seq_len="4096"
-batch_size="32"
+batch_size="16"
 # Sequence packing is controlled by the multimodal dataloader, not by CP.
 # packing_buffer_size is the number of tokenized samples kept in a CPU-side
 # buffer before greedily combining them into seq_len rows. Larger values usually
@@ -61,7 +61,24 @@ batch_size="32"
 # host memory use. Set to "0" to disable packing and pad each sample normally.
 # This is not batch size; batch_size still controls the number of packed rows
 # per step/CP group.
-packing_buffer_size="64"
+packing_buffer_size="32"
+# Conservative dataloader overlap for multimodal packing. Each worker can hold
+# prefetched packed batches containing many resized images, so keep this small
+# on RAM-constrained machines. With CP, this is per rank.
+dataloader_num_workers="1"
+dataloader_persistent_workers="1"
+dataloader_prefetch_factor="1"
+dataloader_pin_memory="0"
+# Store preprocessed visual patch tensors in this dtype before worker IPC and
+# H2D transfer. For BF16 training this roughly halves pixel_values host memory
+# and transfer volume compared with float32 while resize/normalize still runs
+# in float32 inside the processor.
+dataloader_pixel_values_dtype="bfloat16"
+# torchrun warns about OMP_NUM_THREADS because every rank and dataloader worker
+# can otherwise spawn a large CPU thread pool. Start at 1 for multimodal CP; if
+# RAM and CPU load look stable, benchmark 2. A rough upper bound is:
+# physical_cores / (ngpu * (1 + dataloader_num_workers)).
+omp_num_threads="1"
 # Set to an integer for a fixed-step run, or "epoch" to run until the finite
 # dataloader is exhausted. With sequence packing, exact epoch steps are not known
 # until samples are filtered, resized, tokenized, and packed.
@@ -80,6 +97,7 @@ projector_seed="1234"
 activation_checkpoint_mode="none"
 log_freq="1"
 wandb="1"
+nvml_metrics="1"
 overwrite="0"
 optimizer_name="Adam"
 learning_rate="1e-5"
@@ -245,6 +263,9 @@ train_args=(
     --training.steps "${training_steps}"
     --training.local-batch-size "${batch_size}"
     --dataloader.packing-buffer-size "${packing_buffer_size}"
+    --dataloader.num-workers "${dataloader_num_workers}"
+    --dataloader.prefetch-factor "${dataloader_prefetch_factor}"
+    --dataloader.pixel-values-dtype "${dataloader_pixel_values_dtype}"
     --activation-checkpoint.mode "${activation_checkpoint_mode}"
     --checkpoint.enable
     --checkpoint.initial-load-path "${dcp_dir}"
@@ -262,6 +283,9 @@ fi
 if [[ "${wandb}" == "1" ]]; then
     train_args+=(--metrics.enable-wandb)
 fi
+if [[ "${nvml_metrics}" == "1" ]]; then
+    train_args+=(--metrics.enable-nvml-metrics)
+fi
 if [[ -n "${min_pixels}" ]]; then
     train_args+=(--dataloader.min-pixels "${min_pixels}")
 fi
@@ -271,11 +295,22 @@ fi
 if [[ -n "${max_images_per_batch}" ]]; then
     train_args+=(--dataloader.max-images-per-batch "${max_images_per_batch}")
 fi
+if [[ "${dataloader_persistent_workers}" == "1" ]]; then
+    train_args+=(--dataloader.persistent-workers)
+else
+    train_args+=(--dataloader.no-persistent-workers)
+fi
+if [[ "${dataloader_pin_memory}" == "1" ]]; then
+    train_args+=(--dataloader.pin-memory)
+else
+    train_args+=(--dataloader.no-pin-memory)
+fi
 train_args+=("${train_extra_args[@]}")
 
 echo
 echo "==> Step 3/4: Training"
 PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}" \
+OMP_NUM_THREADS="${OMP_NUM_THREADS:-${omp_num_threads}}" \
 "${torchrun_cmd}" \
     --standalone \
     --nproc-per-node="${ngpu}" \

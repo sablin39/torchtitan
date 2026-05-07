@@ -19,6 +19,14 @@ import torch
 from torchtitan.tools.logging import logger
 
 
+def _as_tensor_chunks(value: Any) -> list[torch.Tensor]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        return [value]
+    return [chunk for chunk in value if isinstance(chunk, torch.Tensor)]
+
+
 class MMSamplePacker:
     """Packs multiple samples to maximize sequence length utilization.
 
@@ -87,15 +95,33 @@ class MMSamplePacker:
 
     @staticmethod
     def _merge_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
+        pixel_values = [
+            chunk
+            for sample in samples
+            for chunk in _as_tensor_chunks(sample.get("pixel_values"))
+        ]
+        grid_thw = [
+            chunk
+            for sample in samples
+            for chunk in _as_tensor_chunks(sample.get("grid_thw"))
+        ]
+
         merged: dict[str, Any] = {
             "input_ids": torch.cat([s["input_ids"] for s in samples]),
             "labels": torch.cat([s["labels"] for s in samples]),
             "positions": torch.cat([s["positions"] for s in samples]),
-            "pixel_values": [img for s in samples for img in s.get("pixel_values", [])],
+            # Keep image tensors as chunks. The collator performs one final
+            # batch-level concat, avoiding an expensive packed-row concat here.
+            "pixel_values": pixel_values,
             "pixel_values_videos": [
                 vid for s in samples for vid in s.get("pixel_values_videos", [])
             ],
+            "num_packed_samples": sum(
+                int(s.get("num_packed_samples", 1)) for s in samples
+            ),
         }
+        if grid_thw:
+            merged["grid_thw"] = grid_thw
         return merged
 
     def add_sample(self, sample: dict[str, Any]) -> None:

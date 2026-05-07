@@ -419,10 +419,28 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertEqual((input_ids == tok.image_id).sum().item(), 3)
             self.assertEqual((input_ids == tok.vision_start_id).sum().item(), 2)
             self.assertEqual((input_ids == tok.vision_end_id).sum().item(), 2)
-            self.assertEqual(len(sample["pixel_values"]), 2)
+            self.assertEqual(sample["grid_thw"].shape[0], 2)
+            self.assertEqual(
+                sample["pixel_values"].shape[0],
+                int(sample["grid_thw"].prod(-1).sum().item()),
+            )
+
+    def test_mm_chat_dataset_can_store_bfloat16_pixel_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            sample = next(
+                iter(
+                    _make_mm_chat_dataset(
+                        tok,
+                        [_two_image_sample()],
+                        pixel_values_dtype="bfloat16",
+                    )
+                )
+            )
+            self.assertEqual(sample["pixel_values"].dtype, torch.bfloat16)
 
     def test_mm_chat_image_processing_uses_shared_pixel_budget(self):
-        images, token_counts = process_mm_chat_images(
+        processed = process_mm_chat_images(
             [
                 Image.new("RGB", (128, 128), color="red"),
                 Image.new("RGB", (128, 128), color="blue"),
@@ -436,12 +454,16 @@ class TestMMChatDataset(unittest.TestCase):
             image_std=(0.5, 0.5, 0.5),
             max_aspect_ratio=50.0,
         )
-        self.assertEqual(len(images), 2)
+        self.assertEqual(processed.grid_thw.shape[0], 2)
         self.assertLessEqual(
-            sum(image.shape[1] * image.shape[2] for image in images),
+            sum(image.shape[1] * image.shape[2] for image in processed.images),
             4096,
         )
-        self.assertEqual(token_counts, [1, 1])
+        self.assertEqual(processed.image_token_counts, [1, 1])
+        self.assertEqual(
+            processed.flat_patches.shape[0],
+            int(processed.grid_thw.prod(-1).sum().item()),
+        )
 
     def test_mm_chat_dataset_masks_only_assistant_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -496,6 +518,8 @@ class TestMMChatDataset(unittest.TestCase):
             packed = next(iter(dataset))
             reset_points = (packed["positions"][1:] == 0).nonzero(as_tuple=True)[0]
             self.assertGreater(len(reset_points), 0)
+            self.assertIsInstance(packed["pixel_values"], list)
+            self.assertIsInstance(packed["grid_thw"], list)
 
     def test_mm_chat_dataset_packing_buffer_one_yields_promptly(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -538,6 +562,16 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertTrue(input_dict["input_token_mask"][0, :n].all().item())
             self.assertFalse(input_dict["input_token_mask"][0, n:].any().item())
             self.assertEqual(input_dict["grid_thw"].shape[0], 2)
+            self.assertEqual(input_dict["pixel_values"].dim(), 2)
+            self.assertEqual(
+                input_dict["pixel_values"].shape[0],
+                int(input_dict["grid_thw"].prod(-1).sum().item()),
+            )
+            self.assertIn("data_stats", input_dict)
+            self.assertEqual(input_dict["data_stats"]["num_images"], 2)
+            self.assertEqual(input_dict["data_stats"]["packed_rows"], 1)
+            self.assertEqual(input_dict["data_stats"]["packed_docs"], 1)
+            self.assertEqual(input_dict["data_stats"]["nonpad_tokens"], n)
 
     def test_mm_chat_collator_zero_image_cap_keeps_all_images(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -556,6 +590,11 @@ class TestMMChatDataset(unittest.TestCase):
             )
             input_dict, labels = collator(samples)
             self.assertEqual(input_dict["grid_thw"].shape[0], 4)
+            self.assertEqual(input_dict["pixel_values"].dim(), 2)
+            self.assertEqual(
+                input_dict["pixel_values"].shape[0],
+                int(input_dict["grid_thw"].prod(-1).sum().item()),
+            )
             self.assertGreater(input_dict["input_token_mask"][1].sum().item(), 0)
             self.assertGreater((labels[1] != IGNORE_INDEX).sum().item(), 0)
 

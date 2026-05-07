@@ -374,11 +374,13 @@ class Qwen3VLModel(Qwen3Model):
 
         Args:
             pixel_values: Padded patches (num_items, max_num_patch, patch_dim)
+                or flat concatenated patches (total_num_patch, patch_dim)
             grid_thw: Grid dimensions (num_items, 3) for [t, h, w]
 
         Returns:
-            merged_embeds: (num_items, max_tokens, dim) padded vision embeddings
-            deepstack_features: List of (num_items, max_tokens, dim) per layer
+            merged_embeds: padded (num_items, max_tokens, dim) or flat
+                (total_merged_tokens, dim) vision embeddings
+            deepstack_features: List of padded or flat per-layer features
             num_tokens_per_item: (num_items,) actual token count per item
         """
         pixel_values = pixel_values.to(
@@ -413,10 +415,18 @@ class Qwen3VLModel(Qwen3Model):
         Returns:
             Updated embeddings
         """
+        feature_offset = 0
         for item_idx, sample_idx, vision_start, n_tokens in vision_positions:
+            if merged_embeds.dim() == 2:
+                vision_slice = merged_embeds[
+                    feature_offset : feature_offset + n_tokens, :
+                ]
+                feature_offset += n_tokens
+            else:
+                vision_slice = merged_embeds[item_idx, :n_tokens, :]
             inputs_embeds[
                 sample_idx, vision_start : vision_start + n_tokens, :
-            ] = merged_embeds[item_idx, :n_tokens, :]
+            ] = vision_slice
         return inputs_embeds
 
     def _deepstack_process(
@@ -436,10 +446,18 @@ class Qwen3VLModel(Qwen3Model):
         Returns:
             Updated hidden states
         """
+        feature_offset = 0
         for item_idx, sample_idx, vision_start, n_tokens in vision_positions:
+            if deepstack_embeds.dim() == 2:
+                vision_slice = deepstack_embeds[
+                    feature_offset : feature_offset + n_tokens, :
+                ]
+                feature_offset += n_tokens
+            else:
+                vision_slice = deepstack_embeds[item_idx, :n_tokens, :]
             hidden_states[
                 sample_idx, vision_start : vision_start + n_tokens, :
-            ] += deepstack_embeds[item_idx, :n_tokens, :]
+            ] += vision_slice
         return hidden_states
 
     def _prepare_multimodal_embeds(

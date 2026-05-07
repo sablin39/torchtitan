@@ -15,14 +15,14 @@ from datasets import Dataset, DatasetDict, load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.hf_datasets.multimodal.processor_core import (
     RWKVVLImageProcessorConfig,
+    RWKVVLProcessedImages,
     process_images as process_rwkv_vl_images,
-    vision_to_patches,
 )
 from torchtitan.hf_datasets.multimodal.utils.packing import MMSamplePacker
 from torchtitan.hf_datasets.multimodal.utils.text import pad_batch_dim, pad_seq_len
@@ -36,6 +36,42 @@ ROLE_TABLE = {
     "human": "user",
     "gpt": "assistant",
 }
+
+
+_PIXEL_VALUE_DTYPES = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+}
+
+
+def _resolve_pixel_values_dtype(dtype: str | None) -> torch.dtype | None:
+    if dtype is None or dtype == "":
+        return None
+    normalized = str(dtype).lower()
+    if normalized in {"none", "auto"}:
+        return None
+    if normalized not in _PIXEL_VALUE_DTYPES:
+        raise ValueError(
+            f"Unsupported pixel_values_dtype={dtype!r}; expected one of "
+            f"{sorted(_PIXEL_VALUE_DTYPES)} or 'auto'"
+        )
+    return _PIXEL_VALUE_DTYPES[normalized]
+
+
+def _tensor_chunks(value: Any) -> list[torch.Tensor]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        return [value]
+    return [chunk for chunk in value if isinstance(chunk, torch.Tensor)]
+
+
+def _num_grid_items(value: Any) -> int:
+    return sum(int(chunk.shape[0]) for chunk in _tensor_chunks(value))
 
 
 def _flatten_images(images: Any) -> list[Any]:
@@ -186,8 +222,8 @@ def process_mm_chat_images(
     image_mean: tuple[float, ...],
     image_std: tuple[float, ...],
     max_aspect_ratio: float,
-) -> tuple[list[torch.Tensor], list[int]]:
-    processed = process_rwkv_vl_images(
+) -> RWKVVLProcessedImages:
+    return process_rwkv_vl_images(
         images,
         RWKVVLImageProcessorConfig(
             patch_size=patch_size,
@@ -200,7 +236,6 @@ def process_mm_chat_images(
             max_aspect_ratio=max_aspect_ratio,
         ),
     )
-    return processed.images, processed.image_token_counts
 
 
 def build_image_token_counts_by_message(
@@ -257,6 +292,7 @@ class MMChatDataset(IterableDataset, Stateful):
         dp_world_size: int = 1,
         infinite: bool = False,
         max_aspect_ratio: float = 50.0,
+        pixel_values_dtype: str | None = "float32",
     ) -> None:
         self._data = split_dataset_by_node(dataset, dp_rank, dp_world_size)
         self._tokenizer = tokenizer
@@ -270,6 +306,7 @@ class MMChatDataset(IterableDataset, Stateful):
         self.image_mean = image_mean
         self.image_std = image_std
         self.max_aspect_ratio = max_aspect_ratio
+        self.pixel_values_dtype = _resolve_pixel_values_dtype(pixel_values_dtype)
         self.infinite = infinite
         self._sample_idx = 0
         self._hf_state_restored = False
@@ -286,9 +323,15 @@ class MMChatDataset(IterableDataset, Stateful):
             self._hf_state_restored = False
             return iter(self._data)
         if isinstance(self._data, Dataset):
-            if self._sample_idx >= len(self._data):
+            worker_info = get_worker_info()
+            stride = 1 if worker_info is None else worker_info.num_workers
+            offset = 0 if worker_info is None else worker_info.id
+            start = self._sample_idx * stride + offset
+            if start >= len(self._data):
                 return iter([])
-            return iter(self._data.select(range(self._sample_idx, len(self._data))))
+            if stride == 1:
+                return iter(self._data.select(range(start, len(self._data))))
+            return (self._data[idx] for idx in range(start, len(self._data), stride))
         return iter(self._data)
 
     def _tokenize_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
@@ -299,7 +342,7 @@ class MMChatDataset(IterableDataset, Stateful):
         if not images:
             return None
 
-        processed_images, image_token_counts = process_mm_chat_images(
+        processed_images = process_mm_chat_images(
             images,
             patch_size=self.patch_size,
             temporal_patch_size=self.temporal_patch_size,
@@ -312,7 +355,7 @@ class MMChatDataset(IterableDataset, Stateful):
         )
         image_counts_by_message = build_image_token_counts_by_message(
             messages,
-            image_token_counts,
+            processed_images.image_token_counts,
             image_placeholder_token=self._tokenizer.image_placeholder_token,
         )
 
@@ -354,11 +397,17 @@ class MMChatDataset(IterableDataset, Stateful):
         for token_id in vision_ids:
             labels = torch.where(labels == token_id, IGNORE_INDEX, labels)
 
+        flat_patches = processed_images.flat_patches
+        if self.pixel_values_dtype is not None and flat_patches.is_floating_point():
+            flat_patches = flat_patches.to(self.pixel_values_dtype)
+
         return {
             "input_ids": input_ids,
             "labels": labels,
             "positions": torch.arange(input_ids.numel(), dtype=torch.long),
-            "pixel_values": processed_images,
+            "pixel_values": flat_patches,
+            "grid_thw": processed_images.grid_thw,
+            "num_packed_samples": 1,
         }
 
     def __iter__(self):
@@ -429,28 +478,20 @@ class MMChatCollator:
     tokenizer: Any
 
     def collate_images(
-        self, all_images: list[torch.Tensor]
+        self,
+        batch: list[dict[str, Any]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        results = [
-            vision_to_patches(
-                image,
-                self.patch_size,
-                self.temporal_patch_size,
-                self.spatial_merge_size,
-            )
-            for image in all_images
+        all_patches = [
+            chunk
+            for sample in batch
+            for chunk in _tensor_chunks(sample.get("pixel_values"))
         ]
-        all_patches = [result[0] for result in results]
-        grid_thw_list = [result[1] for result in results]
-        merge_unit = self.spatial_merge_size**2
-        max_num_patch = max(patches.shape[0] for patches in all_patches)
-        if max_num_patch % merge_unit != 0:
-            max_num_patch = ((max_num_patch // merge_unit) + 1) * merge_unit
-        patch_dim = all_patches[0].shape[1]
-        padded_patches = torch.zeros(len(all_patches), max_num_patch, patch_dim)
-        for idx, patches in enumerate(all_patches):
-            padded_patches[idx, : patches.shape[0]] = patches
-        return padded_patches, torch.stack(grid_thw_list, dim=0)
+        grid_thw_list = [
+            chunk
+            for sample in batch
+            for chunk in _tensor_chunks(sample.get("grid_thw"))
+        ]
+        return torch.cat(all_patches, dim=0), torch.cat(grid_thw_list, dim=0)
 
     def collate_text(
         self,
@@ -508,7 +549,9 @@ class MMChatCollator:
     def __call__(
         self, batch: list[dict[str, Any]]
     ) -> tuple[dict[str, torch.Tensor | None], torch.Tensor]:
-        images_per_sample = [len(sample.get("pixel_values", [])) for sample in batch]
+        images_per_sample = [
+            _num_grid_items(sample.get("grid_thw")) for sample in batch
+        ]
         total_images = sum(images_per_sample)
         while (
             self.max_images_per_batch > 0
@@ -523,13 +566,25 @@ class MMChatCollator:
                 f"total <= {self.max_images_per_batch}"
             )
 
-        all_images = [
-            image
-            for sample in batch
-            for image in sample.get("pixel_values", [])
-        ]
-        patches, grids = self.collate_images(all_images) if all_images else (None, None)
+        total_images = sum(images_per_sample)
+        patches, grids = (
+            self.collate_images(batch) if total_images > 0 else (None, None)
+        )
         input_ids, labels, positions, input_token_mask = self.collate_text(batch)
+        pixel_values_bytes = (
+            0 if patches is None else patches.numel() * patches.element_size()
+        )
+        data_stats = {
+            "num_images": total_images,
+            "num_vit_patches": 0 if patches is None else int(patches.shape[0]),
+            "pixel_values_bytes": pixel_values_bytes,
+            "nonpad_tokens": int(input_token_mask.sum().item()),
+            "sequence_tokens": int(input_ids.numel()),
+            "packed_rows": len(batch),
+            "packed_docs": sum(
+                int(sample.get("num_packed_samples", 1)) for sample in batch
+            ),
+        }
         input_dict = {
             "input": input_ids,
             "positions": positions,
@@ -538,6 +593,7 @@ class MMChatCollator:
             "grid_thw": grids,
             "pixel_values_videos": None,
             "grid_thw_videos": None,
+            "data_stats": data_stats,
             "special_tokens": {
                 f"{name}_id": getattr(self.tokenizer, f"{name}_id")
                 for name in self.tokenizer.TOKEN_FIELDS
@@ -565,6 +621,7 @@ class MMChatDataLoader(ParallelAwareDataloader):
         image_mean: tuple[float, ...]
         image_std: tuple[float, ...]
         max_aspect_ratio: float = 50.0
+        pixel_values_dtype: str | None = "float32"
 
     def __init__(
         self,
@@ -611,6 +668,7 @@ class MMChatDataLoader(ParallelAwareDataloader):
             dp_world_size=dp_world_size,
             infinite=config.infinite,
             max_aspect_ratio=config.max_aspect_ratio,
+            pixel_values_dtype=config.pixel_values_dtype,
         )
         collate_fn = MMChatCollator(
             batch_size=local_batch_size,
