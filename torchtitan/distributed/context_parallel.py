@@ -139,13 +139,20 @@ def prepare_context_parallel_input(
     """
     attention_masks = extra_kwargs.get("attention_masks", None)
     positions = extra_kwargs["positions"]
-    (inputs, labels, positions), attention_masks = cp_shard(
+    input_token_mask = extra_kwargs.pop("input_token_mask", None)
+    shard_inputs = (inputs, labels, positions)
+    if input_token_mask is not None:
+        shard_inputs = (*shard_inputs, input_token_mask)
+    sharded_inputs, attention_masks = cp_shard(
         cp_mesh,
-        (inputs, labels, positions),
+        shard_inputs,
         attention_masks,
         load_balancer_type,
     )
+    inputs, labels, positions = sharded_inputs[:3]
     extra_kwargs["positions"] = positions
+    if input_token_mask is not None:
+        extra_kwargs["input_token_mask"] = sharded_inputs[3]
     if attention_masks is not None:
         extra_kwargs["attention_masks"] = attention_masks
 
@@ -244,15 +251,23 @@ def prepare_fla_context_parallel_input(
         device=device,
     )
 
+    input_token_mask = extra_kwargs.pop("input_token_mask", None)
     flat_inputs = inputs.reshape(1, total_tokens)
     flat_labels = labels.reshape(1, total_tokens)
-    (flat_inputs, flat_labels), _ = cp_shard(
+    shard_inputs = (flat_inputs, flat_labels)
+    if input_token_mask is not None:
+        flat_input_token_mask = input_token_mask.reshape(1, total_tokens)
+        shard_inputs = (*shard_inputs, flat_input_token_mask)
+    sharded_inputs, _ = cp_shard(
         cp_mesh,
-        (flat_inputs, flat_labels),
+        shard_inputs,
         attention_masks=None,
         load_balancer_type=None,
         input_seq_dim=1,
     )
+    flat_inputs, flat_labels = sharded_inputs[:2]
+    if input_token_mask is not None:
+        extra_kwargs["input_token_mask"] = sharded_inputs[2]
     return flat_inputs, flat_labels, extra_kwargs
 
 
@@ -282,6 +297,10 @@ def prepare_fla_varlen_input(
     )
     extra_kwargs["cu_seqlens_global"] = cu_seqlens_global
     extra_kwargs["cu_seqlens_global_cpu"] = cu_seqlens_global.detach().to("cpu")
+
+    input_token_mask = extra_kwargs.pop("input_token_mask", None)
+    if input_token_mask is not None:
+        extra_kwargs["input_token_mask"] = input_token_mask.reshape(1, total_tokens)
 
     return (
         inputs.reshape(1, total_tokens),

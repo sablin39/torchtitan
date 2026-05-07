@@ -188,6 +188,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     step: int
     ntokens_seen: int
     n_valid_tokens_seen: int
+    n_nonpad_tokens_seen: int
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
@@ -447,6 +448,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.step = 0
         self.ntokens_seen = 0
         self.n_valid_tokens_seen = 0
+        self.n_nonpad_tokens_seen = 0
 
         self.checkpointer = config.checkpoint.build(
             dataloader=self.dataloader,
@@ -584,10 +586,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         """
         inputs = input_dict["input"]
         extra_inputs = {k: v for k, v in input_dict.items() if k != "input"}
+        input_token_mask = extra_inputs.pop("input_token_mask", None)
         # extra_kwargs are forwarded to all PP stages; extra_inputs are only
         # available to the first stage.  Positions go into extra_kwargs so
         # every stage can apply RoPE correctly.
         extra_kwargs: dict[str, Any] = {}
+        if input_token_mask is not None:
+            extra_kwargs["input_token_mask"] = input_token_mask
 
         # Resolve positions once: per-document positions for block_causal,
         # sequential positions when CP needs them for shard indexing,
@@ -666,8 +671,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Accumulate after CP sharding so labels.numel() reflects the actual
         # unique tokens this rank processes (not the full pre-split sequence).
+        input_token_mask = extra_kwargs.pop("input_token_mask", input_token_mask)
         self.ntokens_seen += labels.numel()
         self.n_valid_tokens_seen += int((labels != IGNORE_INDEX).sum().item())
+        if input_token_mask is None:
+            self.n_nonpad_tokens_seen += labels.numel()
+        else:
+            self.n_nonpad_tokens_seen += int(input_token_mask.sum().item())
 
         return inputs, labels, extra_inputs, extra_kwargs
 
@@ -813,6 +823,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 global_max_loss,
                 global_ntokens_seen,
                 global_nvalid_tokens_seen,
+                global_nnonpad_tokens_seen,
             ) = (
                 dist_utils.dist_sum(loss, loss_mesh),
                 dist_utils.dist_max(local_avg_loss, loss_mesh),
@@ -832,15 +843,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     ),
                     loss_mesh,
                 ),
+                dist_utils.dist_sum(
+                    torch.tensor(
+                        self.n_nonpad_tokens_seen,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    loss_mesh,
+                ),
             )
         else:
             global_avg_loss = global_max_loss = float(loss.detach().item())
             global_ntokens_seen = self.ntokens_seen
             global_nvalid_tokens_seen = self.n_valid_tokens_seen
+            global_nnonpad_tokens_seen = self.n_nonpad_tokens_seen
 
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
             "n_valid_tokens_seen": global_nvalid_tokens_seen,
+            "n_nonpad_tokens_seen": global_nnonpad_tokens_seen,
             "lr": lr,
         }
         self.metrics_processor.log(
@@ -913,12 +934,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "step": self.step,
             "ntokens_seen": self.ntokens_seen,
             "n_valid_tokens_seen": self.n_valid_tokens_seen,
+            "n_nonpad_tokens_seen": self.n_nonpad_tokens_seen,
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
         self.ntokens_seen = state_dict["ntokens_seen"]
         self.n_valid_tokens_seen = state_dict.get("n_valid_tokens_seen", 0)
+        self.n_nonpad_tokens_seen = state_dict.get(
+            "n_nonpad_tokens_seen", self.ntokens_seen
+        )
 
     def close(self) -> None:
         if hasattr(self, "checkpointer") and self.checkpointer:
