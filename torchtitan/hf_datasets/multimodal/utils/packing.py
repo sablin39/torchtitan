@@ -71,8 +71,15 @@ class MMSamplePacker:
                 self._sample_buffer.clear()
                 break
 
-            # Incomplete sequence — keep in buffer for future samples
-            if not flush and current_length < self.max_seq_length:
+            # If the buffer is not full yet, keep an incomplete row around so
+            # future samples can improve occupancy. Once the buffer reaches the
+            # configured limit, emit the best row found by the greedy scan to
+            # keep processed image tensors from accumulating without bound.
+            if (
+                not flush
+                and current_length < self.max_seq_length
+                and len(self._sample_buffer) < self.buffer_size
+            ):
                 break
 
             samples = [self._sample_buffer.pop(sid) for sid in picked_ids]

@@ -145,7 +145,11 @@ class MultiModalCollator:
             images_per_sample.append(num_images)
 
         total_images = sum(images_per_sample)
-        while total_images > self.max_images_per_batch and batch:
+        while (
+            self.max_images_per_batch > 0
+            and total_images > self.max_images_per_batch
+            and batch
+        ):
             removed_images = images_per_sample.pop()
             total_images -= removed_images
             batch.pop()

@@ -1,8 +1,57 @@
 import copy
+import importlib
+import importlib.util
+from pathlib import Path
+import sys
 
+import torch
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import MultiModalData, ProcessingKwargs, ProcessorMixin, Unpack
+
+
+def _load_processor_core():
+    module_names = []
+    if __package__:
+        module_names.append(f"{__package__}.processor_core")
+    module_names.extend(
+        [
+            "processor_core",
+        ]
+    )
+    errors = []
+    for module_name in module_names:
+        try:
+            return importlib.import_module(module_name)
+        except ImportError as exc:
+            errors.append(f"{module_name}: {exc}")
+    source = (
+        Path(__file__).parents[2]
+        / "torchtitan"
+        / "hf_datasets"
+        / "multimodal"
+        / "processor_core.py"
+    )
+    if source.is_file():
+        spec = importlib.util.spec_from_file_location("_rwkv_vl_processor_core", source)
+        if spec is not None and spec.loader is not None:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            return module
+    try:
+        return importlib.import_module("torchtitan.hf_datasets.multimodal.processor_core")
+    except ImportError as exc:
+        errors.append(f"torchtitan.hf_datasets.multimodal.processor_core: {exc}")
+    raise ImportError(
+        "Could not import RWKV-VL processor_core. Tried:\n  "
+        + "\n  ".join([*errors, str(source)])
+    )
+
+
+_processor_core = _load_processor_core()
+make_image_config_from_processor = _processor_core.make_image_config_from_processor
+process_images = _processor_core.process_images
 
 
 CHAT_TEMPLATE = (
@@ -72,6 +121,7 @@ class ModRWKVProcessor(ProcessorMixin):
         image_processor: BaseImageProcessor = None,
         chat_template=None,
         auto_insert_image_tags: bool = True,
+        total_pixels_budget: bool = True,
     ):
         chat_template = CHAT_TEMPLATE if chat_template is None else chat_template
         super().__init__(
@@ -80,6 +130,7 @@ class ModRWKVProcessor(ProcessorMixin):
             chat_template=chat_template,
         )
         self.auto_insert_image_tags = auto_insert_image_tags
+        self.total_pixels_budget = total_pixels_budget
         self.image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
         self.vision_start_token = getattr(tokenizer, "vision_start_token", "<|vision_start|>")
         self.vision_end_token = getattr(tokenizer, "vision_end_token", "<|vision_end|>")
@@ -99,6 +150,7 @@ class ModRWKVProcessor(ProcessorMixin):
         output["processor_class"] = self.__class__.__name__
         if not self.auto_insert_image_tags:
             output["auto_insert_image_tags"] = False
+        output["total_pixels_budget"] = self.total_pixels_budget
         return output
 
     def _flatten_images(self, images):
@@ -123,6 +175,62 @@ class ModRWKVProcessor(ProcessorMixin):
         if isinstance(images, (list, tuple)) and len(images) == batch_size:
             return [len(self._flatten_images(sample_images)) for sample_images in images]
         return None
+
+    def _get_images_per_text_sample(self, images, batch_size):
+        if images is None:
+            return [[] for _ in range(batch_size)]
+        if batch_size == 1:
+            return [self._flatten_images(images)]
+        if isinstance(images, (list, tuple)) and len(images) == batch_size:
+            return [self._flatten_images(sample_images) for sample_images in images]
+        return None
+
+    def _process_images(self, images, batch_size, images_kwargs):
+        image_groups = self._get_images_per_text_sample(images, batch_size)
+        if image_groups is None:
+            image_groups = [self._flatten_images(images)]
+            num_images_per_sample = None
+        else:
+            num_images_per_sample = [len(group) for group in image_groups]
+
+        image_config = make_image_config_from_processor(
+            self.image_processor,
+            **images_kwargs,
+        )
+        processed_groups = [process_images(group, image_config) for group in image_groups]
+        num_image_tokens = [
+            count
+            for processed in processed_groups
+            for count in processed.image_token_counts
+        ]
+        if not num_image_tokens:
+            return {}, None, None, num_images_per_sample
+
+        pixel_values = torch.cat(
+            [
+                processed.flat_patches
+                for processed in processed_groups
+                if processed.flat_patches.numel() > 0
+            ],
+            dim=0,
+        )
+        image_grid_thw = torch.cat(
+            [
+                processed.grid_thw
+                for processed in processed_groups
+                if processed.grid_thw.numel() > 0
+            ],
+            dim=0,
+        )
+        return (
+            {
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+            },
+            image_grid_thw,
+            num_image_tokens,
+            num_images_per_sample,
+        )
 
     def _normalize_image_tags(self, text):
         return text.replace(self.user_image_tag, self.vision_image_token)
@@ -187,29 +295,34 @@ class ModRWKVProcessor(ProcessorMixin):
             **kwargs,
         )
 
+        if not isinstance(text, list):
+            text = [text] if text is not None else None
+
+        batch_size = len(text) if text is not None else 1
         if images is not None:
-            image_inputs = self.image_processor(images=images, **output_kwargs["images_kwargs"])
-            image_grid_thw = image_inputs["image_grid_thw"]
-            multimodal_tokens = self._get_num_multimodal_tokens(
-                image_grid_thw=image_grid_thw,
-                **output_kwargs["images_kwargs"],
+            (
+                image_inputs,
+                image_grid_thw,
+                num_image_tokens,
+                num_images_per_sample,
+            ) = self._process_images(
+                images,
+                batch_size,
+                output_kwargs["images_kwargs"],
             )
-            num_image_tokens = multimodal_tokens.num_image_tokens
         else:
             image_inputs = {}
             image_grid_thw = None
             num_image_tokens = None
+            num_images_per_sample = None
 
         if text is None:
             return BatchFeature(data=image_inputs)
-        if not isinstance(text, list):
-            text = [text]
 
         text = text.copy()
         expected_image_tokens = [0 for _ in text]
         expected_num_images = [0 for _ in text]
         if image_grid_thw is not None:
-            num_images_per_sample = self._get_num_images_per_text_sample(images, len(text))
             index = 0
             for i in range(len(text)):
                 if not self.auto_insert_image_tags:

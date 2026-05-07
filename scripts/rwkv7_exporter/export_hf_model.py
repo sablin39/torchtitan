@@ -99,6 +99,27 @@ def save_tokenizer_core(output: str) -> None:
     shutil.copyfile(source, Path(output) / "tokenizer_core.py")
 
 
+def save_processor_core(output: str) -> None:
+    candidates = [
+        Path(__file__).parents[2]
+        / "torchtitan"
+        / "hf_datasets"
+        / "multimodal"
+        / "processor_core.py",
+    ]
+    try:
+        import torchtitan.hf_datasets.multimodal.processor_core as processor_core
+    except ImportError:
+        pass
+    else:
+        candidates.append(Path(processor_core.__file__))
+    source = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if source is None:
+        formatted = "\n".join(f"  - {candidate}" for candidate in candidates)
+        raise FileNotFoundError(f"Could not find processor_core.py. Checked:\n{formatted}")
+    shutil.copyfile(source, Path(output) / "processor_core.py")
+
+
 def torch_load_weights(path: str) -> dict[str, torch.Tensor]:
     try:
         weights = torch.load(path, weights_only=True, map_location="cpu", mmap=True)
@@ -541,6 +562,7 @@ def save_multimodal_processor(
     )
     processor.save_pretrained(output)
     save_tokenizer_core(output)
+    save_processor_core(output)
 
 
 def verify_text_export(output: str, *, dtype: torch.dtype, verify_model_load: bool) -> None:

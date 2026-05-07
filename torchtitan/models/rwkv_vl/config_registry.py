@@ -47,7 +47,7 @@ class RWKVVLTrainerConfig(Trainer.Config):
 def _rwkv_vl_dataloader(dataset: str, **kwargs) -> MMDataLoader.Config:
     return MMDataLoader.Config(
         dataset=dataset,
-        max_images_per_batch=128,
+        max_images_per_batch=0,
         patch_size=16,
         temporal_patch_size=2,
         spatial_merge_size=2,
@@ -61,7 +61,7 @@ def _rwkv_vl_dataloader(dataset: str, **kwargs) -> MMDataLoader.Config:
 
 def _rwkv_vl_chat_dataloader(**kwargs) -> MMChatDataLoader.Config:
     return MMChatDataLoader.Config(
-        max_images_per_batch=128,
+        max_images_per_batch=0,
         patch_size=16,
         temporal_patch_size=2,
         spatial_merge_size=2,

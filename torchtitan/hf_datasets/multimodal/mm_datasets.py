@@ -79,7 +79,10 @@ from torchtitan.components.tokenizer import MultiModalTokenizer
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 from .mm_collator import MultiModalCollator
-from .utils.image import calculate_vision_tokens, process_image
+from .processor_core import (
+    RWKVVLImageProcessorConfig,
+    process_images as process_rwkv_vl_images,
+)
 from .utils.packing import MMSamplePacker
 from .utils.text import insert_vision_placeholders
 
@@ -126,37 +129,29 @@ def _process_mm_sample(
     if not texts or len(texts) != len(images):
         return None
 
-    processed_images = []
-    num_image_tokens = []
-
-    for idx, img in enumerate(images):
-        if img is not None:
-            # Resize (to multiples of patch_size x merge_size) and normalize images
-            processed_img = process_image(
-                img,
+    image_indices = [idx for idx, img in enumerate(images) if img is not None]
+    image_items = [images[idx] for idx in image_indices]
+    try:
+        processed = process_rwkv_vl_images(
+            image_items,
+            RWKVVLImageProcessorConfig(
                 patch_size=patch_size,
-                merge_size=spatial_merge_size,
+                temporal_patch_size=temporal_patch_size,
+                spatial_merge_size=spatial_merge_size,
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
                 image_mean=image_mean,
                 image_std=image_std,
-            )
-            if processed_img is not None:
-                num_tokens, _, _ = calculate_vision_tokens(
-                    num_frames=1,
-                    height=processed_img.shape[1],
-                    width=processed_img.shape[2],
-                    patch_size=patch_size,
-                    spatial_merge_size=spatial_merge_size,
-                    temporal_patch_size=1,
-                )
-                processed_images.append(processed_img)
-                num_image_tokens.append(num_tokens)
-                texts[idx] = None
-
-    if len(processed_images) != len([_ for _ in images if _ is not None]):
-        logger.warning("Cannot process all images for sample. Dropping")
+                max_aspect_ratio=float(kwargs.get("max_aspect_ratio", 200.0)),
+            ),
+        )
+    except Exception as exc:
+        logger.warning(f"Cannot process all images for sample. Dropping: {exc}")
         return None
+    processed_images = processed.images
+    num_image_tokens = processed.image_token_counts
+    for idx in image_indices:
+        texts[idx] = None
 
     # Replace image placeholders (None) with image token sequences
     processed_text = insert_vision_placeholders(

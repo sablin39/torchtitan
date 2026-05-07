@@ -13,16 +13,15 @@ from typing import Any
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from datasets.distributed import split_dataset_by_node
-from PIL import Image
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.hf_datasets.multimodal.utils.image import (
-    calculate_vision_tokens,
-    process_image,
+from torchtitan.hf_datasets.multimodal.processor_core import (
+    RWKVVLImageProcessorConfig,
+    process_images as process_rwkv_vl_images,
     vision_to_patches,
 )
 from torchtitan.hf_datasets.multimodal.utils.packing import MMSamplePacker
@@ -176,12 +175,6 @@ def validate_mm_chat_messages(messages: list[dict[str, Any]]) -> None:
         raise ValueError("MM chat sample has no assistant turn")
 
 
-def _normalize_pil_image(image: Any) -> Any:
-    if isinstance(image, Image.Image):
-        return image.convert("RGB")
-    return image
-
-
 def process_mm_chat_images(
     images: list[Any],
     *,
@@ -194,43 +187,20 @@ def process_mm_chat_images(
     image_std: tuple[float, ...],
     max_aspect_ratio: float,
 ) -> tuple[list[torch.Tensor], list[int]]:
-    processed_images = []
-    image_token_counts = []
-    for image in images:
-        image = _normalize_pil_image(image)
-        if hasattr(image, "size"):
-            width, height = image.size
-            if width == 0 or height == 0:
-                raise ValueError("Image has zero width or height")
-            ratio = max(width / height, height / width)
-            if ratio > max_aspect_ratio:
-                raise ValueError(
-                    f"Image aspect ratio {ratio:.1f} exceeds {max_aspect_ratio}"
-                )
-
-        processed = process_image(
-            image,
+    processed = process_rwkv_vl_images(
+        images,
+        RWKVVLImageProcessorConfig(
             patch_size=patch_size,
-            merge_size=spatial_merge_size,
+            temporal_patch_size=temporal_patch_size,
+            spatial_merge_size=spatial_merge_size,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
             image_mean=image_mean,
             image_std=image_std,
-        )
-        if processed is None:
-            raise ValueError("Could not process image")
-
-        num_tokens, _, _ = calculate_vision_tokens(
-            num_frames=1,
-            height=processed.shape[1],
-            width=processed.shape[2],
-            patch_size=patch_size,
-            spatial_merge_size=spatial_merge_size,
-            temporal_patch_size=temporal_patch_size,
-        )
-        processed_images.append(processed)
-        image_token_counts.append(num_tokens)
-    return processed_images, image_token_counts
+            max_aspect_ratio=max_aspect_ratio,
+        ),
+    )
+    return processed.images, processed.image_token_counts
 
 
 def build_image_token_counts_by_message(
@@ -485,7 +455,7 @@ class MMChatCollator:
     def collate_text(
         self,
         batch: list[dict[str, Any]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         input_ids = pad_sequence(
             [sample["input_ids"] for sample in batch],
             batch_first=True,
@@ -529,14 +499,22 @@ class MMChatCollator:
                 (0, 0, 0, self.batch_size - positions.shape[0]),
                 value=0,
             )
-        return input_ids, labels, positions
+        input_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for sample_idx, sample in enumerate(batch[: self.batch_size]):
+            valid_len = min(sample["input_ids"].numel(), self.seq_len)
+            input_token_mask[sample_idx, :valid_len] = True
+        return input_ids, labels, positions, input_token_mask
 
     def __call__(
         self, batch: list[dict[str, Any]]
     ) -> tuple[dict[str, torch.Tensor | None], torch.Tensor]:
         images_per_sample = [len(sample.get("pixel_values", [])) for sample in batch]
         total_images = sum(images_per_sample)
-        while total_images > self.max_images_per_batch and batch:
+        while (
+            self.max_images_per_batch > 0
+            and total_images > self.max_images_per_batch
+            and batch
+        ):
             removed = images_per_sample.pop()
             total_images -= removed
             batch.pop()
@@ -551,10 +529,11 @@ class MMChatCollator:
             for image in sample.get("pixel_values", [])
         ]
         patches, grids = self.collate_images(all_images) if all_images else (None, None)
-        input_ids, labels, positions = self.collate_text(batch)
+        input_ids, labels, positions, input_token_mask = self.collate_text(batch)
         input_dict = {
             "input": input_ids,
             "positions": positions,
+            "input_token_mask": input_token_mask,
             "pixel_values": patches,
             "grid_thw": grids,
             "pixel_values_videos": None,
