@@ -176,18 +176,18 @@ def _process_mm_sample(
     input_ids = torch.tensor(tokens)
     labels = torch.tensor(tokens)
 
-    special_token_ids = torch.tensor(
-        [
-            # pyrefly: ignore [missing-attribute]
-            tokenizer.vision_start_id,
-            # pyrefly: ignore [missing-attribute]
-            tokenizer.vision_end_id,
-            # pyrefly: ignore [missing-attribute]
-            tokenizer.image_id,
-            # pyrefly: ignore [missing-attribute]
-            tokenizer.video_id,
-        ]
-    )
+    special_ids = [
+        # pyrefly: ignore [missing-attribute]
+        tokenizer.vision_start_id,
+        # pyrefly: ignore [missing-attribute]
+        tokenizer.vision_end_id,
+        # pyrefly: ignore [missing-attribute]
+        tokenizer.image_id,
+    ]
+    video_id = getattr(tokenizer, "video_id", None)
+    if video_id is not None:
+        special_ids.append(video_id)
+    special_token_ids = torch.tensor(special_ids)
     labels = torch.where(torch.isin(labels, special_token_ids), IGNORE_INDEX, labels)
 
     return {
