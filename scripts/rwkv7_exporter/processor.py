@@ -50,53 +50,10 @@ def _load_processor_core():
 
 
 _processor_core = _load_processor_core()
+CHAT_TEMPLATE = _processor_core.CHAT_TEMPLATE
+CHAT_TEMPLATE_FAKE_THINKING = _processor_core.CHAT_TEMPLATE_FAKE_THINKING
 make_image_config_from_processor = _processor_core.make_image_config_from_processor
 process_images = _processor_core.process_images
-
-
-CHAT_TEMPLATE = (
-    "{% for message in messages %}"
-    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ':' }}"
-    "{% if message['content'] is string %}"
-    "{{ message['content'] }}"
-    "{% else %}"
-    "{% set ns = namespace(explicit_image_tags=0, image_items=0, text_parts=[]) %}"
-    "{% for item in message['content'] %}"
-    "{% if item['type'] == 'text' %}"
-    "{% set ns.text_parts = ns.text_parts + [item['text']] %}"
-    "{% set ns.explicit_image_tags = ns.explicit_image_tags + item['text'].count('<image>') %}"
-    "{% elif item['type'] in ['image', 'image_url'] %}"
-    "{% set ns.image_items = ns.image_items + 1 %}"
-    "{% endif %}"
-    "{% endfor %}"
-    "{% for _ in range([ns.image_items - ns.explicit_image_tags, 0] | max) %}"
-    "{{ '<image>' }}"
-    "{% endfor %}"
-    "{{ ns.text_parts | join('') }}"
-    "{% endif %}"
-    "{{ '\\x17' }}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}{{ '\\x16Assistant:' }}{% endif %}"
-)
-
-CHAT_TEMPLATE_NO_IMAGE_TAGS = (
-    "{% for message in messages %}"
-    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ':' }}"
-    "{% if message['content'] is string %}"
-    "{{ message['content'] }}"
-    "{% else %}"
-    "{% set ns = namespace(text_parts=[]) %}"
-    "{% for item in message['content'] %}"
-    "{% if item['type'] == 'text' %}"
-    "{% set ns.text_parts = ns.text_parts + [item['text']] %}"
-    "{% endif %}"
-    "{% endfor %}"
-    "{{ ns.text_parts | join('') }}"
-    "{% endif %}"
-    "{{ '\\x17' }}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}{{ '\\x16Assistant:' }}{% endif %}"
-)
 
 
 class ModRWKVProcessorKwargs(ProcessingKwargs, total=False):

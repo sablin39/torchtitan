@@ -11,6 +11,7 @@ from typing import Any
 
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.models.rwkv7.tokenizer_core import (
+    CHAT_TEMPLATE_FAKE_THINKING,
     DEFAULT_BOS_TOKEN,
     DEFAULT_EOS_TOKEN,
     DEFAULT_IMAGE_TOKEN,
@@ -42,6 +43,7 @@ class RwkvTokenizer(BaseTokenizer):
         vision_end_token: str = DEFAULT_VISION_END_TOKEN
         add_bos_token: bool = False
         add_eos_token: bool = False
+        fake_thinking: bool = False
 
     def __init__(
         self,
@@ -94,6 +96,8 @@ class RwkvTokenizer(BaseTokenizer):
                 self.set_chat_template(f.read())
         elif hf_config is not None and "chat_template" in hf_config:
             self.set_chat_template(hf_config["chat_template"])
+        if self.config.fake_thinking:
+            self.set_chat_template(CHAT_TEMPLATE_FAKE_THINKING)
 
         self.idx2token = self.core.idx2token
         self.token2idx = self.core.token2idx

@@ -7,31 +7,15 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 from transformers import AddedToken, PreTrainedTokenizer
 from transformers.utils import logging
 
-try:
-    from .tokenizer_core import (
-        DEFAULT_IMAGE_TOKEN,
-        DEFAULT_VISION_END_TOKEN,
-        DEFAULT_VISION_START_TOKEN,
-        RWKVSpecialTokens,
-        RWKVTokenizerCore,
-    )
-except ImportError:
-    try:
-        from tokenizer_core import (
-            DEFAULT_IMAGE_TOKEN,
-            DEFAULT_VISION_END_TOKEN,
-            DEFAULT_VISION_START_TOKEN,
-            RWKVSpecialTokens,
-            RWKVTokenizerCore,
-        )
-    except ImportError:
-        from torchtitan.models.rwkv7.tokenizer_core import (
-            DEFAULT_IMAGE_TOKEN,
-            DEFAULT_VISION_END_TOKEN,
-            DEFAULT_VISION_START_TOKEN,
-            RWKVSpecialTokens,
-            RWKVTokenizerCore,
-        )
+from torchtitan.models.rwkv7.tokenizer_core import (
+    CHAT_TEMPLATE,
+    CHAT_TEMPLATE_FAKE_THINKING,
+    DEFAULT_IMAGE_TOKEN,
+    DEFAULT_VISION_END_TOKEN,
+    DEFAULT_VISION_START_TOKEN,
+    RWKVSpecialTokens,
+    RWKVTokenizerCore,
+)
 
 
 if TYPE_CHECKING:
@@ -44,22 +28,7 @@ VOCAB_FILES_NAMES = {
     "vocab_file": "wr_vocab_v20230424.txt",
 }
 
-CHAT_TEMPLATE = """{% for message in messages -%}
-<|im_start|>{{ message['role'][:1] | upper }}{{ message['role'][1:] }}: {{ message['content'] }}
-<|im_end|>
-
-{% endfor -%}
-{% if add_generation_prompt -%}
-<|im_start|>Assistant: {% if thinking is defined and thinking %}<think>{% else %}<think></think>{% endif %}
-{% endif -%}"""
-
 DEFAULT_ADDITIONAL_SPECIAL_TOKENS = [
-    "<tool_calls_begin>",
-    "</tool_calls_end>",
-    "<tool_call>",
-    "</tool_call>",
-    "<tool_response>",
-    "</tool_response>",
     DEFAULT_VISION_START_TOKEN,
     DEFAULT_VISION_END_TOKEN,
     DEFAULT_IMAGE_TOKEN,
@@ -77,10 +46,10 @@ class RwkvTokenizer(PreTrainedTokenizer):
     def __init__(
         self,
         vocab_file,
-        bos_token="<|im_start|>",
-        eos_token="<|im_end|>",
-        pad_token="<|im_end|>",
-        unk_token="<|im_start|>",
+        bos_token="\x16",
+        eos_token="\x17",
+        pad_token="\x17",
+        unk_token="\x16",
         chat_template=None,
         **kwargs,
     ):

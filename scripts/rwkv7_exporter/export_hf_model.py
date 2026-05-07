@@ -22,15 +22,15 @@ from transformers import (
 try:
     from .configuration_rwkv7 import RWKV7Config
     from .modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
-    from .tokenizer import RwkvTokenizer
+    from .tokenizer import CHAT_TEMPLATE_FAKE_THINKING, RwkvTokenizer
 except ImportError:
     from configuration_rwkv7 import RWKV7Config
     from modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
-    from tokenizer import RwkvTokenizer
+    from tokenizer import CHAT_TEMPLATE_FAKE_THINKING, RwkvTokenizer
 
 
-IM_START_TOKEN = "<|im_start|>"
-IM_END_TOKEN = "<|im_end|>"
+IM_START_TOKEN = "\x16"
+IM_END_TOKEN = "\x17"
 IM_START_TOKEN_ID = 23
 IM_END_TOKEN_ID = 24
 DEFAULT_MAX_SHARD_SIZE = "1000GB"
@@ -88,12 +88,9 @@ def resolve_vocab_file(name: str) -> Path:
 
 
 def save_tokenizer_core(output: str) -> None:
-    try:
-        import torchtitan.models.rwkv7.tokenizer_core as tokenizer_core
-    except ImportError:
-        source = Path(__file__).with_name("tokenizer_core.py")
-    else:
-        source = Path(tokenizer_core.__file__)
+    import torchtitan.models.rwkv7.tokenizer_core as tokenizer_core
+
+    source = Path(tokenizer_core.__file__)
     if not source.is_file():
         raise FileNotFoundError(f"Could not find tokenizer_core.py at {source}")
     shutil.copyfile(source, Path(output) / "tokenizer_core.py")
@@ -529,11 +526,18 @@ def save_multimodal_processor(
     output: str,
     image_processor_source: str,
     max_pixels: int | None,
+    fake_thinking: bool,
 ) -> None:
     try:
+        from .processor import (
+            CHAT_TEMPLATE_FAKE_THINKING as PROCESSOR_CHAT_TEMPLATE_FAKE_THINKING,
+        )
         from .processor import ModRWKVProcessor
         from .tokenizer import RwkvTokenizer as VLRwkvTokenizer
     except ImportError:
+        from processor import (  # type: ignore[no-redef]
+            CHAT_TEMPLATE_FAKE_THINKING as PROCESSOR_CHAT_TEMPLATE_FAKE_THINKING,
+        )
         from processor import ModRWKVProcessor
         from tokenizer import RwkvTokenizer as VLRwkvTokenizer
 
@@ -559,6 +563,7 @@ def save_multimodal_processor(
     processor = ModRWKVProcessor(
         tokenizer=tokenizer,
         image_processor=image_processor,
+        chat_template=PROCESSOR_CHAT_TEMPLATE_FAKE_THINKING if fake_thinking else None,
     )
     processor.save_pretrained(output)
     save_tokenizer_core(output)
@@ -634,6 +639,7 @@ def convert(
     max_position_embeddings: int | None = None,
     max_shard_size: str = DEFAULT_MAX_SHARD_SIZE,
     verify_model_load: bool = True,
+    fake_thinking: bool = False,
 ):
     output = os.path.realpath(output)
     text_weights = extract_text_weights(torch_load_weights(rwkv7))
@@ -668,6 +674,7 @@ def convert(
         eos_token=IM_END_TOKEN,
         pad_token=IM_END_TOKEN,
         unk_token=IM_START_TOKEN,
+        chat_template=CHAT_TEMPLATE_FAKE_THINKING if fake_thinking else None,
     )
     tokenizer.register_for_auto_class()
     tokenizer.save_pretrained(output)
@@ -690,6 +697,7 @@ def convert_multimodal(
     image_processor: str | None = None,
     max_pixels: int | None = None,
     verify_model_load: bool = False,
+    fake_thinking: bool = False,
 ) -> None:
     output = os.path.realpath(output)
     text_weights = extract_text_weights(torch_load_weights(rwkv7))
@@ -748,6 +756,7 @@ def convert_multimodal(
         output=output,
         image_processor_source=image_processor or vision_model,
         max_pixels=max_pixels,
+        fake_thinking=fake_thinking,
     )
     print(f"Saved RWKV-VL HF checkpoint to {output}")
     verify_multimodal_export(
@@ -804,6 +813,11 @@ if __name__ == '__main__':
         action='store_true',
         help='After saving, load the full exported model through AutoModel. This can require substantial RAM.',
     )
+    parser.add_argument(
+        '--fake-thinking',
+        action='store_true',
+        help='Save a chat template that prefixes every assistant message with an empty <think> block.',
+    )
     args = parser.parse_args()
 
     if args.multimodal:
@@ -821,6 +835,7 @@ if __name__ == '__main__':
             image_processor=args.image_processor,
             max_pixels=args.max_pixels,
             verify_model_load=args.verify_model_load,
+            fake_thinking=args.fake_thinking,
         )
     else:
         convert(
@@ -830,4 +845,5 @@ if __name__ == '__main__':
             max_position_embeddings=args.max_position_embeddings,
             max_shard_size=args.max_shard_size,
             verify_model_load=args.verify_model_load,
+            fake_thinking=args.fake_thinking,
         )

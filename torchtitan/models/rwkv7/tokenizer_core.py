@@ -23,36 +23,33 @@ DEFAULT_VISION_START_TOKEN = "<|vision_start|>"
 DEFAULT_VISION_END_TOKEN = "<|vision_end|>"
 DEFAULT_IMAGE_PLACEHOLDER_TOKEN = "<image>"
 
-SPECIAL_TOKEN_TEXT_TO_RAW = {
-    "<tool_calls_begin>": "\x10",
-    "</tool_calls_end>": "\x11",
-    "<tool_call>": "\x12",
-    "</tool_call>": "\x13",
-    "<tool_response>": "\x14",
-    "</tool_response>": "\x15",
-    "<|im_start|>": "\x16",
-    "<|im_end|>": "\x17",
-}
+CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ':' }}"
+    "{{ message['content'] }}"
+    "{{ '\\x17' }}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    "{{ '\\x16Assistant:' }}"
+    "{% if thinking is defined and thinking %}{{ ' <think>' }}{% endif %}"
+    "{% endif %}"
+)
 
-RAW_SPECIAL_TOKEN_IDS = {
-    raw: idx
-    for idx, raw in enumerate(
-        ["\x10", "\x11", "\x12", "\x13", "\x14", "\x15", "\x16", "\x17"],
-        start=17,
-    )
-}
+CHAT_TEMPLATE_FAKE_THINKING = (
+    "{% for message in messages %}"
+    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ':' }}"
+    "{% if message['role'] == 'assistant' %}{{ ' <think>\\n</think>\\n' }}{% endif %}"
+    "{{ message['content'] }}"
+    "{{ '\\x17' }}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{ '\\x16Assistant: <think>\\n</think>\\n' }}{% endif %}"
+)
 
 SPECIAL_TOKEN_TEXT_TO_ID = {
-    text: RAW_SPECIAL_TOKEN_IDS[raw]
-    for text, raw in SPECIAL_TOKEN_TEXT_TO_RAW.items()
+    DEFAULT_VISION_START_TOKEN: 65530,
+    DEFAULT_VISION_END_TOKEN: 65531,
+    DEFAULT_IMAGE_TOKEN: 65532,
 }
-SPECIAL_TOKEN_TEXT_TO_ID.update(
-    {
-        DEFAULT_VISION_START_TOKEN: 65530,
-        DEFAULT_VISION_END_TOKEN: 65531,
-        DEFAULT_IMAGE_TOKEN: 65532,
-    }
-)
 
 SPECIAL_TOKEN_ID_TO_TEXT = {
     token_id: text for text, token_id in SPECIAL_TOKEN_TEXT_TO_ID.items()

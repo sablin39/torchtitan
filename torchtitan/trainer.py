@@ -71,6 +71,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         (fqn to file mapping), the config.json file, generation_config.json, and tokenizer files.
         """
 
+        fake_thinking: bool = False
+        """
+        Replace the tokenizer chat template with the RWKV fake-thinking template,
+        which prefixes assistant messages with an empty <think> block.
+        """
+
         dump_folder: str = "./outputs"
         """Folder to dump job outputs"""
 
@@ -236,6 +242,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
         # build tokenizer
         self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
+        if config.fake_thinking:
+            from torchtitan.models.rwkv7.tokenizer import CHAT_TEMPLATE_FAKE_THINKING
+
+            self.tokenizer.set_chat_template(CHAT_TEMPLATE_FAKE_THINKING)
 
         # build dataloader
         self.dataloader = config.dataloader.build(
