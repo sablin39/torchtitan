@@ -110,6 +110,8 @@ lr_warmup_steps="500"
 lr_total_steps=""
 lr_decay_type="cosine"
 lr_min_factor="0.1"
+checkpoint_interval="2000"
+checkpoint_keep_latest_k="0"
 image_processor=""
 min_pixels="65536"
 max_pixels="2097152"
@@ -171,6 +173,16 @@ fi
 
 if [[ "${fake_thinking}" != "0" && "${fake_thinking}" != "1" ]]; then
     echo "fake_thinking must be 0 or 1, got: ${fake_thinking}" >&2
+    exit 2
+fi
+
+if ! [[ "${checkpoint_interval}" =~ ^[0-9]+$ ]] || (( checkpoint_interval < 1 )); then
+    echo "checkpoint_interval must be a positive integer, got: ${checkpoint_interval}" >&2
+    exit 2
+fi
+
+if ! [[ "${checkpoint_keep_latest_k}" =~ ^[0-9]+$ ]]; then
+    echo "checkpoint_keep_latest_k must be a non-negative integer, got: ${checkpoint_keep_latest_k}" >&2
     exit 2
 fi
 
@@ -280,8 +292,8 @@ train_args=(
     --activation-checkpoint.mode "${activation_checkpoint_mode}"
     --checkpoint.enable
     --checkpoint.initial-load-path "${dcp_dir}"
-    --checkpoint.interval "${training_steps}"
-    --checkpoint.keep-latest-k 0
+    --checkpoint.interval "${checkpoint_interval}"
+    --checkpoint.keep-latest-k "${checkpoint_keep_latest_k}"
     --checkpoint.export-dtype "${export_dtype}"
 )
 
