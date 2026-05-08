@@ -48,6 +48,7 @@ torchrun_cmd="$(resolve_cmd torchrun "${repo_root}/.venv/bin/torchrun")"
 
 rwkv7_path="/mnt/raid0_8t/rwkv7-g1/rwkv7-g1d-0.4b-20260210-ctx8192.pth"
 vision_model="/home/rwkv/models/Qwen3.5-0.8B"
+fake_thinking="1"
 dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/chartqa(cauldron,llava_format)"
 
 split="train"
@@ -166,6 +167,11 @@ if ! [[ "${packing_buffer_size}" =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 
+if [[ "${fake_thinking}" != "0" && "${fake_thinking}" != "1" ]]; then
+    echo "fake_thinking must be 0 or 1, got: ${fake_thinking}" >&2
+    exit 2
+fi
+
 run_until_epoch="0"
 if [[ "${steps}" == "epoch" || "${steps}" == "auto" ]]; then
     run_until_epoch="1"
@@ -231,6 +237,9 @@ fi
 if [[ -n "${max_position_embeddings}" ]]; then
     export_args+=(--max-position-embeddings "${max_position_embeddings}")
 fi
+if [[ "${fake_thinking}" == "1" ]]; then
+    export_args+=(--fake-thinking)
+fi
 
 echo
 echo "==> Step 1/4: Exporting RWKV-VL HF checkpoint"
@@ -285,6 +294,9 @@ if [[ "${wandb}" == "1" ]]; then
 fi
 if [[ "${nvml_metrics}" == "1" ]]; then
     train_args+=(--metrics.enable-nvml-metrics)
+fi
+if [[ "${fake_thinking}" == "1" ]]; then
+    train_args+=(--fake-thinking)
 fi
 if [[ -n "${min_pixels}" ]]; then
     train_args+=(--dataloader.min-pixels "${min_pixels}")

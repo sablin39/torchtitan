@@ -88,7 +88,10 @@ CHAT_TEMPLATE_FAKE_THINKING = (
     "{% endif %}"
     "{{ '\\x17' }}"
     "{% endfor %}"
-    "{% if add_generation_prompt %}{{ '\\x16Assistant: <think>\\n</think>\\n' }}{% endif %}"
+    "{% if add_generation_prompt %}"
+    "{{ '\\x16Assistant:' }}"
+    "{% if thinking is defined and thinking %}{{ ' <think>' }}{% endif %}"
+    "{% endif %}"
 )
 
 

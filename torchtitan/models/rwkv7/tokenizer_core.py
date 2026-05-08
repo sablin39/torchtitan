@@ -42,7 +42,10 @@ CHAT_TEMPLATE_FAKE_THINKING = (
     "{{ message['content'] }}"
     "{{ '\\x17' }}"
     "{% endfor %}"
-    "{% if add_generation_prompt %}{{ '\\x16Assistant: <think>\\n</think>\\n' }}{% endif %}"
+    "{% if add_generation_prompt %}"
+    "{{ '\\x16Assistant:' }}"
+    "{% if thinking is defined and thinking %}{{ ' <think>' }}{% endif %}"
+    "{% endif %}"
 )
 
 SPECIAL_TOKEN_TEXT_TO_ID = {
