@@ -29,6 +29,27 @@ Weights and Biases will automatically send metrics to a remote server if you log
 
 So all you need to do is make sure that `metrics.enable_wandb` is enabled
 
+If you need SwanLab to receive the WandB metrics instead, install SwanLab and
+enable it:
+
+```
+pip install swanlab
+python -m torchtitan.train ... --metrics.enable-swanlab
+```
+
+When `metrics.enable_swanlab` is set, TorchTitan calls
+`swanlab.sync_wandb(wandb_run=False)` before the wrapped logger calls
+`wandb.init()`. This lets SwanLab consume the WandB-style metrics while WandB
+itself stays offline. If you want to upload to both WandB and SwanLab, enable
+both flags:
+
+```
+python -m torchtitan.train ... --metrics.enable-wandb --metrics.enable-swanlab
+```
+
+In that case TorchTitan calls `swanlab.sync_wandb(wandb_run=True)` before
+`wandb.init()`.
+
 For an example you can inspect the Llama 3 [config_registry.py](../torchtitan/models/llama3/config_registry.py)
 
 Note that if both W&B and Tensorboard are enabled then we will prioritize W&B.

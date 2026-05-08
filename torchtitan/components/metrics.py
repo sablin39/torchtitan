@@ -138,7 +138,16 @@ class WandBLogger(BaseLogger):
         log_dir: str,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
+        sync_swanlab: bool = False,
+        swanlab_wandb_run: bool = True,
     ):
+        if sync_swanlab:
+            # Import swanlab before wandb.init so it can install its WandB sync hook.
+            import swanlab
+
+            swanlab.sync_wandb(wandb_run=swanlab_wandb_run)
+            logger.info("SwanLab WandB sync enabled")
+
         # Import wandb here to avoid startup import
         import wandb
 
@@ -301,6 +310,13 @@ class MetricsProcessor(Configurable):
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
 
+        enable_swanlab: bool = False
+        """
+        Whether to sync WandB metrics to SwanLab.
+        When enable_wandb is false, SwanLab still uses wandb.init but disables
+        the WandB run through swanlab.sync_wandb(wandb_run=False).
+        """
+
         enable_nvml_metrics: bool = False
         """
         Whether to log NVIDIA NVML GPM metrics such as SM and tensor utilization.
@@ -396,11 +412,14 @@ class MetricsProcessor(Configurable):
         # Log initial config state
         logger.debug(
             f"Building logger with config: wandb={config.enable_wandb}, "
+            f"swanlab={config.enable_swanlab}, "
             f"tensorboard={config.enable_tensorboard}"
         )
 
         # Check if any logging backend is enabled
-        has_logging_enabled = config.enable_tensorboard or config.enable_wandb
+        has_logging_enabled = (
+            config.enable_tensorboard or config.enable_wandb or config.enable_swanlab
+        )
 
         # Determine if this rank should log
         should_log = has_logging_enabled
@@ -440,15 +459,25 @@ class MetricsProcessor(Configurable):
         logger_container = LoggerContainer()
 
         # Create loggers in priority order
-        if config.enable_wandb:
+        if config.enable_wandb or config.enable_swanlab:
             logger.debug("Attempting to create WandB logger")
             try:
                 wandb_logger = WandBLogger(
-                    base_log_dir, config_dict=config_dict, tag=tag
+                    base_log_dir,
+                    config_dict=config_dict,
+                    tag=tag,
+                    sync_swanlab=config.enable_swanlab,
+                    swanlab_wandb_run=config.enable_wandb,
                 )
                 logger_container.add_logger(wandb_logger)
             except Exception as e:
-                if "No module named 'wandb'" in str(e):
+                if "No module named 'swanlab'" in str(e):
+                    logger.error(
+                        "Failed to create WandB logger: No module named 'swanlab'. "
+                        "Please install it using 'pip install swanlab' or disable "
+                        "metrics.enable_swanlab."
+                    )
+                elif "No module named 'wandb'" in str(e):
                     logger.error(
                         "Failed to create WandB logger: No module named 'wandb'. Please install it using 'pip install wandb'."
                     )

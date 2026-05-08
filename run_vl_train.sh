@@ -42,6 +42,7 @@ torchrun_cmd="$(resolve_cmd torchrun "${repo_root}/.venv/bin/torchrun")"
 #   export WANDB_PROJECT=torchtitan
 #   export WANDB_RUN_NAME=rwkv-vl-train
 #   export WANDB_MODE=offline  # optional, for offline/local logging
+# Set swanlab="1" below to call swanlab.sync_wandb() before wandb.init().
 #
 # Edit this block directly for now. We will replace it with a smarter config
 # system later.
@@ -97,7 +98,8 @@ train_module="proj,llm"
 projector_seed="1234"
 activation_checkpoint_mode="none"
 log_freq="1"
-wandb="1"
+wandb="0"
+swanlab="1"
 nvml_metrics="1"
 overwrite="0"
 optimizer_name="Adam"
@@ -291,6 +293,9 @@ if [[ -n "${lr_total_steps}" ]]; then
 fi
 if [[ "${wandb}" == "1" ]]; then
     train_args+=(--metrics.enable-wandb)
+fi
+if [[ "${swanlab}" == "1" ]]; then
+    train_args+=(--metrics.enable-swanlab)
 fi
 if [[ "${nvml_metrics}" == "1" ]]; then
     train_args+=(--metrics.enable-nvml-metrics)
