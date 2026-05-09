@@ -29,7 +29,7 @@ python_cmd="$(resolve_cmd python "${repo_root}/.venv/bin/python")"
 torchrun_cmd="$(resolve_cmd torchrun "${repo_root}/.venv/bin/torchrun")"
 
 # Pipeline:
-#   1. Export RWKV .pth + Qwen3.5 vision weights to an HF RWKV-VL checkpoint.
+#   1. Export RWKV .pth + Qwen3-VL vision weights to an HF RWKV-VL checkpoint.
 #   2. Convert that HF checkpoint to TorchTitan DCP.
 #   3. Train with TorchTitan.
 #   4. Convert the final TorchTitan DCP checkpoint back to HF and copy HF assets.

@@ -1,59 +1,32 @@
 import copy
-import importlib
-import importlib.util
-from pathlib import Path
-import sys
 
 import torch
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import MultiModalData, ProcessingKwargs, ProcessorMixin, Unpack
 
-
-def _load_processor_core():
-    module_names = []
-    if __package__:
-        module_names.append(f"{__package__}.processor_core")
-    module_names.extend(
-        [
-            "processor_core",
-        ]
+try:
+    from .processor_core import (
+        CHAT_TEMPLATE,
+        CHAT_TEMPLATE_FAKE_THINKING,
+        make_image_config_from_processor,
+        process_images,
     )
-    errors = []
-    for module_name in module_names:
-        try:
-            return importlib.import_module(module_name)
-        except ImportError as exc:
-            errors.append(f"{module_name}: {exc}")
-    source = (
-        Path(__file__).parents[2]
-        / "torchtitan"
-        / "hf_datasets"
-        / "multimodal"
-        / "processor_core.py"
-    )
-    if source.is_file():
-        spec = importlib.util.spec_from_file_location("_rwkv_vl_processor_core", source)
-        if spec is not None and spec.loader is not None:
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            spec.loader.exec_module(module)
-            return module
+except ImportError:
     try:
-        return importlib.import_module("torchtitan.hf_datasets.multimodal.processor_core")
-    except ImportError as exc:
-        errors.append(f"torchtitan.hf_datasets.multimodal.processor_core: {exc}")
-    raise ImportError(
-        "Could not import RWKV-VL processor_core. Tried:\n  "
-        + "\n  ".join([*errors, str(source)])
-    )
-
-
-_processor_core = _load_processor_core()
-CHAT_TEMPLATE = _processor_core.CHAT_TEMPLATE
-CHAT_TEMPLATE_FAKE_THINKING = _processor_core.CHAT_TEMPLATE_FAKE_THINKING
-make_image_config_from_processor = _processor_core.make_image_config_from_processor
-process_images = _processor_core.process_images
+        from processor_core import (  # type: ignore[no-redef]
+            CHAT_TEMPLATE,
+            CHAT_TEMPLATE_FAKE_THINKING,
+            make_image_config_from_processor,
+            process_images,
+        )
+    except ImportError:
+        from torchtitan.hf_datasets.multimodal.processor_core import (  # type: ignore[no-redef]
+            CHAT_TEMPLATE,
+            CHAT_TEMPLATE_FAKE_THINKING,
+            make_image_config_from_processor,
+            process_images,
+        )
 
 
 class ModRWKVProcessorKwargs(ProcessingKwargs, total=False):
@@ -68,7 +41,6 @@ class ModRWKVProcessorKwargs(ProcessingKwargs, total=False):
 
 class ModRWKVProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
-    image_processor_class = "AutoImageProcessor"
     tokenizer_class = "RwkvTokenizer"
     user_image_tag = "<image>"
 

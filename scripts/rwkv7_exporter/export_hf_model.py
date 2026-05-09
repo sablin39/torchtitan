@@ -15,8 +15,8 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoProcessor,
     AutoTokenizer,
-    Qwen3_5VisionConfig,
-    Qwen3_5VisionModel,
+    Qwen3VLVisionConfig,
+    Qwen3VLVisionModel,
 )
 
 try:
@@ -363,22 +363,35 @@ def _torch_weight_files(path: Path) -> list[Path]:
     return sorted(path.glob("pytorch_model*.bin"))
 
 
-def load_qwen35_vision_config(vision_model: str) -> Qwen3_5VisionConfig:
+def _ensure_qwen3_vl_vision_config(vision_config) -> Qwen3VLVisionConfig:
+    if isinstance(vision_config, Qwen3VLVisionConfig):
+        return vision_config
+    if not isinstance(vision_config, dict) and hasattr(vision_config, "to_dict"):
+        vision_config = vision_config.to_dict()
+    if isinstance(vision_config, dict):
+        model_type = vision_config.get("model_type")
+        if model_type not in {None, Qwen3VLVisionConfig.model_type}:
+            raise TypeError(
+                "Expected a Qwen3-VL vision config; "
+                f"got model_type={model_type!r}."
+            )
+        return Qwen3VLVisionConfig(**vision_config)
+    raise TypeError(f"Unsupported vision config type: {type(vision_config)!r}.")
+
+
+def load_qwen3_vl_vision_config(vision_model: str) -> Qwen3VLVisionConfig:
     config = AutoConfig.from_pretrained(vision_model, trust_remote_code=True)
     vision_config = getattr(config, "vision_config", config)
-    if isinstance(vision_config, dict):
-        return Qwen3_5VisionConfig(**vision_config)
-    if isinstance(vision_config, Qwen3_5VisionConfig):
-        return vision_config
-    if getattr(vision_config, "to_dict", None) is not None:
-        return Qwen3_5VisionConfig(**vision_config.to_dict())
-    raise TypeError(
-        f"Could not derive a Qwen3.5 vision config from {vision_model!r}; "
-        f"got {type(vision_config)!r}."
-    )
+    try:
+        return _ensure_qwen3_vl_vision_config(vision_config)
+    except TypeError as exc:
+        raise TypeError(
+            f"Could not derive a Qwen3-VL vision config from {vision_model!r}; "
+            f"got {type(vision_config)!r}."
+        ) from exc
 
 
-def load_qwen35_vision_state_dict(
+def load_qwen3_vl_vision_state_dict(
     vision_model: str,
     *,
     dtype: torch.dtype,
@@ -410,7 +423,7 @@ def load_qwen35_vision_state_dict(
 
     if not state_dict:
         raise KeyError(
-            f"Could not find Qwen3.5 vision weights in {vision_model!r}. "
+            f"Could not find Qwen3-VL-compatible vision weights in {vision_model!r}. "
             "Expected keys such as 'model.visual.patch_embed.proj.weight' "
             "or 'patch_embed.proj.weight'."
         )
@@ -441,14 +454,14 @@ def validate_component_state(
 
 def validate_vision_state(
     vision_state: dict[str, torch.Tensor],
-    vision_config: Qwen3_5VisionConfig,
+    vision_config: Qwen3VLVisionConfig,
 ) -> None:
     with torch.device("meta"):
-        vision = Qwen3_5VisionModel(vision_config)
+        vision = Qwen3VLVisionModel(vision_config)
     validate_component_state(
         vision_state,
         vision.state_dict(),
-        component="Qwen3.5 vision encoder",
+        component="Qwen3-VL vision encoder",
     )
 
 
@@ -484,7 +497,7 @@ def build_projector_state_dict(
 def build_multimodal_config(
     *,
     text_config: RWKV7Config,
-    vision_config: Qwen3_5VisionConfig,
+    vision_config: Qwen3VLVisionConfig,
     projector_hidden_dim: int | None,
 ):
     try:
@@ -708,7 +721,7 @@ def convert_multimodal(
         precision=precision_name,
         max_position_embeddings=infer_max_position_embeddings(rwkv7, max_position_embeddings),
     )
-    vision_config = load_qwen35_vision_config(vision_model)
+    vision_config = load_qwen3_vl_vision_config(vision_model)
     config = build_multimodal_config(
         text_config=text_config,
         vision_config=vision_config,
@@ -721,7 +734,7 @@ def convert_multimodal(
         build_converted_state_dict(text_weights, text_model, dtype)
     )
 
-    vision_state = load_qwen35_vision_state_dict(vision_model, dtype=dtype)
+    vision_state = load_qwen3_vl_vision_state_dict(vision_model, dtype=dtype)
     validate_vision_state(vision_state, vision_config)
     vision_state = {"model.encoder." + key: value for key, value in vision_state.items()}
 
@@ -776,13 +789,16 @@ if __name__ == '__main__':
     parser.add_argument(
         '--multimodal',
         action='store_true',
-        help='Export an RWKV-VL checkpoint by combining RWKV text weights with Qwen3.5 vision weights.',
+        help=(
+            'Export an RWKV-VL checkpoint by combining RWKV text weights with '
+            'Qwen3-VL-compatible vision weights.'
+        ),
     )
     parser.add_argument(
         '--vision-model',
         type=str,
         default=None,
-        help='HF-compatible Qwen3.5 model or vision-encoder path used when --multimodal is set.',
+        help='HF-compatible Qwen3-VL model or vision-encoder path used when --multimodal is set.',
     )
     parser.add_argument(
         '--image-processor',

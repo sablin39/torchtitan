@@ -17,10 +17,11 @@ from transformers import (
     AutoModelForImageTextToText,
     PretrainedConfig,
     PreTrainedModel,
-    Qwen3_5VisionModel,
+    Qwen3VLVisionModel,
 )
+from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
+from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
 
 try:
     from .configuration_rwkv7 import RWKV7Config
@@ -50,11 +51,29 @@ class ModRWKVConfig(PretrainedConfig):
     model_type = "modrwkv"
     is_composition = True
 
+    @staticmethod
+    def _to_vision_config(
+        vision_config: Union[Qwen3VLVisionConfig, Dict[str, Any]],
+    ) -> Qwen3VLVisionConfig:
+        if isinstance(vision_config, Qwen3VLVisionConfig):
+            return vision_config
+        if not isinstance(vision_config, dict) and hasattr(vision_config, "to_dict"):
+            vision_config = vision_config.to_dict()
+        if isinstance(vision_config, dict):
+            model_type = vision_config.get("model_type")
+            if model_type not in {None, Qwen3VLVisionConfig.model_type}:
+                raise TypeError(
+                    "ModRWKVConfig expects a Qwen3-VL vision config; "
+                    f"got model_type={model_type!r}."
+                )
+            return Qwen3VLVisionConfig(**vision_config)
+        raise TypeError(f"Unsupported vision config type: {type(vision_config)!r}")
+
     @classmethod
     def from_text_vision_configs(
         cls,
         text_config: Union[RWKV7Config, Dict[str, Any]],
-        vision_config: Union[Qwen3_5VisionConfig, Dict[str, Any]],
+        vision_config: Union[Qwen3VLVisionConfig, Dict[str, Any]],
         projector_config: Optional[Union[ModRWKVProjectorConfig, Dict[str, Any]]] = None,
         **kwargs,
     ) -> "ModRWKVConfig":
@@ -68,7 +87,7 @@ class ModRWKVConfig(PretrainedConfig):
     def __init__(
         self,
         text_config: Optional[Union[RWKV7Config, Dict[str, Any]]] = None,
-        vision_config: Optional[Union[Qwen3_5VisionConfig, Dict[str, Any]]] = None,
+        vision_config: Optional[Union[Qwen3VLVisionConfig, Dict[str, Any]]] = None,
         projector_config: Optional[Union[ModRWKVProjectorConfig, Dict[str, Any]]] = None,
         image_token_id: int = 65532,
         vision_start_token_id: int = 65530,
@@ -87,8 +106,7 @@ class ModRWKVConfig(PretrainedConfig):
 
         if vision_config is None:
             vision_config = {}
-        if isinstance(vision_config, dict):
-            vision_config = Qwen3_5VisionConfig(**vision_config)
+        vision_config = self._to_vision_config(vision_config)
         self.vision_config = vision_config
 
         if projector_config is None:
@@ -176,7 +194,7 @@ class VisualAdapter(nn.Module):
 class RWKV7VLModel(ModRWKVPreTrainedModel):
     def __init__(self, config: ModRWKVConfig):
         super().__init__(config)
-        self.encoder = Qwen3_5VisionModel(config.vision_config)
+        self.encoder = Qwen3VLVisionModel(config.vision_config)
 
         proj_cfg = config.projector_config
         self.proj = VisualAdapter(
@@ -200,7 +218,9 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         image_grid_thw: torch.LongTensor,
     ) -> torch.FloatTensor:
         vision_output = self.encoder(pixel_values, image_grid_thw)
-        if hasattr(vision_output, "last_hidden_state"):
+        if hasattr(vision_output, "pooler_output"):
+            vision_embeds = vision_output.pooler_output
+        elif hasattr(vision_output, "last_hidden_state"):
             vision_embeds = vision_output.last_hidden_state
         elif isinstance(vision_output, (tuple, list)):
             vision_embeds = vision_output[0]
@@ -286,7 +306,7 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         )
 
 
-class RWKV7VLForConditionalGeneration(ModRWKVPreTrainedModel):
+class RWKV7VLForConditionalGeneration(ModRWKVPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {}
 
     def __init__(self, config: ModRWKVConfig):
@@ -311,6 +331,76 @@ class RWKV7VLForConditionalGeneration(ModRWKVPreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    @staticmethod
+    def _has_nonempty_past_key_values(
+        past_key_values: Optional[Any],
+        cache_position: Optional[torch.LongTensor],
+    ) -> bool:
+        if past_key_values is None:
+            return False
+        if cache_position is not None:
+            return cache_position.numel() > 0 and cache_position[0].item() > 0
+
+        get_seq_length = getattr(past_key_values, "get_seq_length", None)
+        if callable(get_seq_length):
+            try:
+                return get_seq_length() > 0
+            except (AttributeError, TypeError):
+                pass
+
+        try:
+            return len(past_key_values) > 0
+        except TypeError:
+            return True
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Any] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = True,
+        logits_to_keep: Optional[int] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        has_past = self._has_nonempty_past_key_values(
+            past_key_values,
+            cache_position,
+        )
+
+        if has_past and input_ids is not None:
+            if (
+                cache_position is not None
+                and input_ids.shape[1] != cache_position.shape[0]
+            ):
+                input_ids = input_ids[:, cache_position]
+            else:
+                input_ids = input_ids[:, -1:]
+
+        model_inputs: dict[str, Any] = {
+            "input_ids": input_ids.contiguous() if input_ids is not None else None,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            "use_cache": use_cache,
+        }
+
+        if inputs_embeds is not None and not has_past:
+            model_inputs["inputs_embeds"] = inputs_embeds
+
+        if not has_past:
+            model_inputs["pixel_values"] = pixel_values
+            model_inputs["image_grid_thw"] = image_grid_thw
+
+        if cache_position is not None:
+            model_inputs["cache_position"] = cache_position
+        if logits_to_keep is not None:
+            model_inputs["logits_to_keep"] = logits_to_keep
+
+        return model_inputs
 
     def forward(
         self,

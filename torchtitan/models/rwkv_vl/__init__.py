@@ -148,7 +148,7 @@ def _debugmodel() -> RWKV7VLForConditionalGeneration.Config:
     )
 
 
-def _qwen35_08b_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
+def _qwen3_vl_08b_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
     return _vl_vision_encoder_config(
         dim=768,
         ffn_dim=3072,
@@ -187,7 +187,7 @@ def _g1d_0_4b() -> RWKV7VLForConditionalGeneration.Config:
             v_low_rank_dim=32,
             chunk_size=64,
         ),
-        vision_encoder=_qwen35_08b_vision_encoder_config(),
+        vision_encoder=_qwen3_vl_08b_vision_encoder_config(),
         proj=VisualAdapter.Config(
             encoder_dim=1024,
             hidden_dim=4096,
