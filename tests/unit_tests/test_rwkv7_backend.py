@@ -15,7 +15,12 @@ from torchtitan.config.manager import ConfigManager
 from torchtitan.models.rwkv7 import model_registry as rwkv7_model_registry
 from torchtitan.models.rwkv7.state_dict_adapter import RWKV7StateDictAdapter
 from torchtitan.models.rwkv7.tokenizer import RwkvTokenizer
-from torchtitan.models.rwkv_vl import model_registry as rwkv_vl_model_registry
+import torchtitan.models.rwkv_vl.config_registry as rwkv_vl_config_registry
+from torchtitan.models.rwkv_vl import (
+    model_registry as rwkv_vl_model_registry,
+    rwkv_vl_configs,
+)
+from torchtitan.models.rwkv_vl.model import VisualAdapter
 from torchtitan.models.rwkv_vl.state_dict_adapter import RWKVVLStateDictAdapter
 from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
 
@@ -50,6 +55,49 @@ class TestRWKV7Backend(unittest.TestCase):
         model.verify_module_protocol()
         self.assertEqual(model.config.image_token_id, 2007)
         self.assertEqual(model.vision_encoder.config.dim, 128)
+
+    def test_rwkv_vl_production_flavors_are_explicit(self):
+        self.assertIn("0.4B-v100M", rwkv_vl_configs)
+        self.assertIn("1.5B-v100M", rwkv_vl_configs)
+        self.assertIn("1.5B-v400M", rwkv_vl_configs)
+        self.assertNotIn("0.4B", rwkv_vl_configs)
+        self.assertNotIn("0.4B-v400M", rwkv_vl_configs)
+        self.assertFalse(hasattr(rwkv_vl_config_registry, "rwkv_vl_0_4b_chat"))
+
+    def test_rwkv_vl_production_projector_shapes(self):
+        cases = {
+            "0.4B-v100M": (1024, 1024, 0),
+            "1.5B-v100M": (1024, 2048, 0),
+            "1.5B-v400M": (2048, 2048, 3),
+        }
+        for flavor, (encoder_dim, project_dim, num_deepstack) in cases.items():
+            with self.subTest(flavor=flavor):
+                spec = rwkv_vl_model_registry(flavor)
+                self.assertEqual(spec.model.proj.encoder_dim, encoder_dim)
+                self.assertEqual(spec.model.proj.project_dim, project_dim)
+                self.assertEqual(spec.model.proj.num_deepstack, num_deepstack)
+                with torch.device("meta"):
+                    model = spec.model.build()
+                self.assertEqual(len(model.proj.deepstack), num_deepstack)
+
+    def test_visual_adapter_projects_each_stream_without_identity_layout(self):
+        with torch.device("meta"):
+            adapter = VisualAdapter.Config(
+                encoder_dim=2048,
+                project_dim=2048,
+                hidden_dim=8192,
+                num_deepstack=3,
+            ).build()
+            main, deepstack = adapter(
+                torch.empty(2, 2048, device="meta"),
+                [torch.empty(2, 2048, device="meta") for _ in range(3)],
+            )
+        self.assertEqual(tuple(main.shape), (2, 2048))
+        self.assertEqual([tuple(t.shape) for t in deepstack], [(2, 2048)] * 3)
+        keys = set(adapter.state_dict())
+        self.assertIn("main.pre_norm.weight", keys)
+        self.assertIn("deepstack.0.pre_norm.weight", keys)
+        self.assertNotIn("pre_norm.weight", keys)
 
     def test_rwkv_vl_train_module_freezes_unselected_roots(self):
         spec = rwkv_vl_model_registry("debugmodel")
@@ -119,7 +167,10 @@ class TestRWKV7Backend(unittest.TestCase):
                 "model.encoder.blocks.0.attn.qkv.weight": torch.empty(
                     vision_dim * 3, vision_dim
                 ),
-                "model.proj.pre_norm.weight": torch.empty(hidden_size),
+                "model.encoder.deepstack_merger_list.0.norm.weight": torch.empty(
+                    vision_dim
+                ),
+                "model.proj.main.pre_norm.weight": torch.empty(hidden_size),
                 "model.llm.norm.weight": torch.empty(hidden_size),
                 "lm_head.weight": torch.empty(spec.model.vocab_size, hidden_size),
             }
@@ -129,7 +180,8 @@ class TestRWKV7Backend(unittest.TestCase):
             (vision_dim, 3 * 2 * 16 * 16),
         )
         self.assertIn("vision_encoder.layers.0.attn.qkv.weight", out)
-        self.assertIn("proj.pre_norm.weight", out)
+        self.assertIn("vision_encoder.deepstack_merger_list.0.norm.weight", out)
+        self.assertIn("proj.main.pre_norm.weight", out)
         self.assertIn("llm.norm.weight", out)
 
     def test_flattened_cu_seqlens_fixed_rows(self):

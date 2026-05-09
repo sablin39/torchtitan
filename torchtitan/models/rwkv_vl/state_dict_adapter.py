@@ -27,6 +27,10 @@ class RWKVVLStateDictAdapter(StateDictAdapter):
             return "proj." + key.removeprefix("model.proj.")
         if key == "model.encoder.pos_embed.weight":
             return "vision_encoder.pos_embed"
+        if key.startswith("model.encoder.deepstack_merger_list."):
+            return "vision_encoder.deepstack_merger_list." + key.removeprefix(
+                "model.encoder.deepstack_merger_list."
+            )
         if key.startswith("model.encoder.blocks."):
             return "vision_encoder.layers." + key.removeprefix(
                 "model.encoder.blocks."
@@ -44,6 +48,10 @@ class RWKVVLStateDictAdapter(StateDictAdapter):
             return "model.proj." + key.removeprefix("proj.")
         if key == "vision_encoder.pos_embed":
             return "model.encoder.pos_embed.weight"
+        if key.startswith("vision_encoder.deepstack_merger_list."):
+            return "model.encoder.deepstack_merger_list." + key.removeprefix(
+                "vision_encoder.deepstack_merger_list."
+            )
         if key.startswith("vision_encoder.layers."):
             return "model.encoder.blocks." + key.removeprefix(
                 "vision_encoder.layers."

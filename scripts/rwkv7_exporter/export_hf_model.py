@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 
 import torch
@@ -18,6 +19,10 @@ from transformers import (
     Qwen3VLVisionConfig,
     Qwen3VLVisionModel,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 try:
     from .configuration_rwkv7 import RWKV7Config
@@ -45,6 +50,7 @@ VISION_KEY_HINTS = (
     "pos_embed.",
     "blocks.",
     "merger.",
+    "deepstack_merger_list.",
 )
 
 
@@ -379,16 +385,96 @@ def _ensure_qwen3_vl_vision_config(vision_config) -> Qwen3VLVisionConfig:
     raise TypeError(f"Unsupported vision config type: {type(vision_config)!r}.")
 
 
+def _to_qwen3_vl_vision_config(vision_config) -> Qwen3VLVisionConfig:
+    if isinstance(vision_config, Qwen3VLVisionConfig):
+        return vision_config
+    if not isinstance(vision_config, dict) and hasattr(vision_config, "to_dict"):
+        vision_config = vision_config.to_dict()
+    if not isinstance(vision_config, dict):
+        raise TypeError(f"Unsupported vision config type: {type(vision_config)!r}.")
+
+    return Qwen3VLVisionConfig(
+        depth=vision_config["depth"],
+        hidden_size=vision_config["hidden_size"],
+        hidden_act=vision_config.get("hidden_act", "gelu_pytorch_tanh"),
+        intermediate_size=vision_config["intermediate_size"],
+        num_heads=vision_config["num_heads"],
+        in_channels=vision_config.get("in_channels", 3),
+        patch_size=vision_config.get("patch_size", 16),
+        spatial_merge_size=vision_config.get("spatial_merge_size", 2),
+        temporal_patch_size=vision_config.get("temporal_patch_size", 2),
+        out_hidden_size=vision_config["out_hidden_size"],
+        num_position_embeddings=vision_config.get("num_position_embeddings", 2304),
+        deepstack_visual_indexes=list(
+            vision_config.get("deepstack_visual_indexes")
+            or vision_config.get("deepstack_visual_indices")
+            or []
+        ),
+        initializer_range=vision_config.get("initializer_range", 0.02),
+    )
+
+
 def load_qwen3_vl_vision_config(vision_model: str) -> Qwen3VLVisionConfig:
     config = AutoConfig.from_pretrained(vision_model, trust_remote_code=True)
     vision_config = getattr(config, "vision_config", config)
     try:
-        return _ensure_qwen3_vl_vision_config(vision_config)
+        return _to_qwen3_vl_vision_config(vision_config)
     except TypeError as exc:
         raise TypeError(
-            f"Could not derive a Qwen3-VL vision config from {vision_model!r}; "
+            f"Could not derive a Qwen3-VL-compatible vision config from {vision_model!r}; "
             f"got {type(vision_config)!r}."
         ) from exc
+
+
+def _extract_visual_module(model: torch.nn.Module) -> torch.nn.Module:
+    for path in (
+        "model.visual",
+        "visual",
+        "model.vision_model",
+        "vision_model",
+    ):
+        module: object = model
+        for part in path.split("."):
+            module = getattr(module, part, None)
+            if module is None:
+                break
+        if isinstance(module, torch.nn.Module):
+            return module
+    raise AttributeError(
+        "Could not find a visual module on the loaded HF model. Checked "
+        "model.visual, visual, model.vision_model, and vision_model."
+    )
+
+
+def _load_hf_vision_source_model(vision_model: str, dtype: torch.dtype) -> torch.nn.Module:
+    kwargs = {
+        "trust_remote_code": True,
+        "dtype": dtype,
+        "low_cpu_mem_usage": True,
+    }
+    try:
+        return AutoModelForImageTextToText.from_pretrained(vision_model, **kwargs)
+    except (ValueError, TypeError):
+        return AutoModel.from_pretrained(vision_model, **kwargs)
+
+
+def load_qwen_vision_package(
+    vision_model: str,
+    *,
+    dtype: torch.dtype,
+) -> tuple[Qwen3VLVisionConfig, dict[str, torch.Tensor]]:
+    config = AutoConfig.from_pretrained(vision_model, trust_remote_code=True)
+    vision_config = _to_qwen3_vl_vision_config(getattr(config, "vision_config", config))
+    model = _load_hf_vision_source_model(vision_model, dtype=dtype)
+    model.eval()
+    visual = _extract_visual_module(model)
+    vision_state = {
+        key: value.detach().cpu().to(dtype=dtype).contiguous()
+        for key, value in visual.state_dict().items()
+    }
+    validate_vision_state(vision_state, vision_config)
+    del visual, model
+    return vision_config, vision_state
 
 
 def load_qwen3_vl_vision_state_dict(
@@ -470,6 +556,7 @@ def build_projector_state_dict(
     encoder_dim: int,
     project_dim: int,
     hidden_dim: int | None,
+    num_deepstack: int,
     dtype: torch.dtype,
     seed: int | None,
 ) -> dict[str, torch.Tensor]:
@@ -486,6 +573,7 @@ def build_projector_state_dict(
             encoder_dim=encoder_dim,
             project_dim=project_dim,
             hidden_dim=hidden_dim,
+            num_deepstack=num_deepstack,
             use_conv=False,
         )
     return {
@@ -509,6 +597,7 @@ def build_multimodal_config(
         encoder_dim=vision_config.out_hidden_size,
         project_dim=text_config.hidden_size,
         hidden_dim=projector_hidden_dim,
+        num_deepstack=len(getattr(vision_config, "deepstack_visual_indexes", [])),
     )
     config = ModRWKVConfig.from_text_vision_configs(
         text_config=text_config,
@@ -721,7 +810,7 @@ def convert_multimodal(
         precision=precision_name,
         max_position_embeddings=infer_max_position_embeddings(rwkv7, max_position_embeddings),
     )
-    vision_config = load_qwen3_vl_vision_config(vision_model)
+    vision_config, vision_state = load_qwen_vision_package(vision_model, dtype=dtype)
     config = build_multimodal_config(
         text_config=text_config,
         vision_config=vision_config,
@@ -734,14 +823,13 @@ def convert_multimodal(
         build_converted_state_dict(text_weights, text_model, dtype)
     )
 
-    vision_state = load_qwen3_vl_vision_state_dict(vision_model, dtype=dtype)
-    validate_vision_state(vision_state, vision_config)
     vision_state = {"model.encoder." + key: value for key, value in vision_state.items()}
 
     projector_state = build_projector_state_dict(
         encoder_dim=vision_config.out_hidden_size,
         project_dim=text_config.hidden_size,
         hidden_dim=projector_hidden_dim,
+        num_deepstack=len(getattr(vision_config, "deepstack_visual_indexes", [])),
         dtype=dtype,
         seed=projector_seed,
     )

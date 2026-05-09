@@ -6,10 +6,12 @@ is self-contained.
 """
 
 from dataclasses import dataclass
+import warnings
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from transformers.cache_utils import Cache
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -37,6 +39,7 @@ class ModRWKVProjectorConfig:
     encoder_dim: int = 1024
     project_dim: int = 1024
     hidden_dim: Optional[int] = None
+    num_deepstack: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -44,6 +47,7 @@ class ModRWKVProjectorConfig:
             "encoder_dim": self.encoder_dim,
             "project_dim": self.project_dim,
             "hidden_dim": self.hidden_dim,
+            "num_deepstack": self.num_deepstack,
         }
 
 
@@ -60,13 +64,36 @@ class ModRWKVConfig(PretrainedConfig):
         if not isinstance(vision_config, dict) and hasattr(vision_config, "to_dict"):
             vision_config = vision_config.to_dict()
         if isinstance(vision_config, dict):
+            if not vision_config:
+                return Qwen3VLVisionConfig()
             model_type = vision_config.get("model_type")
-            if model_type not in {None, Qwen3VLVisionConfig.model_type}:
+            if model_type not in {None, Qwen3VLVisionConfig.model_type, "qwen3_vl"}:
                 raise TypeError(
                     "ModRWKVConfig expects a Qwen3-VL vision config; "
                     f"got model_type={model_type!r}."
                 )
-            return Qwen3VLVisionConfig(**vision_config)
+            return Qwen3VLVisionConfig(
+                depth=vision_config["depth"],
+                hidden_size=vision_config["hidden_size"],
+                hidden_act=vision_config.get("hidden_act", "gelu_pytorch_tanh"),
+                intermediate_size=vision_config["intermediate_size"],
+                num_heads=vision_config["num_heads"],
+                in_channels=vision_config.get("in_channels", 3),
+                patch_size=vision_config.get("patch_size", 16),
+                spatial_merge_size=vision_config.get("spatial_merge_size", 2),
+                temporal_patch_size=vision_config.get("temporal_patch_size", 2),
+                out_hidden_size=vision_config["out_hidden_size"],
+                num_position_embeddings=vision_config.get(
+                    "num_position_embeddings",
+                    2304,
+                ),
+                deepstack_visual_indexes=list(
+                    vision_config.get("deepstack_visual_indexes")
+                    or vision_config.get("deepstack_visual_indices")
+                    or []
+                ),
+                initializer_range=vision_config.get("initializer_range", 0.02),
+            )
         raise TypeError(f"Unsupported vision config type: {type(vision_config)!r}")
 
     @classmethod
@@ -110,9 +137,15 @@ class ModRWKVConfig(PretrainedConfig):
         self.vision_config = vision_config
 
         if projector_config is None:
+            deepstack_indexes = getattr(
+                vision_config,
+                "deepstack_visual_indexes",
+                getattr(vision_config, "deepstack_visual_indices", []),
+            )
             projector_config = ModRWKVProjectorConfig(
                 encoder_dim=getattr(vision_config, "out_hidden_size", 1024),
                 project_dim=getattr(text_config, "hidden_size", 1024),
+                num_deepstack=len(deepstack_indexes),
             )
         elif isinstance(projector_config, dict):
             projector_config = ModRWKVProjectorConfig(**projector_config)
@@ -156,19 +189,17 @@ class ModRWKVPreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = ["past_key_values"]
 
 
-class VisualAdapter(nn.Module):
+class _VisualStreamProjector(nn.Module):
     def __init__(
         self,
         encoder_dim: int,
         project_dim: int,
         hidden_dim: Optional[int] = None,
-        use_conv: bool = False,
     ):
         super().__init__()
         self.encoder_dim = encoder_dim
         self.project_dim = project_dim
         self.hidden_dim = hidden_dim or project_dim * 4
-        self.use_conv = use_conv
 
         self.pre_norm = nn.LayerNorm(encoder_dim)
         self.mlp = nn.Sequential(
@@ -176,19 +207,60 @@ class VisualAdapter(nn.Module):
             nn.ReLU(),
             nn.Linear(self.hidden_dim, project_dim),
         )
-        if use_conv:
-            self.conv = nn.Conv1d(
-                in_channels=encoder_dim,
-                out_channels=encoder_dim,
-                kernel_size=3,
-                stride=2,
-                bias=False,
-            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_conv:
-            x = self.conv(x.permute(0, 2, 1)).permute(0, 2, 1)
-        return x + self.mlp(self.pre_norm(x))
+        return self.mlp(self.pre_norm(x))
+
+
+class VisualAdapter(nn.Module):
+    def __init__(
+        self,
+        encoder_dim: int,
+        project_dim: int,
+        hidden_dim: Optional[int] = None,
+        num_deepstack: int = 0,
+        use_conv: bool = False,
+    ):
+        super().__init__()
+        if use_conv:
+            raise ValueError("Convolutional visual projectors are not supported.")
+        self.encoder_dim = encoder_dim
+        self.project_dim = project_dim
+        self.hidden_dim = hidden_dim or project_dim * 4
+        self.num_deepstack = num_deepstack
+        self.main = _VisualStreamProjector(
+            encoder_dim=encoder_dim,
+            project_dim=project_dim,
+            hidden_dim=self.hidden_dim,
+        )
+        self.deepstack = nn.ModuleList(
+            [
+                _VisualStreamProjector(
+                    encoder_dim=encoder_dim,
+                    project_dim=project_dim,
+                    hidden_dim=self.hidden_dim,
+                )
+                for _ in range(num_deepstack)
+            ]
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        deepstack_features: Optional[list[torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if deepstack_features is None:
+            deepstack_features = []
+        if len(deepstack_features) != self.num_deepstack:
+            raise ValueError(
+                f"Expected {self.num_deepstack} DeepStack feature tensors, "
+                f"got {len(deepstack_features)}."
+            )
+        projected_deepstack = [
+            projector(feature)
+            for projector, feature in zip(self.deepstack, deepstack_features)
+        ]
+        return self.main(x), projected_deepstack
 
 
 class RWKV7VLModel(ModRWKVPreTrainedModel):
@@ -201,6 +273,7 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
             encoder_dim=proj_cfg.encoder_dim,
             project_dim=proj_cfg.project_dim,
             hidden_dim=proj_cfg.hidden_dim,
+            num_deepstack=proj_cfg.num_deepstack,
             use_conv=config.use_conv_in_projector,
         )
         self.llm = RWKV7Model(config.text_config)
@@ -216,7 +289,7 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         self,
         pixel_values: torch.FloatTensor,
         image_grid_thw: torch.LongTensor,
-    ) -> torch.FloatTensor:
+    ) -> tuple[torch.FloatTensor, list[torch.FloatTensor]]:
         vision_output = self.encoder(pixel_values, image_grid_thw)
         if hasattr(vision_output, "pooler_output"):
             vision_embeds = vision_output.pooler_output
@@ -227,19 +300,36 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         else:
             vision_embeds = vision_output
 
+        deepstack_features = getattr(vision_output, "deepstack_features", None)
+        if deepstack_features is None:
+            deepstack_features = []
+        projected, projected_deepstack = self.proj(
+            vision_embeds,
+            list(deepstack_features),
+        )
+        projected = projected.reshape(-1, self.config.text_config.hidden_size)
+        projected_deepstack = [
+            feature.reshape(-1, self.config.text_config.hidden_size)
+            for feature in projected_deepstack
+        ]
+
         spatial_merge_size = getattr(self.encoder.config, "spatial_merge_size", 2)
-        split_sizes = (image_grid_thw.prod(-1) // (spatial_merge_size**2)).tolist()
-        image_embeds = torch.split(vision_embeds, split_sizes)
-        projected = []
-        for embeds in image_embeds:
-            projected.append(self.proj(embeds).reshape(-1, self.config.text_config.hidden_size))
-        if not projected:
-            return torch.empty(
+        expected_tokens = int(
+            (image_grid_thw.prod(-1) // (spatial_merge_size**2)).sum().item()
+        )
+        if expected_tokens != projected.shape[0]:
+            raise ValueError(
+                "Projected image features and image grid do not match: "
+                f"features={projected.shape[0]} grid_tokens={expected_tokens}"
+            )
+        if projected.numel() == 0:
+            empty = torch.empty(
                 0,
                 self.config.text_config.hidden_size,
                 device=self.get_input_embeddings().weight.device,
             )
-        return torch.cat(projected, dim=0)
+            return empty, []
+        return projected, projected_deepstack
 
     def _inject_image_features(
         self,
@@ -260,6 +350,25 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         )
         return inputs_embeds
 
+    def _add_image_features(
+        self,
+        input_ids: torch.LongTensor,
+        hidden_states: torch.FloatTensor,
+        image_features: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        image_mask = input_ids == self.config.image_token_id
+        if image_mask.sum().item() != image_features.shape[0]:
+            raise ValueError(
+                "DeepStack features and image placeholder tokens do not match: "
+                f"tokens={image_mask.sum().item()} features={image_features.shape[0]}"
+            )
+        hidden_states = hidden_states.clone()
+        hidden_states[image_mask] += image_features.to(
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        return hidden_states
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -279,30 +388,102 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
             if return_dict is not None
             else self.config.text_config.use_return_dict
         )
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.text_config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.text_config.output_hidden_states
+        )
+        use_cache = (
+            use_cache
+            if use_cache is not None
+            else (self.config.text_config.use_cache if not self.training else False)
+        )
+        if output_attentions:
+            warnings.warn(
+                "`RWKV7Model` does not support `output_attentions`; setting it to `False`."
+            )
+            output_attentions = False
+
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must provide either input_ids or inputs_embeds.")
         if (pixel_values is None) != (image_grid_thw is None):
             raise ValueError("pixel_values and image_grid_thw must be provided together.")
+        if pixel_values is not None and input_ids is None:
+            raise ValueError("input_ids are required when pixel_values are provided.")
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
+        deepstack_features: list[torch.Tensor] = []
         if pixel_values is not None:
-            image_features = self._get_image_features(pixel_values, image_grid_thw)
+            image_features, deepstack_features = self._get_image_features(
+                pixel_values,
+                image_grid_thw,
+            )
             inputs_embeds = self._inject_image_features(
                 input_ids,
                 inputs_embeds,
                 image_features,
             )
 
-        return self.llm(
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
+        if use_cache and past_key_values is not None and not isinstance(
+            past_key_values,
+            Cache,
+        ):
+            from_legacy_cache = getattr(Cache, "from_legacy_cache", None)
+            if callable(from_legacy_cache):
+                past_key_values = from_legacy_cache(past_key_values)
+
+        all_hidden_states = () if output_hidden_states else None
+        all_attns = () if output_attentions else None
+        hidden_states = inputs_embeds
+        v_first = torch.zeros_like(hidden_states)
+        for layer_idx, layer in enumerate(self.llm.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            hidden_states, attentions, past_key_values, v_first = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                v_first=v_first,
+                **kwargs,
+            )
+            if layer_idx < len(deepstack_features):
+                hidden_states = self._add_image_features(
+                    input_ids,
+                    hidden_states,
+                    deepstack_features[layer_idx],
+                )
+            if output_attentions:
+                all_attns += (attentions,)
+
+        hidden_states = self.llm.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        if not return_dict:
+            return tuple(
+                item
+                for item in [
+                    hidden_states,
+                    past_key_values,
+                    all_hidden_states,
+                    all_attns,
+                ]
+                if item is not None
+            )
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
             past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs,
+            hidden_states=all_hidden_states,
+            attentions=all_attns,
         )
 
 

@@ -47,15 +47,25 @@ torchrun_cmd="$(resolve_cmd torchrun "${repo_root}/.venv/bin/torchrun")"
 # Edit this block directly for now. We will replace it with a smarter config
 # system later.
 
-rwkv7_path="/mnt/raid0_8t/rwkv7-g1/rwkv7-g1d-0.4b-20260210-ctx8192.pth"
-vision_model="/home/rwkv/models/Qwen3.5-0.8B"
+rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1d-0.4b-20260210-ctx8192.pth"
+vision_model="/home/molin/models/Qwen3.5-0.8B"
+# 1.5B-v100M:
+# rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
+# vision_model="/home/molin/models/Qwen3.5-0.8B"
+# model_flavor="1.5B-v100M"
+# train_config="rwkv_vl_1_5b_v100m_chat"
+# 1.5B-v400M:
+# rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
+# vision_model="/home/molin/models/Qwen3-VL-2B-Instruct"
+# model_flavor="1.5B-v400M"
+# train_config="rwkv_vl_1_5b_v400m_chat"
 fake_thinking="1"
-dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/chartqa(cauldron,llava_format)"
+dataset_path="/home/molin/data/LLaVA-OneVision-Data/ai2d(cauldron,llava_format)"
 
 split="train"
-ngpu="2"
+ngpu="4"
 seq_len="4096"
-batch_size="16"
+batch_size="8"
 # Sequence packing is controlled by the multimodal dataloader, not by CP.
 # packing_buffer_size is the number of tokenized samples kept in a CPU-side
 # buffer before greedily combining them into seq_len rows. Larger values usually
@@ -63,11 +73,11 @@ batch_size="16"
 # host memory use. Set to "0" to disable packing and pad each sample normally.
 # This is not batch size; batch_size still controls the number of packed rows
 # per step/CP group.
-packing_buffer_size="32"
+packing_buffer_size="64"
 # Conservative dataloader overlap for multimodal packing. Each worker can hold
 # prefetched packed batches containing many resized images, so keep this small
 # on RAM-constrained machines. With CP, this is per rank.
-dataloader_num_workers="1"
+dataloader_num_workers="2"
 dataloader_persistent_workers="1"
 dataloader_prefetch_factor="1"
 dataloader_pin_memory="0"
@@ -84,13 +94,13 @@ omp_num_threads="1"
 # Set to an integer for a fixed-step run, or "epoch" to run until the finite
 # dataloader is exhausted. With sequence packing, exact epoch steps are not known
 # until samples are filtered, resized, tokenized, and packed.
-steps="epoch"
+steps="20"
 max_epoch_steps="1000000000"
 precision="bfloat16"
 export_dtype="bfloat16"
 model_name="rwkv_vl"
-model_flavor="0.4B"
-train_config="rwkv_vl_0_4b_chat"
+model_flavor="0.4B-v100M"
+train_config="rwkv_vl_0_4b_v100m_chat"
 # Comma-separated roots to train. Valid entries are vision_encoder, proj, llm,
 # lm_head, and all. The normal llm selector includes the top-level lm_head.
 # For a common projector+LM finetune with frozen vision, use: "proj,llm".
@@ -110,8 +120,8 @@ lr_warmup_steps="500"
 lr_total_steps=""
 lr_decay_type="cosine"
 lr_min_factor="0.1"
-checkpoint_interval="2000"
-checkpoint_keep_latest_k="0"
+checkpoint_interval="20"
+checkpoint_keep_latest_k="2"
 image_processor=""
 min_pixels="65536"
 max_pixels="2097152"

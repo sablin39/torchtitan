@@ -107,12 +107,12 @@ def rwkv_vl_debugmodel_chat() -> Trainer.Config:
     )
 
 
-def rwkv_vl_0_4b_chat() -> Trainer.Config:
+def _rwkv_vl_chat_config(model_flavor: str) -> Trainer.Config:
     return RWKVVLTrainerConfig(
         loss=ChunkedCELoss.Config(),
         hf_assets_path="./tests/assets/tokenizer",
         tokenizer=RwkvVLMultiModalTokenizer.Config(),
-        model_spec=model_registry("0.4B"),
+        model_spec=model_registry(model_flavor),
         dataloader=_rwkv_vl_chat_dataloader(dataset_path="./tests/assets/cc12m_test"),
         optimizer=OptimizersContainer.Config(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
@@ -128,3 +128,15 @@ def rwkv_vl_0_4b_chat() -> Trainer.Config:
         checkpoint=CheckpointManager.Config(interval=10, last_save_model_only=True),
         activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
     )
+
+
+def rwkv_vl_0_4b_v100m_chat() -> Trainer.Config:
+    return _rwkv_vl_chat_config("0.4B-v100M")
+
+
+def rwkv_vl_1_5b_v100m_chat() -> Trainer.Config:
+    return _rwkv_vl_chat_config("1.5B-v100M")
+
+
+def rwkv_vl_1_5b_v400m_chat() -> Trainer.Config:
+    return _rwkv_vl_chat_config("1.5B-v400M")

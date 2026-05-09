@@ -127,6 +127,7 @@ def _debugmodel() -> RWKV7VLForConditionalGeneration.Config:
             encoder_dim=hidden_size,
             hidden_dim=1024,
             project_dim=hidden_size,
+            num_deepstack=0,
             norm_eps=1e-5,
         ),
         lm_head=Linear.Config(
@@ -148,7 +149,7 @@ def _debugmodel() -> RWKV7VLForConditionalGeneration.Config:
     )
 
 
-def _qwen3_vl_08b_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
+def _qwen3vit_v100m_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
     return _vl_vision_encoder_config(
         dim=768,
         ffn_dim=3072,
@@ -163,10 +164,34 @@ def _qwen3_vl_08b_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
     )
 
 
-def _g1d_0_4b() -> RWKV7VLForConditionalGeneration.Config:
+def _qwen3vit_v400m_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
+    return _vl_vision_encoder_config(
+        dim=1024,
+        ffn_dim=4096,
+        n_layers=24,
+        n_heads=16,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        out_hidden_size=2048,
+        num_position_embeddings=2304,
+        deepstack_visual_indices=[5, 11, 17],
+    )
+
+
+def _rwkv_vl_config(
+    *,
+    hidden_size: int,
+    num_hidden_layers: int,
+    num_heads: int,
+    intermediate_size: int,
+    a_low_rank_dim: int,
+    decay_low_rank_dim: int,
+    gate_low_rank_dim: int,
+    v_low_rank_dim: int,
+    vision_encoder: Qwen3VLVisionEncoder.Config,
+) -> RWKV7VLForConditionalGeneration.Config:
     vocab_size = 65536
-    hidden_size = 1024
-    num_hidden_layers = 24
     return RWKV7VLForConditionalGeneration.Config(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
@@ -174,24 +199,25 @@ def _g1d_0_4b() -> RWKV7VLForConditionalGeneration.Config:
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             num_hidden_layers=num_hidden_layers,
-            num_heads=16,
+            num_heads=num_heads,
             head_dim=64,
-            intermediate_size=4096,
+            intermediate_size=intermediate_size,
             value_dim=[hidden_size] * num_hidden_layers,
             norm_eps=1e-5,
             norm_bias=True,
             hidden_act="sqrelu",
-            a_low_rank_dim=64,
-            decay_low_rank_dim=64,
-            gate_low_rank_dim=128,
-            v_low_rank_dim=32,
+            a_low_rank_dim=a_low_rank_dim,
+            decay_low_rank_dim=decay_low_rank_dim,
+            gate_low_rank_dim=gate_low_rank_dim,
+            v_low_rank_dim=v_low_rank_dim,
             chunk_size=64,
         ),
-        vision_encoder=_qwen3_vl_08b_vision_encoder_config(),
+        vision_encoder=vision_encoder,
         proj=VisualAdapter.Config(
-            encoder_dim=1024,
-            hidden_dim=4096,
+            encoder_dim=vision_encoder.out_hidden_size,
+            hidden_dim=None,
             project_dim=hidden_size,
+            num_deepstack=len(vision_encoder.deepstack_visual_indices),
             norm_eps=1e-5,
         ),
         lm_head=Linear.Config(
@@ -213,9 +239,53 @@ def _g1d_0_4b() -> RWKV7VLForConditionalGeneration.Config:
     )
 
 
+def _g1d_0_4b_v100m() -> RWKV7VLForConditionalGeneration.Config:
+    return _rwkv_vl_config(
+        hidden_size=1024,
+        num_hidden_layers=24,
+        num_heads=16,
+        intermediate_size=4096,
+        a_low_rank_dim=64,
+        decay_low_rank_dim=64,
+        gate_low_rank_dim=128,
+        v_low_rank_dim=32,
+        vision_encoder=_qwen3vit_v100m_vision_encoder_config(),
+    )
+
+
+def _g1f_1_5b_v100m() -> RWKV7VLForConditionalGeneration.Config:
+    return _rwkv_vl_config(
+        hidden_size=2048,
+        num_hidden_layers=24,
+        num_heads=32,
+        intermediate_size=8192,
+        a_low_rank_dim=96,
+        decay_low_rank_dim=96,
+        gate_low_rank_dim=256,
+        v_low_rank_dim=64,
+        vision_encoder=_qwen3vit_v100m_vision_encoder_config(),
+    )
+
+
+def _g1f_1_5b_v400m() -> RWKV7VLForConditionalGeneration.Config:
+    return _rwkv_vl_config(
+        hidden_size=2048,
+        num_hidden_layers=24,
+        num_heads=32,
+        intermediate_size=8192,
+        a_low_rank_dim=96,
+        decay_low_rank_dim=96,
+        gate_low_rank_dim=256,
+        v_low_rank_dim=64,
+        vision_encoder=_qwen3vit_v400m_vision_encoder_config(),
+    )
+
+
 rwkv_vl_configs = {
     "debugmodel": _debugmodel,
-    "0.4B": _g1d_0_4b,
+    "0.4B-v100M": _g1d_0_4b_v100m,
+    "1.5B-v100M": _g1f_1_5b_v100m,
+    "1.5B-v400M": _g1f_1_5b_v400m,
 }
 
 
