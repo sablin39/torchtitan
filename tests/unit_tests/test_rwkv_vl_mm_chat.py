@@ -20,6 +20,7 @@ from torchtitan.hf_datasets.multimodal.processor_core import (
     process_images as process_rwkv_vl_images,
 )
 from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
+    build_image_token_counts_by_message,
     MMChatCollator,
     MMChatDataset,
     normalize_mm_chat_sample,
@@ -180,6 +181,52 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 tt_tok.assistant_token_spans(messages, counts),
                 hf_tok.assistant_token_spans(messages, counts),
             )
+
+    def test_expand_image_placeholders_adds_missing_and_drops_extra(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            text = "\x16User:<image><image>hello\x17"
+            expanded = tok.expand_image_placeholders(text, [2])
+            self.assertEqual(expanded.count(tok.core.vision_start_token), 1)
+            self.assertEqual(expanded.count(tok.core.vision_end_token), 1)
+            self.assertEqual(expanded.count(tok.core.image_token), 2)
+            self.assertNotIn("<image>", expanded)
+
+            expanded = tok.expand_image_placeholders("\x16User:hello\x17", [1, 3])
+            self.assertEqual(expanded.count(tok.core.vision_start_token), 2)
+            self.assertEqual(expanded.count(tok.core.vision_end_token), 2)
+            self.assertEqual(expanded.count(tok.core.image_token), 4)
+
+    def test_image_count_builder_caps_extra_tags_and_prepends_missing(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "image"},
+                    {"type": "text", "text": "Question"},
+                ],
+            },
+            {"role": "assistant", "content": "Answer"},
+        ]
+        counts = build_image_token_counts_by_message(
+            messages,
+            [5],
+            image_placeholder_token="<image>",
+        )
+        self.assertEqual(counts, [[5], []])
+
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": [{"type": "text", "text": "Question"}]},
+            {"role": "assistant", "content": "Answer"},
+        ]
+        counts = build_image_token_counts_by_message(
+            messages,
+            [2, 4],
+            image_placeholder_token="<image>",
+        )
+        self.assertEqual(counts, [[], [2, 4], []])
 
     def test_hf_exporter_processor_uses_shared_pixel_budget(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -253,21 +253,28 @@ def build_image_token_counts_by_message(
         for item in items:
             if item.get("type") in {"image", "image_url"}:
                 if image_idx >= len(image_token_counts):
-                    raise ValueError("More image placeholders than images")
+                    continue
                 counts.append(image_token_counts[image_idx])
                 image_idx += 1
             elif item.get("type") == "text":
                 for _ in range(item.get("text", "").count(image_placeholder_token)):
                     if image_idx >= len(image_token_counts):
-                        raise ValueError("More image placeholders than images")
+                        continue
                     counts.append(image_token_counts[image_idx])
                     image_idx += 1
         counts_by_message.append(counts)
 
-    if image_idx != len(image_token_counts):
-        raise ValueError(
-            "Not all processed images were consumed by chat image markers: "
-            f"consumed {image_idx}, got {len(image_token_counts)}"
+    if image_idx < len(image_token_counts):
+        target_idx = next(
+            (
+                idx
+                for idx, message in enumerate(messages)
+                if message.get("role") == "user"
+            ),
+            0,
+        )
+        counts_by_message[target_idx] = (
+            image_token_counts[image_idx:] + counts_by_message[target_idx]
         )
     return counts_by_message
 

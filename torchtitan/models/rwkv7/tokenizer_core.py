@@ -26,7 +26,13 @@ DEFAULT_IMAGE_PLACEHOLDER_TOKEN = "<image>"
 CHAT_TEMPLATE = (
     "{% for message in messages %}"
     "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ':' }}"
+    "{% if message['content'] is string %}"
     "{{ message['content'] }}"
+    "{% else %}"
+    "{% for item in message['content'] %}"
+    "{% if item['type'] == 'image' or item['type'] == 'image_url' %}{{ '<image>' }}{% elif item['type'] == 'text' %}{{ item['text'] }}{% endif %}"
+    "{% endfor %}"
+    "{% endif %}"
     "{{ '\\x17' }}"
     "{% endfor %}"
     "{% if add_generation_prompt %}"
@@ -39,7 +45,13 @@ CHAT_TEMPLATE_FAKE_THINKING = (
     "{% for message in messages %}"
     "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ':' }}"
     "{% if message['role'] == 'assistant' %}{{ ' <think>\\n</think>\\n' }}{% endif %}"
+    "{% if message['content'] is string %}"
     "{{ message['content'] }}"
+    "{% else %}"
+    "{% for item in message['content'] %}"
+    "{% if item['type'] == 'image' or item['type'] == 'image_url' %}{{ '<image>' }}{% elif item['type'] == 'text' %}{{ item['text'] }}{% endif %}"
+    "{% endfor %}"
+    "{% endif %}"
     "{{ '\\x17' }}"
     "{% endfor %}"
     "{% if add_generation_prompt %}"
@@ -358,10 +370,8 @@ class RWKVTokenizerCore:
             start, _, pattern = min(matches)
             pieces.append(rendered_text[pos:start])
             if image_idx >= len(image_token_counts):
-                raise ValueError(
-                    "Rendered chat contains more image placeholders than images: "
-                    f"saw at least {image_idx + 1}, got {len(image_token_counts)}"
-                )
+                pos = start + len(pattern)
+                continue
             n_tokens = image_token_counts[image_idx]
             pieces.append(
                 f"{self.vision_start_token}"
@@ -371,11 +381,14 @@ class RWKVTokenizerCore:
             image_idx += 1
             pos = start + len(pattern)
 
-        if image_idx != len(image_token_counts):
-            raise ValueError(
-                "Rendered chat contains fewer image placeholders than images: "
-                f"saw {image_idx}, got {len(image_token_counts)}"
+        while image_idx < len(image_token_counts):
+            n_tokens = image_token_counts[image_idx]
+            pieces.append(
+                f"{self.vision_start_token}"
+                f"{self.image_token * n_tokens}"
+                f"{self.vision_end_token}"
             )
+            image_idx += 1
         return "".join(pieces)
 
     def render_mm_chat(
