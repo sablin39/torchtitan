@@ -59,28 +59,39 @@ vision_model="/home/molin/models/Qwen3.5-0.8B"
 # vision_model="/home/molin/models/Qwen3-VL-2B-Instruct"
 # model_flavor="1.5B-v400M"
 # train_config="rwkv_vl_1_5b_v400m_chat"
+# Defaults below recover the 2026-05-09 FineVisionMax run from the offline
+# W&B config in outputs/rwkv_vl_train_20260509_065318_latest_dcp_wandb*.
 fake_thinking="1"
-dataset_path="/home/molin/data/LLaVA-OneVision-Data/ai2d(cauldron,llava_format)"
+# W&B remote path: /data/HuggingFaceM4_FineVisionMax
+dataset_path="/home/molin/data/LLaVA-OneVision-Data"
 
 split="train"
 ngpu="4"
-seq_len="4096"
+# Size of each context-parallel group. For ngpu=4 this creates two CP groups
+# of 2 ranks; for ngpu=8 it creates four CP groups of 2 ranks.
+context_parallel_degree="2"
+seq_len="8192"
+# The recovered 4096-token W&B run used batch_size=24. For 8192-token local
+# stress on this shared 4x96GB workstation, batch_size=8 is the verified default.
 batch_size="8"
+# batch_size is TorchTitan training.local_batch_size. With RWKV/FLA CP it is
+# the number of packed seq_len rows per batch-parallel group. CP shards the
+# flattened tokens inside each row group; it does not multiply batch size.
+# With global_batch_size=-1, TorchTitan's effective global batch is:
+# batch_size * (ngpu / context_parallel_degree).
 # Sequence packing is controlled by the multimodal dataloader, not by CP.
 # packing_buffer_size is the number of tokenized samples kept in a CPU-side
 # buffer before greedily combining them into seq_len rows. Larger values usually
 # improve non-padding token occupancy, but increase preprocessing latency and
 # host memory use. Set to "0" to disable packing and pad each sample normally.
-# This is not batch size; batch_size still controls the number of packed rows
-# per step/CP group.
 packing_buffer_size="64"
 # Conservative dataloader overlap for multimodal packing. Each worker can hold
 # prefetched packed batches containing many resized images, so keep this small
 # on RAM-constrained machines. With CP, this is per rank.
-dataloader_num_workers="2"
+dataloader_num_workers="4"
 dataloader_persistent_workers="1"
-dataloader_prefetch_factor="1"
-dataloader_pin_memory="0"
+dataloader_prefetch_factor="2"
+dataloader_pin_memory="1"
 # Store preprocessed visual patch tensors in this dtype before worker IPC and
 # H2D transfer. For BF16 training this roughly halves pixel_values host memory
 # and transfer volume compared with float32 while resize/normalize still runs
@@ -94,17 +105,19 @@ omp_num_threads="1"
 # Set to an integer for a fixed-step run, or "epoch" to run until the finite
 # dataloader is exhausted. With sequence packing, exact epoch steps are not known
 # until samples are filtered, resized, tokenized, and packed.
-steps="20"
+steps="epoch"
 max_epoch_steps="1000000000"
 precision="bfloat16"
 export_dtype="bfloat16"
 model_name="rwkv_vl"
 model_flavor="0.4B-v100M"
 train_config="rwkv_vl_0_4b_v100m_chat"
-# Comma-separated roots to train. Valid entries are vision_encoder, proj, llm,
-# lm_head, and all. The normal llm selector includes the top-level lm_head.
-# For a common projector+LM finetune with frozen vision, use: "proj,llm".
-train_module="proj,llm"
+# Per-root learning rates. A value of 0 freezes that root and skips selective
+# FSDP sharding for it. Leave lm_head_lr empty to follow llm_lr.
+vision_encoder_lr="0"
+proj_lr="1e-5"
+llm_lr="1e-5"
+lm_head_lr=""
 projector_seed="1234"
 activation_checkpoint_mode="none"
 log_freq="1"
@@ -114,14 +127,15 @@ nvml_metrics="1"
 overwrite="0"
 optimizer_name="Adam"
 learning_rate="1e-5"
-lr_warmup_steps="500"
+weight_decay="0"
+lr_warmup_steps="2000"
 # Leave empty to use training_steps. In steps="epoch" mode, set this manually
 # if you want the cosine decay horizon to be shorter than max_epoch_steps.
 lr_total_steps=""
-lr_decay_type="cosine"
-lr_min_factor="0.1"
-checkpoint_interval="20"
-checkpoint_keep_latest_k="2"
+lr_decay_type="linear"
+lr_min_factor="1.0"
+checkpoint_interval="2000"
+checkpoint_keep_latest_k="0"
 image_processor=""
 min_pixels="65536"
 max_pixels="2097152"
@@ -135,7 +149,7 @@ output_root="${repo_root}/outputs/rwkv_vl_train_${timestamp}"
 
 train_extra_args=(
     # Add extra torchtitan.train args here, for example:
-    --parallelism.context-parallel-degree "${ngpu}"
+    --parallelism.context-parallel-degree "${context_parallel_degree}"
     --parallelism.context-parallel-load-balancer None
     --compile.enable
     # --compile.components model
@@ -163,6 +177,17 @@ fi
 
 if ! [[ "${ngpu}" =~ ^[0-9]+$ ]] || (( ngpu < 1 )); then
     echo "ngpu must be a positive integer, got: ${ngpu}" >&2
+    exit 2
+fi
+
+if ! [[ "${context_parallel_degree}" =~ ^[0-9]+$ ]] || (( context_parallel_degree < 1 )); then
+    echo "context_parallel_degree must be a positive integer, got: ${context_parallel_degree}" >&2
+    exit 2
+fi
+
+if (( ngpu % context_parallel_degree != 0 )); then
+    echo "ngpu must be divisible by context_parallel_degree." >&2
+    echo "Got ngpu=${ngpu}, context_parallel_degree=${context_parallel_degree}." >&2
     exit 2
 fi
 
@@ -208,11 +233,13 @@ else
 fi
 
 total_local_tokens=$((batch_size * seq_len))
-if (( total_local_tokens % ngpu != 0 )); then
-    echo "RWKV/FLA CP requires batch_size * seq_len to be divisible by ngpu." >&2
-    echo "Got batch_size=${batch_size}, seq_len=${seq_len}, ngpu=${ngpu}." >&2
+if (( total_local_tokens % context_parallel_degree != 0 )); then
+    echo "RWKV/FLA CP requires batch_size * seq_len to be divisible by context_parallel_degree." >&2
+    echo "Got batch_size=${batch_size}, seq_len=${seq_len}, context_parallel_degree=${context_parallel_degree}." >&2
     exit 2
 fi
+
+batch_parallel_degree=$((ngpu / context_parallel_degree))
 
 hf_dir="${output_root}/hf_export"
 dcp_dir="${output_root}/dcp_from_hf"
@@ -238,6 +265,10 @@ echo "  HF export:     ${hf_dir}"
 echo "  DCP export:    ${dcp_dir}"
 echo "  Train dump:    ${train_dump_dir}"
 echo "  Final HF:      ${final_hf_dir}"
+echo "Parallelism:"
+echo "  GPUs:          ${ngpu}"
+echo "  CP degree:     ${context_parallel_degree}"
+echo "  Batch groups:  ${batch_parallel_degree}"
 
 export_args=(
     "${repo_root}/scripts/rwkv7_exporter/export_hf_model.py"
@@ -281,7 +312,6 @@ train_args=(
     -m torchtitan.train
     --module "${model_name}"
     --config "${train_config}"
-    --train-module "${train_module}"
     --hf-assets-path "${hf_dir}"
     --dump-folder "${train_dump_dir}"
     --metrics.log-freq "${log_freq}"
@@ -289,6 +319,10 @@ train_args=(
     --dataloader.split "${split}"
     --optimizer.name "${optimizer_name}"
     --optimizer.lr "${learning_rate}"
+    --optimizer.weight-decay "${weight_decay}"
+    --module-lrs.vision-encoder "${vision_encoder_lr}"
+    --module-lrs.proj "${proj_lr}"
+    --module-lrs.llm "${llm_lr}"
     --lr-scheduler.warmup-steps "${lr_warmup_steps}"
     --lr-scheduler.decay-type "${lr_decay_type}"
     --lr-scheduler.min-lr-factor "${lr_min_factor}"
@@ -312,6 +346,9 @@ if [[ "${run_until_epoch}" == "1" ]]; then
 fi
 if [[ -n "${lr_total_steps}" ]]; then
     train_args+=(--lr-scheduler.total-steps "${lr_total_steps}")
+fi
+if [[ -n "${lm_head_lr}" ]]; then
+    train_args+=(--module-lrs.lm-head "${lm_head_lr}")
 fi
 if [[ "${wandb}" == "1" ]]; then
     train_args+=(--metrics.enable-wandb)

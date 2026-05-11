@@ -21,6 +21,7 @@ from torchtitan.models.rwkv_vl import (
     rwkv_vl_configs,
 )
 from torchtitan.models.rwkv_vl.model import VisualAdapter
+import torchtitan.models.rwkv_vl.parallelize as rwkv_vl_parallelize
 from torchtitan.models.rwkv_vl.state_dict_adapter import RWKVVLStateDictAdapter
 from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
 
@@ -99,9 +100,14 @@ class TestRWKV7Backend(unittest.TestCase):
         self.assertIn("deepstack.0.pre_norm.weight", keys)
         self.assertNotIn("pre_norm.weight", keys)
 
-    def test_rwkv_vl_train_module_freezes_unselected_roots(self):
+    def test_rwkv_vl_module_lrs_freeze_zero_lr_roots(self):
         spec = rwkv_vl_model_registry("debugmodel")
-        spec.model.train_module = ["proj"]
+        spec.model.root_lrs = {
+            "vision_encoder": 0.0,
+            "proj": 1e-4,
+            "llm": 0.0,
+            "lm_head": 0.0,
+        }
         with torch.device("meta"):
             model = spec.model.build()
 
@@ -112,9 +118,34 @@ class TestRWKV7Backend(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for p in model.llm.parameters()))
         self.assertTrue(all(not p.requires_grad for p in model.lm_head.parameters()))
 
-    def test_rwkv_vl_train_module_llm_includes_lm_head(self):
-        spec = rwkv_vl_model_registry("debugmodel")
-        spec.model.train_module = ["llm"]
+    def test_rwkv_vl_module_lrs_lm_head_follows_llm_by_default(self):
+        cfg = ConfigManager().parse_args(
+            [
+                "--module",
+                "rwkv_vl",
+                "--config",
+                "rwkv_vl_debugmodel_chat",
+                "--optimizer.lr",
+                "1e-5",
+                "--module-lrs.vision-encoder",
+                "0",
+                "--module-lrs.proj",
+                "0",
+                "--module-lrs.llm",
+                "2e-5",
+            ]
+        )
+        spec = cfg.model_spec
+        spec.model.update_from_config(trainer_config=cfg)
+        self.assertEqual(
+            spec.model.root_lrs,
+            {
+                "vision_encoder": 0.0,
+                "proj": 0.0,
+                "llm": 2e-5,
+                "lm_head": 2e-5,
+            },
+        )
         with torch.device("meta"):
             model = spec.model.build()
 
@@ -125,18 +156,104 @@ class TestRWKV7Backend(unittest.TestCase):
         )
         self.assertTrue(all(not p.requires_grad for p in model.proj.parameters()))
 
-    def test_rwkv_vl_train_module_cli_parses_comma_list(self):
+    def test_rwkv_vl_module_lrs_cli_configures_optimizer_groups(self):
         cfg = ConfigManager().parse_args(
             [
                 "--module",
                 "rwkv_vl",
                 "--config",
                 "rwkv_vl_debugmodel_chat",
-                "--train-module",
-                "proj,llm",
+                "--optimizer.lr",
+                "1e-5",
+                "--module-lrs.vision-encoder",
+                "0",
+                "--module-lrs.proj",
+                "1e-4",
+                "--module-lrs.llm",
+                "1e-5",
             ]
         )
-        self.assertEqual(cfg.train_module, ["proj", "llm"])
+        self.assertEqual(cfg.module_lrs.vision_encoder, 0.0)
+        self.assertEqual(cfg.module_lrs.proj, 1e-4)
+        self.assertEqual(cfg.module_lrs.llm, 1e-5)
+        self.assertIsNone(cfg.module_lrs.lm_head)
+
+        cfg.model_spec.model.update_from_config(trainer_config=cfg)
+        groups = {
+            group.pattern: group.lr_multiplier
+            for group in cfg.optimizer.param_groups
+        }
+        self.assertNotIn(r"^vision_encoder\.", groups)
+        self.assertEqual(groups[r"^proj\."], 10.0)
+        self.assertEqual(groups[r"^llm\."], 1.0)
+        self.assertEqual(groups[r"^lm_head\."], 1.0)
+
+    def test_rwkv_vl_fsdp_skips_frozen_roots(self):
+        spec = rwkv_vl_model_registry("debugmodel")
+        spec.model.root_lrs = {
+            "vision_encoder": 0.0,
+            "proj": 1e-5,
+            "llm": 1e-5,
+            "lm_head": 1e-5,
+        }
+        with torch.device("meta"):
+            model = spec.model.build()
+
+        frozen_params = {p for p in model.parameters() if not p.requires_grad}
+        self.assertGreater(len(frozen_params), 0)
+        self.assertTrue(
+            all(param in frozen_params for param in model.vision_encoder.parameters())
+        )
+        self.assertFalse(
+            any(param in frozen_params for param in model.proj.parameters())
+        )
+
+        module_names = {
+            id(model): "model",
+            id(model.vision_encoder): "vision_encoder",
+            id(model.proj): "proj",
+            id(model.llm.embeddings): "llm.embeddings",
+            id(model.llm.norm): "llm.norm",
+            id(model.lm_head): "lm_head",
+            id(model.llm): "llm",
+        }
+        module_names.update(
+            {id(block): f"llm.layers.{idx}" for idx, block in model.llm.layers.items()}
+        )
+
+        fully_shard_calls = []
+        original_fully_shard = rwkv_vl_parallelize.fully_shard
+        original_disable = rwkv_vl_parallelize.disable_fsdp_gradient_division
+
+        def fake_fully_shard(module, **kwargs):
+            fully_shard_calls.append((module_names[id(module)], kwargs))
+
+        try:
+            rwkv_vl_parallelize.fully_shard = fake_fully_shard
+            rwkv_vl_parallelize.disable_fsdp_gradient_division = lambda model: None
+            rwkv_vl_parallelize.apply_fsdp(
+                model,
+                dp_mesh=object(),
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+            )
+        finally:
+            rwkv_vl_parallelize.fully_shard = original_fully_shard
+            rwkv_vl_parallelize.disable_fsdp_gradient_division = original_disable
+
+        sharded_modules = [name for name, _ in fully_shard_calls]
+        self.assertNotIn("vision_encoder", sharded_modules)
+        self.assertIn("proj", sharded_modules)
+        self.assertIn("llm.embeddings", sharded_modules)
+        self.assertIn("lm_head", sharded_modules)
+        self.assertIn("llm", sharded_modules)
+        self.assertIn("model", sharded_modules)
+        frozen_param_ids = {id(param) for param in frozen_params}
+        for _, kwargs in fully_shard_calls:
+            self.assertEqual(
+                {id(param) for param in kwargs["ignored_params"]},
+                frozen_param_ids,
+            )
 
     def test_rwkv7_state_dict_adapter_maps_llm_prefix(self):
         spec = rwkv7_model_registry("debugmodel")

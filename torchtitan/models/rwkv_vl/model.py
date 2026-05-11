@@ -13,6 +13,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from torchtitan.components.optimizer import ParamGroupConfig
 from torchtitan.models.common import Linear
 from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
 from torchtitan.models.rwkv7.model import (
@@ -28,37 +29,73 @@ from torchtitan.protocols.module import Module, ModuleList, Sequential
 ReLU = Module.from_nn_module(nn.ReLU)
 
 
-_DEFAULT_TRAIN_MODULE = ("vision_encoder", "proj", "llm")
-_TRAIN_MODULE_ALIASES = {
-    "vision_encoder": ("vision_encoder",),
-    "proj": ("proj",),
-    # lm_head is a top-level module for ChunkedCELoss integration, but it is
-    # part of the trainable language-model side for normal finetuning choices.
-    "llm": ("llm", "lm_head"),
-    "lm_head": ("lm_head",),
-    "all": ("vision_encoder", "proj", "llm", "lm_head"),
+_ROOT_MODULE_NAMES = ("vision_encoder", "proj", "llm", "lm_head")
+_ROOT_PARAM_PATTERNS = {
+    "vision_encoder": r"^vision_encoder\.",
+    "proj": r"^proj\.",
+    "llm": r"^llm\.",
+    "lm_head": r"^lm_head\.",
 }
 
 
-def _expand_train_module(train_module: list[str]) -> tuple[str, ...]:
-    expanded: set[str] = set()
-    invalid = []
-    for name in train_module:
-        normalized = name.strip()
-        if normalized not in _TRAIN_MODULE_ALIASES:
-            invalid.append(name)
-            continue
-        expanded.update(_TRAIN_MODULE_ALIASES[normalized])
+def _default_root_lrs() -> dict[str, float]:
+    return {name: 1.0 for name in _ROOT_MODULE_NAMES}
 
-    if invalid:
-        valid = ", ".join(sorted(_TRAIN_MODULE_ALIASES))
+
+def _validate_root_lrs(root_lrs: dict[str, float]) -> dict[str, float]:
+    missing = set(_ROOT_MODULE_NAMES) - set(root_lrs)
+    unknown = set(root_lrs) - set(_ROOT_MODULE_NAMES)
+    if missing or unknown:
         raise ValueError(
-            f"Unsupported RWKV-VL train_module entries: {invalid}. "
-            f"Valid entries are: {valid}."
+            "RWKV-VL root_lrs must contain exactly "
+            f"{list(_ROOT_MODULE_NAMES)}; missing={sorted(missing)}, "
+            f"unknown={sorted(unknown)}"
         )
-    if not expanded:
-        raise ValueError("RWKV-VL train_module must select at least one module")
-    return tuple(sorted(expanded))
+
+    resolved = {name: float(root_lrs[name]) for name in _ROOT_MODULE_NAMES}
+    negative = {name: lr for name, lr in resolved.items() if lr < 0}
+    if negative:
+        raise ValueError(f"RWKV-VL module LRs must be non-negative, got {negative}")
+    if not any(lr > 0 for lr in resolved.values()):
+        raise ValueError("At least one RWKV-VL module LR must be greater than 0")
+    return resolved
+
+
+def _resolve_root_lrs(module_lrs: Any, default_lr: float) -> dict[str, float]:
+    if default_lr <= 0:
+        raise ValueError(
+            "RWKV-VL module LR config requires --optimizer.lr to be greater than 0"
+        )
+
+    resolved = {}
+    for name in _ROOT_MODULE_NAMES:
+        value = getattr(module_lrs, name)
+        resolved[name] = default_lr if value is None else float(value)
+
+    if getattr(module_lrs, "lm_head") is None:
+        resolved["lm_head"] = resolved["llm"]
+
+    return _validate_root_lrs(resolved)
+
+
+def _configure_optimizer_param_groups(
+    optimizer_config: Any,
+    root_lrs: dict[str, float],
+):
+    base_lr = float(optimizer_config.lr)
+    if base_lr <= 0:
+        raise ValueError(
+            "RWKV-VL module LR config requires --optimizer.lr to be greater than 0"
+        )
+
+    optimizer_config.param_groups = [
+        ParamGroupConfig(
+            pattern=_ROOT_PARAM_PATTERNS[name],
+            lr_multiplier=lr / base_lr,
+        )
+        for name, lr in root_lrs.items()
+        if lr > 0
+    ]
 
 
 def _linear(
@@ -183,19 +220,18 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         vision_start_token_id: int = 65530
         vision_end_token_id: int = 65531
         uses_fla_context_parallel: bool = True
-        train_module: list[str] = field(
-            default_factory=lambda: list(_DEFAULT_TRAIN_MODULE)
-        )
+        root_lrs: dict[str, float] = field(default_factory=_default_root_lrs)
 
         def update_from_config(self, *, trainer_config, **kwargs) -> None:
             parallelism = trainer_config.parallelism
             training = trainer_config.training
             compile_config = getattr(trainer_config, "compile", None)
-            train_module = getattr(trainer_config, "train_module", None)
-
-            if train_module is not None:
-                self.train_module = list(train_module)
-            _expand_train_module(self.train_module)
+            module_lrs = getattr(trainer_config, "module_lrs")
+            self.root_lrs = _resolve_root_lrs(module_lrs, trainer_config.optimizer.lr)
+            _configure_optimizer_param_groups(
+                trainer_config.optimizer,
+                self.root_lrs,
+            )
 
             if parallelism.tensor_parallel_degree > 1:
                 raise NotImplementedError("RWKV-VL v1 does not support tensor parallelism")
@@ -248,10 +284,10 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             )
         ).build()
         self._cp_group = None
-        self._train_module_roots = self._apply_train_module_selection()
+        self._trainable_roots = self._apply_root_lr_selection()
 
-    def _apply_train_module_selection(self) -> tuple[str, ...]:
-        train_roots = set(_expand_train_module(self.config.train_module))
+    def _apply_root_lr_selection(self) -> tuple[str, ...]:
+        root_lrs = _validate_root_lrs(self.config.root_lrs)
         module_roots = {
             "vision_encoder": self.vision_encoder,
             "proj": self.proj,
@@ -259,8 +295,8 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             "lm_head": self.lm_head,
         }
         for name, module in module_roots.items():
-            module.requires_grad_(name in train_roots)
-        return tuple(sorted(train_roots))
+            module.requires_grad_(root_lrs[name] > 0)
+        return tuple(name for name in _ROOT_MODULE_NAMES if root_lrs[name] > 0)
 
     def set_cp_process_group(self, cp_group) -> None:
         self._cp_group = cp_group

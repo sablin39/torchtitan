@@ -21,8 +21,6 @@ from torchtitan.trainer import Trainer
 from . import model_registry
 
 
-_DEFAULT_TRAIN_MODULE = ("vision_encoder", "proj", "llm")
-
 _DEBUG_SPECIAL_TOKENS = {
     "image_token": "<|image_pad|>",
     "video_token": "<|video_pad|>",
@@ -33,14 +31,25 @@ _DEBUG_SPECIAL_TOKENS = {
 
 
 @dataclass(kw_only=True, slots=True)
-class RWKVVLTrainerConfig(Trainer.Config):
-    train_module: list[str] = field(
-        default_factory=lambda: list(_DEFAULT_TRAIN_MODULE)
-    )
+class RWKVVLModuleLRs:
     """
-    Comma-separated RWKV-VL roots to train. Valid values are vision_encoder,
-    proj, llm, lm_head, and all. The normal llm selector includes lm_head.
-    Non-selected roots are frozen before the optimizer is built.
+    Per-root RWKV-VL learning rates. ``None`` means use ``optimizer.lr``.
+    A value of 0 freezes that root and excludes it from FSDP sharding.
+    ``lm_head`` defaults to the resolved ``llm`` LR when left as ``None``.
+    """
+
+    vision_encoder: float | None = None
+    proj: float | None = None
+    llm: float | None = None
+    lm_head: float | None = None
+
+
+@dataclass(kw_only=True, slots=True)
+class RWKVVLTrainerConfig(Trainer.Config):
+    module_lrs: RWKVVLModuleLRs = field(default_factory=RWKVVLModuleLRs)
+    """
+    Per-root RWKV-VL learning rates. Roots with lr=0 are frozen before the
+    optimizer is built and are skipped by selective FSDP sharding.
     """
 
 

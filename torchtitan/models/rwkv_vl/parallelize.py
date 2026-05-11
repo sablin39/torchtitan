@@ -38,13 +38,14 @@ def parallelize_rwkv_vl(
     ac_config: ActivationCheckpointConfig,
     dump_folder: str,
 ):
-    train_module = getattr(model, "_train_module_roots", None)
-    if train_module is not None:
+    trainable_roots = getattr(model, "_trainable_roots", None)
+    if trainable_roots is not None:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in model.parameters())
         logger.info(
-            "RWKV-VL train_module=%s enables %s / %s trainable parameters",
-            list(model.config.train_module),
+            "RWKV-VL module_lrs=%s enables roots=%s and %s / %s trainable parameters",
+            model.config.root_lrs,
+            list(trainable_roots),
             f"{trainable_params:,}",
             f"{total_params:,}",
         )
@@ -119,6 +120,23 @@ def apply_rwkv_compile(model: nn.Module, compile_config: CompileConfig) -> None:
     logger.info("Compiled each RWKV7Block with torch.compile(fullgraph=False)")
 
 
+def _has_trainable_params(module: nn.Module) -> bool:
+    return any(p.requires_grad for p in module.parameters())
+
+
+def _fully_shard_if_trainable(
+    module: nn.Module,
+    *,
+    module_name: str,
+    skipped_frozen_modules: list[str],
+    **kwargs,
+) -> None:
+    if _has_trainable_params(module):
+        fully_shard(module, **kwargs)
+    else:
+        skipped_frozen_modules.append(module_name)
+
+
 def apply_fsdp(
     model: RWKV7VLForConditionalGeneration,
     dp_mesh: DeviceMesh,
@@ -133,6 +151,9 @@ def apply_fsdp(
         cast_forward_inputs=False,
     )
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
+    frozen_params = {p for p in model.parameters() if not p.requires_grad}
+    if frozen_params:
+        fsdp_config["ignored_params"] = frozen_params
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
@@ -141,37 +162,55 @@ def apply_fsdp(
         pp_enabled=False,
     )
 
-    fully_shard(
+    skipped_frozen_modules: list[str] = []
+    _fully_shard_if_trainable(
         model.vision_encoder,
+        module_name="vision_encoder",
+        skipped_frozen_modules=skipped_frozen_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
-    fully_shard(
+    _fully_shard_if_trainable(
         model.proj,
+        module_name="proj",
+        skipped_frozen_modules=skipped_frozen_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
-    fully_shard(
+    _fully_shard_if_trainable(
         model.llm.embeddings,
+        module_name="llm.embeddings",
+        skipped_frozen_modules=skipped_frozen_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
-    for block in model.llm.layers.values():
-        fully_shard(
+    for layer_idx, block in model.llm.layers.items():
+        _fully_shard_if_trainable(
             block,
+            module_name=f"llm.layers.{layer_idx}",
+            skipped_frozen_modules=skipped_frozen_modules,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
-    fully_shard(
+    _fully_shard_if_trainable(
         model.llm.norm,
+        module_name="llm.norm",
+        skipped_frozen_modules=skipped_frozen_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward_policy == "always",
     )
-    fully_shard(
+    _fully_shard_if_trainable(
         model.lm_head,
+        module_name="lm_head",
+        skipped_frozen_modules=skipped_frozen_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward_policy == "always",
     )
+    if skipped_frozen_modules:
+        logger.info(
+            "Skipped FSDP wrapping for frozen RWKV-VL modules: %s",
+            skipped_frozen_modules,
+        )
     fully_shard(model.llm, **fsdp_config)
     fully_shard(model, **fsdp_config)
     disable_fsdp_gradient_division(model)
