@@ -141,7 +141,7 @@ class _VisualStreamProjector(Module):
         norm_eps: float,
     ):
         super().__init__()
-        self.pre_norm = LayerNorm(encoder_dim, eps=norm_eps)
+        self.pre_norm = LayerNorm(project_dim, eps=norm_eps)
         self.mlp = Sequential(
             _projector_linear(encoder_dim, hidden_dim, bias=True),
             ReLU(),
@@ -149,7 +149,8 @@ class _VisualStreamProjector(Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.pre_norm(x))
+        x = self.mlp(x)
+        return x + self.pre_norm(x)
 
 
 class VisualAdapter(Module):
