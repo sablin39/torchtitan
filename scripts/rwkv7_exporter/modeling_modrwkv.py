@@ -201,7 +201,7 @@ class _VisualStreamProjector(nn.Module):
         self.project_dim = project_dim
         self.hidden_dim = hidden_dim or project_dim * 4
 
-        self.pre_norm = nn.LayerNorm(encoder_dim)
+        self.pre_norm = nn.LayerNorm(project_dim)
         self.mlp = nn.Sequential(
             nn.Linear(encoder_dim, self.hidden_dim),
             nn.ReLU(),
@@ -209,7 +209,8 @@ class _VisualStreamProjector(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.pre_norm(x))
+        x = self.mlp(x)
+        return x + self.pre_norm(x)
 
 
 class VisualAdapter(nn.Module):
