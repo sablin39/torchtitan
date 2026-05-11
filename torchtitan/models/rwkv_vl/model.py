@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any
 
@@ -96,6 +96,21 @@ def _configure_optimizer_param_groups(
         for name, lr in root_lrs.items()
         if lr > 0
     ]
+
+
+def _validate_backbone_chunk_size(chunk_size: int) -> int:
+    chunk_size = int(chunk_size)
+    if chunk_size < 16:
+        raise ValueError(
+            "RWKV-VL backbone_chunk_size must be at least 16; "
+            f"got {chunk_size}"
+        )
+    if chunk_size & (chunk_size - 1):
+        raise ValueError(
+            "RWKV-VL backbone_chunk_size must be a power of two; "
+            f"got {chunk_size}"
+        )
+    return chunk_size
 
 
 def _linear(
@@ -232,6 +247,12 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             _configure_optimizer_param_groups(
                 trainer_config.optimizer,
                 self.root_lrs,
+            )
+            self.llm = replace(
+                self.llm,
+                chunk_size=_validate_backbone_chunk_size(
+                    getattr(trainer_config, "backbone_chunk_size", self.llm.chunk_size)
+                ),
             )
 
             if parallelism.tensor_parallel_degree > 1:

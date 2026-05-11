@@ -188,6 +188,42 @@ class TestRWKV7Backend(unittest.TestCase):
         self.assertEqual(groups[r"^llm\."], 1.0)
         self.assertEqual(groups[r"^lm_head\."], 1.0)
 
+    def test_rwkv_vl_backbone_chunk_size_cli_updates_model_config(self):
+        cfg = ConfigManager().parse_args(
+            [
+                "--module",
+                "rwkv_vl",
+                "--config",
+                "rwkv_vl_debugmodel_chat",
+                "--backbone-chunk-size",
+                "32",
+            ]
+        )
+        self.assertEqual(cfg.backbone_chunk_size, 32)
+        self.assertEqual(cfg.model_spec.model.llm.chunk_size, 64)
+
+        cfg.model_spec.model.update_from_config(trainer_config=cfg)
+        self.assertEqual(cfg.model_spec.model.llm.chunk_size, 32)
+        with torch.device("meta"):
+            model = cfg.model_spec.model.build()
+        self.assertTrue(
+            all(block.attn.chunk_size == 32 for block in model.llm.layers.values())
+        )
+
+    def test_rwkv_vl_backbone_chunk_size_rejects_bad_values(self):
+        cfg = ConfigManager().parse_args(
+            [
+                "--module",
+                "rwkv_vl",
+                "--config",
+                "rwkv_vl_debugmodel_chat",
+                "--backbone-chunk-size",
+                "8",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "at least 16"):
+            cfg.model_spec.model.update_from_config(trainer_config=cfg)
+
     def test_rwkv_vl_fsdp_skips_frozen_roots(self):
         spec = rwkv_vl_model_registry("debugmodel")
         spec.model.root_lrs = {

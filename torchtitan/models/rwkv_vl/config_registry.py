@@ -52,6 +52,12 @@ class RWKVVLTrainerConfig(Trainer.Config):
     optimizer is built and are skipped by selective FSDP sharding.
     """
 
+    backbone_chunk_size: int = 64
+    """
+    Chunk size used by the RWKV7 backbone DPLR kernels. This does not affect
+    state dict shapes; it is applied to the model config before construction.
+    """
+
 
 def _rwkv_vl_dataloader(dataset: str, **kwargs) -> MMDataLoader.Config:
     return MMDataLoader.Config(

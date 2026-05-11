@@ -112,10 +112,13 @@ export_dtype="bfloat16"
 model_name="rwkv_vl"
 model_flavor="0.4B-v100M"
 train_config="rwkv_vl_0_4b_v100m_chat"
+# RWKV7 DPLR chunk size for the language backbone. The model default is 64;
+# local long-sequence sweeps favored 32 for packed CP training.
+backbone_chunk_size="32"
 # Per-root learning rates. A value of 0 freezes that root and skips selective
 # FSDP sharding for it. Leave lm_head_lr empty to follow llm_lr.
 vision_encoder_lr="0"
-proj_lr="1e-5"
+proj_lr="1e-4"
 llm_lr="1e-5"
 lm_head_lr=""
 projector_seed="1234"
@@ -198,6 +201,15 @@ fi
 
 if ! [[ "${seq_len}" =~ ^[0-9]+$ ]] || (( seq_len < 1 )); then
     echo "seq_len must be a positive integer, got: ${seq_len}" >&2
+    exit 2
+fi
+
+if ! [[ "${backbone_chunk_size}" =~ ^[0-9]+$ ]] || (( backbone_chunk_size < 16 )); then
+    echo "backbone_chunk_size must be an integer >= 16, got: ${backbone_chunk_size}" >&2
+    exit 2
+fi
+if (( backbone_chunk_size & (backbone_chunk_size - 1) )); then
+    echo "backbone_chunk_size must be a power of two, got: ${backbone_chunk_size}" >&2
     exit 2
 fi
 
@@ -323,6 +335,7 @@ train_args=(
     --module-lrs.vision-encoder "${vision_encoder_lr}"
     --module-lrs.proj "${proj_lr}"
     --module-lrs.llm "${llm_lr}"
+    --backbone-chunk-size "${backbone_chunk_size}"
     --lr-scheduler.warmup-steps "${lr_warmup_steps}"
     --lr-scheduler.decay-type "${lr_decay_type}"
     --lr-scheduler.min-lr-factor "${lr_min_factor}"
