@@ -1,11 +1,15 @@
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+import importlib
 import json
 import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+import uuid
 
 import torch
 from safetensors import safe_open
@@ -27,11 +31,10 @@ if str(REPO_ROOT) not in sys.path:
 try:
     from .configuration_rwkv7 import RWKV7Config
     from .modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
-    from .tokenizer import CHAT_TEMPLATE_FAKE_THINKING, RwkvTokenizer
 except ImportError:
     from configuration_rwkv7 import RWKV7Config
     from modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
-    from tokenizer import CHAT_TEMPLATE_FAKE_THINKING, RwkvTokenizer
+from torchtitan.models.rwkv7.tokenizer_core import CHAT_TEMPLATE_FAKE_THINKING
 
 
 IM_START_TOKEN = "\x16"
@@ -99,7 +102,9 @@ def save_tokenizer_core(output: str) -> None:
     source = Path(tokenizer_core.__file__)
     if not source.is_file():
         raise FileNotFoundError(f"Could not find tokenizer_core.py at {source}")
-    shutil.copyfile(source, Path(output) / "tokenizer_core.py")
+    output_path = Path(output)
+    output_path.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, output_path / "tokenizer_core.py")
 
 
 def save_processor_core(output: str) -> None:
@@ -120,7 +125,62 @@ def save_processor_core(output: str) -> None:
     if source is None:
         formatted = "\n".join(f"  - {candidate}" for candidate in candidates)
         raise FileNotFoundError(f"Could not find processor_core.py. Checked:\n{formatted}")
-    shutil.copyfile(source, Path(output) / "processor_core.py")
+    output_path = Path(output)
+    output_path.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, output_path / "processor_core.py")
+
+
+@contextmanager
+def _remote_code_package(*, include_processor: bool = False):
+    package_name = f"_rwkv7_exporter_remote_{uuid.uuid4().hex}"
+    module_names = [
+        package_name,
+        f"{package_name}.tokenizer",
+        f"{package_name}.tokenizer_core",
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        package_dir = Path(tmpdir) / package_name
+        package_dir.mkdir()
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
+        shutil.copyfile(
+            Path(__file__).with_name("tokenizer.py"), package_dir / "tokenizer.py"
+        )
+        save_tokenizer_core(str(package_dir))
+        if include_processor:
+            shutil.copyfile(
+                Path(__file__).with_name("processor.py"),
+                package_dir / "processor.py",
+            )
+            save_processor_core(str(package_dir))
+            module_names.extend(
+                [f"{package_name}.processor", f"{package_name}.processor_core"]
+            )
+
+        sys.path.insert(0, tmpdir)
+        try:
+            importlib.invalidate_caches()
+            tokenizer_module = importlib.import_module(f"{package_name}.tokenizer")
+            processor_module = (
+                importlib.import_module(f"{package_name}.processor")
+                if include_processor
+                else None
+            )
+            yield SimpleNamespace(
+                tokenizer_module=tokenizer_module,
+                processor_module=processor_module,
+                RwkvTokenizer=tokenizer_module.RwkvTokenizer,
+                ModRWKVProcessor=(
+                    processor_module.ModRWKVProcessor if processor_module else None
+                ),
+            )
+        finally:
+            try:
+                sys.path.remove(tmpdir)
+            except ValueError:
+                pass
+            for module_name in reversed(module_names):
+                sys.modules.pop(module_name, None)
+            importlib.invalidate_caches()
 
 
 def torch_load_weights(path: str) -> dict[str, torch.Tensor]:
@@ -630,46 +690,43 @@ def save_multimodal_processor(
     max_pixels: int | None,
     fake_thinking: bool,
 ) -> None:
-    try:
-        from .processor import (
-            CHAT_TEMPLATE_FAKE_THINKING as PROCESSOR_CHAT_TEMPLATE_FAKE_THINKING,
+    with _remote_code_package(include_processor=True) as remote_code:
+        VLRwkvTokenizer = remote_code.RwkvTokenizer
+        ModRWKVProcessor = remote_code.ModRWKVProcessor
+        assert ModRWKVProcessor is not None
+        processor_chat_template_fake_thinking = (
+            remote_code.processor_module.CHAT_TEMPLATE_FAKE_THINKING
         )
-        from .processor import ModRWKVProcessor
-        from .tokenizer import RwkvTokenizer as VLRwkvTokenizer
-    except ImportError:
-        from processor import (  # type: ignore[no-redef]
-            CHAT_TEMPLATE_FAKE_THINKING as PROCESSOR_CHAT_TEMPLATE_FAKE_THINKING,
+
+        VLRwkvTokenizer.register_for_auto_class("AutoTokenizer")
+        ModRWKVProcessor.register_for_auto_class("AutoProcessor")
+
+        tokenizer = VLRwkvTokenizer(
+            vocab_file=str(resolve_vocab_file("wr_vocab_v20230424.txt")),
+            bos_token="\x16",
+            eos_token="\x17",
+            pad_token="\x17",
+            unk_token="\x16",
         )
-        from processor import ModRWKVProcessor
-        from tokenizer import RwkvTokenizer as VLRwkvTokenizer
+        image_processor = AutoImageProcessor.from_pretrained(
+            image_processor_source,
+            trust_remote_code=True,
+        )
+        if max_pixels is not None:
+            if max_pixels <= 0:
+                raise ValueError("--max-pixels must be positive when provided.")
+            image_processor.size["longest_edge"] = int(max_pixels)
 
-    VLRwkvTokenizer.register_for_auto_class("AutoTokenizer")
-    ModRWKVProcessor.register_for_auto_class("AutoProcessor")
-
-    tokenizer = VLRwkvTokenizer(
-        vocab_file=str(resolve_vocab_file("wr_vocab_v20230424.txt")),
-        bos_token="\x16",
-        eos_token="\x17",
-        pad_token="\x17",
-        unk_token="\x16",
-    )
-    image_processor = AutoImageProcessor.from_pretrained(
-        image_processor_source,
-        trust_remote_code=True,
-    )
-    if max_pixels is not None:
-        if max_pixels <= 0:
-            raise ValueError("--max-pixels must be positive when provided.")
-        image_processor.size["longest_edge"] = int(max_pixels)
-
-    processor = ModRWKVProcessor(
-        tokenizer=tokenizer,
-        image_processor=image_processor,
-        chat_template=PROCESSOR_CHAT_TEMPLATE_FAKE_THINKING if fake_thinking else None,
-    )
-    processor.save_pretrained(output)
-    save_tokenizer_core(output)
-    save_processor_core(output)
+        processor = ModRWKVProcessor(
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            chat_template=(
+                processor_chat_template_fake_thinking if fake_thinking else None
+            ),
+        )
+        processor.save_pretrained(output)
+        save_tokenizer_core(output)
+        save_processor_core(output)
 
 
 def verify_text_export(output: str, *, dtype: torch.dtype, verify_model_load: bool) -> None:
@@ -770,17 +827,18 @@ def convert(
         max_shard_size=max_shard_size,
     )
 
-    tokenizer = RwkvTokenizer(
-        vocab_file=str(resolve_vocab_file("wr_vocab_v20230424.txt")),
-        bos_token=IM_START_TOKEN,
-        eos_token=IM_END_TOKEN,
-        pad_token=IM_END_TOKEN,
-        unk_token=IM_START_TOKEN,
-        chat_template=CHAT_TEMPLATE_FAKE_THINKING if fake_thinking else None,
-    )
-    tokenizer.register_for_auto_class()
-    tokenizer.save_pretrained(output)
-    save_tokenizer_core(output)
+    with _remote_code_package() as remote_code:
+        tokenizer = remote_code.RwkvTokenizer(
+            vocab_file=str(resolve_vocab_file("wr_vocab_v20230424.txt")),
+            bos_token=IM_START_TOKEN,
+            eos_token=IM_END_TOKEN,
+            pad_token=IM_END_TOKEN,
+            unk_token=IM_START_TOKEN,
+            chat_template=CHAT_TEMPLATE_FAKE_THINKING if fake_thinking else None,
+        )
+        tokenizer.register_for_auto_class()
+        tokenizer.save_pretrained(output)
+        save_tokenizer_core(output)
 
     print(f"Saved text-only HF checkpoint to {output}")
     verify_text_export(output, dtype=dtype, verify_model_load=verify_model_load)

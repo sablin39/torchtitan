@@ -18,26 +18,15 @@ try:
         RWKVTokenizerCore,
     )
 except ImportError:
-    try:
-        from tokenizer_core import (  # type: ignore[no-redef]
-            CHAT_TEMPLATE,
-            CHAT_TEMPLATE_FAKE_THINKING,
-            DEFAULT_IMAGE_TOKEN,
-            DEFAULT_VISION_END_TOKEN,
-            DEFAULT_VISION_START_TOKEN,
-            RWKVSpecialTokens,
-            RWKVTokenizerCore,
-        )
-    except ImportError:
-        from torchtitan.models.rwkv7.tokenizer_core import (  # type: ignore[no-redef]
-            CHAT_TEMPLATE,
-            CHAT_TEMPLATE_FAKE_THINKING,
-            DEFAULT_IMAGE_TOKEN,
-            DEFAULT_VISION_END_TOKEN,
-            DEFAULT_VISION_START_TOKEN,
-            RWKVSpecialTokens,
-            RWKVTokenizerCore,
-        )
+    from tokenizer_core import (  # type: ignore[no-redef]
+        CHAT_TEMPLATE,
+        CHAT_TEMPLATE_FAKE_THINKING,
+        DEFAULT_IMAGE_TOKEN,
+        DEFAULT_VISION_END_TOKEN,
+        DEFAULT_VISION_START_TOKEN,
+        RWKVSpecialTokens,
+        RWKVTokenizerCore,
+    )
 
 
 if TYPE_CHECKING:

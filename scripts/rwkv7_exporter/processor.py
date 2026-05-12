@@ -13,20 +13,12 @@ try:
         process_images,
     )
 except ImportError:
-    try:
-        from processor_core import (  # type: ignore[no-redef]
-            CHAT_TEMPLATE,
-            CHAT_TEMPLATE_FAKE_THINKING,
-            make_image_config_from_processor,
-            process_images,
-        )
-    except ImportError:
-        from torchtitan.hf_datasets.multimodal.processor_core import (  # type: ignore[no-redef]
-            CHAT_TEMPLATE,
-            CHAT_TEMPLATE_FAKE_THINKING,
-            make_image_config_from_processor,
-            process_images,
-        )
+    from processor_core import (  # type: ignore[no-redef]
+        CHAT_TEMPLATE,
+        CHAT_TEMPLATE_FAKE_THINKING,
+        make_image_config_from_processor,
+        process_images,
+    )
 
 
 class ModRWKVProcessorKwargs(ProcessingKwargs, total=False):

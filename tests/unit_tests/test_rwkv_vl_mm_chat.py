@@ -6,6 +6,8 @@
 
 import os
 from pathlib import Path
+import shutil
+import sys
 import tempfile
 import unittest
 
@@ -27,9 +29,10 @@ from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
     process_mm_chat_images,
 )
 from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
-from scripts.rwkv7_exporter.export_hf_model import save_processor_core
-from scripts.rwkv7_exporter.processor import ModRWKVProcessor
-from scripts.rwkv7_exporter.tokenizer import RwkvTokenizer as HFRwkvTokenizer
+from scripts.rwkv7_exporter.export_hf_model import (
+    save_processor_core,
+    save_tokenizer_core,
+)
 
 
 CHAT_TEMPLATE = (
@@ -133,6 +136,26 @@ def _make_mm_chat_dataset(
     )
 
 
+def _load_exported_remote_code(tmpdir: str):
+    export_dir = Path(tmpdir) / "remote"
+    export_dir.mkdir()
+    exporter_dir = Path(__file__).parents[2] / "scripts" / "rwkv7_exporter"
+    shutil.copyfile(exporter_dir / "tokenizer.py", export_dir / "tokenizer.py")
+    shutil.copyfile(exporter_dir / "processor.py", export_dir / "processor.py")
+    save_tokenizer_core(str(export_dir))
+    save_processor_core(str(export_dir))
+    sys.path.insert(0, str(export_dir))
+    try:
+        for module_name in ("tokenizer", "tokenizer_core", "processor", "processor_core"):
+            sys.modules.pop(module_name, None)
+        from processor import ModRWKVProcessor
+        from tokenizer import RwkvTokenizer
+
+        return RwkvTokenizer, ModRWKVProcessor
+    finally:
+        sys.path.remove(str(export_dir))
+
+
 def _contains_tensor(value) -> bool:
     if isinstance(value, torch.Tensor):
         return True
@@ -157,13 +180,15 @@ class TinyImageProcessor(BaseImageProcessor):
 
 
 class TestRwkvVLTokenizer(unittest.TestCase):
-    def test_exporter_has_no_static_processor_core_copy(self):
+    def test_exporter_has_no_static_core_copies(self):
         repo_root = Path(__file__).parents[2]
-        exporter_core = repo_root / "scripts" / "rwkv7_exporter" / "processor_core.py"
-        self.assertFalse(exporter_core.exists())
+        exporter_dir = repo_root / "scripts" / "rwkv7_exporter"
+        self.assertFalse((exporter_dir / "processor_core.py").exists())
+        self.assertFalse((exporter_dir / "tokenizer_core.py").exists())
 
     def test_torchtitan_and_hf_exporter_tokenizers_align(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            HFRwkvTokenizer, _ = _load_exported_remote_code(tmpdir)
             vocab_file = os.path.join(tmpdir, "wr_vocab_v20230424.txt")
             _write_tiny_rwkv_vocab(vocab_file)
             with open(os.path.join(tmpdir, "chat_template.jinja"), "w") as f:
@@ -240,6 +265,7 @@ class TestRwkvVLTokenizer(unittest.TestCase):
 
     def test_hf_exporter_processor_uses_shared_pixel_budget(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            HFRwkvTokenizer, ModRWKVProcessor = _load_exported_remote_code(tmpdir)
             vocab_file = os.path.join(tmpdir, "wr_vocab_v20230424.txt")
             _write_tiny_rwkv_vocab(vocab_file)
             hf_tok = HFRwkvTokenizer(
@@ -286,8 +312,9 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 2,
             )
 
-    def test_hf_exporter_fetches_processor_core_during_export(self):
+    def test_hf_exporter_processor_requires_local_core_copy(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            HFRwkvTokenizer, ModRWKVProcessor = _load_exported_remote_code(tmpdir)
             vocab_file = os.path.join(tmpdir, "wr_vocab_v20230424.txt")
             _write_tiny_rwkv_vocab(vocab_file)
             hf_tok = HFRwkvTokenizer(
@@ -303,14 +330,33 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 image_processor=TinyImageProcessor(),
             )
             output_dir = os.path.join(tmpdir, "exported")
+            save_processor_core(output_dir)
             processor.save_pretrained(output_dir)
             self.assertTrue(os.path.isfile(os.path.join(output_dir, "processor.py")))
-            self.assertFalse(
-                os.path.isfile(os.path.join(output_dir, "processor_core.py"))
-            )
-            save_processor_core(output_dir)
             self.assertTrue(
                 os.path.isfile(os.path.join(output_dir, "processor_core.py"))
+            )
+
+    def test_hf_exporter_tokenizer_requires_local_core_copy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            HFRwkvTokenizer, _ = _load_exported_remote_code(tmpdir)
+            vocab_file = os.path.join(tmpdir, "wr_vocab_v20230424.txt")
+            _write_tiny_rwkv_vocab(vocab_file)
+            hf_tok = HFRwkvTokenizer(
+                vocab_file=vocab_file,
+                bos_token="\x16",
+                eos_token="\x17",
+                pad_token="\x17",
+                unk_token="\x16",
+                chat_template=CHAT_TEMPLATE,
+            )
+            hf_tok.register_for_auto_class("AutoTokenizer")
+            output_dir = os.path.join(tmpdir, "exported")
+            save_tokenizer_core(output_dir)
+            hf_tok.save_pretrained(output_dir)
+            self.assertTrue(os.path.isfile(os.path.join(output_dir, "tokenizer.py")))
+            self.assertTrue(
+                os.path.isfile(os.path.join(output_dir, "tokenizer_core.py"))
             )
 
     def test_max_pixels_reduces_actual_patch_and_token_counts_for_odd_sizes(self):
