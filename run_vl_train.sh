@@ -123,6 +123,7 @@ llm_lr="1e-5"
 lm_head_lr=""
 projector_seed="1234"
 activation_checkpoint_mode="none"
+# Currently only "full" and "none" are supported. "selective" will fail due to `token_shift_cp`
 log_freq="1"
 wandb="0"
 swanlab="1"
@@ -141,7 +142,7 @@ checkpoint_interval="2000"
 checkpoint_keep_latest_k="0"
 image_processor=""
 min_pixels="65536"
-max_pixels="2097152"
+max_pixels="3145728"
 # 0 means no image-count cap. max_pixels is a shared per-sample pixel budget
 # across all images in one chat example; set a positive image cap only as an
 # emergency batch-memory guard.
