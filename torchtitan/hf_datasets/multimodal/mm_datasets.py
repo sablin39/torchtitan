@@ -445,14 +445,17 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
             self._data.load_state_dict(state_dict["hf_dataset_state"])
             self._hf_state_restored = True
 
-        if self.enable_packing and "packer_state" in state_dict:
-            packer_state = state_dict["packer_state"]
-            self.packer._sample_buffer = {
-                i: s for i, s in enumerate(packer_state["sample_buffer"])
-            }
-            self.packer._next_id = len(packer_state["sample_buffer"])
+        if self.enable_packing:
+            self.packer._sample_buffer.clear()
+            self.packer._next_id = 0
             self.packer.packed_samples.clear()
-            self.packer.packed_samples.extend(packer_state["packed_samples"])
+            if "packer_state" in state_dict:
+                packer_state = state_dict["packer_state"]
+                self.packer._sample_buffer = {
+                    i: s for i, s in enumerate(packer_state["sample_buffer"])
+                }
+                self.packer._next_id = len(packer_state["sample_buffer"])
+                self.packer.packed_samples.extend(packer_state["packed_samples"])
 
     def state_dict(self):
         state = {"sample_idx": self._sample_idx}
@@ -461,13 +464,8 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
         if hasattr(self._data, "state_dict"):
             state["hf_dataset_state"] = self._data.state_dict()
 
-        if self.enable_packing:
-            # pyrefly: ignore [bad-typed-dict-key]
-            state["packer_state"] = {
-                "sample_buffer": list(self.packer._sample_buffer.values()),
-                "packed_samples": list(self.packer.packed_samples),
-            }
-
+        # Packer buffers hold processed image tensors. They are data-dependent,
+        # can be multi-GiB with VLM inputs, and are cheap to refill after resume.
         return state
 
 

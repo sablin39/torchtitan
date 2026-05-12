@@ -133,6 +133,16 @@ def _make_mm_chat_dataset(
     )
 
 
+def _contains_tensor(value) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_tensor(item) for item in value)
+    return False
+
+
 class TinyImageProcessor(BaseImageProcessor):
     model_input_names = ["pixel_values", "image_grid_thw"]
 
@@ -583,6 +593,31 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertGreater(first["input_ids"].numel(), 0)
             self.assertGreater(second["input_ids"].numel(), 0)
             self.assertLessEqual(len(dataset.packer._sample_buffer), 1)
+
+    def test_mm_chat_dataset_checkpoint_drops_packer_tensors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            dataset = _make_mm_chat_dataset(
+                tok,
+                [_two_image_sample()],
+                packing_buffer_size=64,
+                batch_size=2,
+            )
+
+            processed = dataset._tokenize_sample(_two_image_sample())
+            self.assertIsNotNone(processed)
+            self.assertIsInstance(processed["pixel_values"], torch.Tensor)
+            dataset.packer.add_sample(processed)
+            self.assertEqual(len(dataset.packer._sample_buffer), 1)
+
+            state = dataset.state_dict()
+            self.assertNotIn("packer_state", state)
+            self.assertFalse(_contains_tensor(state))
+
+            dataset.load_state_dict(state)
+            self.assertEqual(dataset.packer._sample_buffer, {})
+            self.assertEqual(dataset.packer._next_id, 0)
+            self.assertEqual(len(dataset.packer.packed_samples), 0)
 
     def test_mm_chat_collator_does_not_shift_again(self):
         with tempfile.TemporaryDirectory() as tmpdir:

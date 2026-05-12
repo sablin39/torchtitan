@@ -26,6 +26,14 @@ _TOKENIZER_CONFIG = MultiModalTokenizer.Config(
 _TOKENIZER = _TOKENIZER_CONFIG.build(tokenizer_path=_TOKENIZER_PATH)
 
 
+def _contains_key(value, key: str) -> bool:
+    if isinstance(value, dict):
+        return key in value or any(_contains_key(item, key) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_key(item, key) for item in value)
+    return False
+
+
 class TestMMDatasetCheckpointing(unittest.TestCase):
     """Test save/load for multimodal dataset, mirroring test_dataset_checkpointing.py."""
 
@@ -94,6 +102,58 @@ class TestMMDatasetCheckpointing(unittest.TestCase):
                                 f"{key} shape mismatch: {exp_v.shape} vs {res_v.shape} "
                                 f"(world_size={world_size}, rank={rank})"
                             )
+
+    def test_checkpoint_state_drops_processed_packer_samples(self):
+        dl_config = MMDataLoader.Config(
+            dataset="cc12m-test",
+            packing_buffer_size=64,
+            max_images_per_batch=128,
+            patch_size=16,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            min_pixels=784,
+            max_pixels=200000,
+            image_mean=(0.5, 0.5, 0.5),
+            image_std=(0.5, 0.5, 0.5),
+        )
+        dataloader = dl_config.build(
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=_TOKENIZER,
+            seq_len=4096,
+            local_batch_size=1,
+        )
+        dataset = dataloader.dataset
+        sample = next(iter(dataset._data))
+        processed = dataset.sample_processor(
+            sample=sample,
+            tokenizer=dataset._tokenizer,
+            patch_size=dataset.patch_size,
+            temporal_patch_size=dataset.temporal_patch_size,
+            spatial_merge_size=dataset.spatial_merge_size,
+            min_pixels=dataset.min_pixels,
+            max_pixels=dataset.max_pixels,
+            image_mean=dataset.image_mean,
+            image_std=dataset.image_std,
+            video_dir=dataset.video_dir,
+            video_fps=dataset.video_fps,
+            video_min_frames=dataset.video_min_frames,
+            video_max_frames=dataset.video_max_frames,
+            seq_len=dataset.seq_len,
+        )
+        self.assertIsNotNone(processed)
+        self.assertIn("pixel_values", processed)
+
+        dataset.packer.add_sample(processed)
+        self.assertEqual(len(dataset.packer._sample_buffer), 1)
+        state = dataset.state_dict()
+        self.assertNotIn("packer_state", state)
+        self.assertFalse(_contains_key(state, "pixel_values"))
+
+        dataset.load_state_dict(state)
+        self.assertEqual(dataset.packer._sample_buffer, {})
+        self.assertEqual(dataset.packer._next_id, 0)
+        self.assertEqual(len(dataset.packer.packed_samples), 0)
 
 
 if __name__ == "__main__":
