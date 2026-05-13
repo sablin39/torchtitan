@@ -141,13 +141,20 @@ def _require_fla_ops() -> _FLAOps:
 
 
 @torch.compiler.disable
-def _token_shift_cp_eager(x: torch.Tensor, cp_context: Any) -> torch.Tensor:
+def _token_shift_eager(
+    x: torch.Tensor,
+    *,
+    cp_context: Any | None,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
     ops = _require_fla_ops()
-    return ops.token_shift_cp(
-        x,
-        cp_context=cp_context,
-        cu_seqlens=cp_context.cu_seqlens,
-    )
+    if cp_context is not None:
+        return ops.token_shift_cp(
+            x,
+            cp_context=cp_context,
+            cu_seqlens=cp_context.cu_seqlens,
+        )
+    return ops.token_shift(x, cu_seqlens)
 
 
 class RWKVLoRA(Module):
@@ -368,18 +375,6 @@ class RWKV7TimeMix(Module):
             _orthogonal_(self.v_proj.weight)
             self.o_proj.weight.zero_()
 
-    def _token_shift(
-        self,
-        x: torch.Tensor,
-        *,
-        cp_context: Any | None,
-        cu_seqlens: torch.Tensor | None,
-    ) -> torch.Tensor:
-        ops = _require_fla_ops()
-        if cp_context is not None:
-            return _token_shift_cp_eager(x, cp_context)
-        return ops.token_shift(x, cu_seqlens)
-
     def forward(
         self,
         x: torch.Tensor,
@@ -391,7 +386,11 @@ class RWKV7TimeMix(Module):
         ops = _require_fla_ops()
         batch_size, seq_len, _ = x.shape
 
-        delta = self._token_shift(x, cp_context=cp_context, cu_seqlens=cu_seqlens)
+        delta = _token_shift_eager(
+            x,
+            cp_context=cp_context,
+            cu_seqlens=cu_seqlens,
+        )
         xr, xw, xk, xv, xa, xg = ops.fused_addcmul_rwkv7(
             x, delta, self.x_r, self.x_w, self.x_k, self.x_v, self.x_a, self.x_g
         )
@@ -484,11 +483,11 @@ class RWKV7ChannelMix(Module):
         cp_context: Any | None = None,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        ops = _require_fla_ops()
-        if cp_context is not None:
-            delta = _token_shift_cp_eager(x, cp_context)
-        else:
-            delta = ops.token_shift(x, cu_seqlens)
+        delta = _token_shift_eager(
+            x,
+            cp_context=cp_context,
+            cu_seqlens=cu_seqlens,
+        )
         return self.value(_sqrelu(self.key(x.addcmul(delta, self.x_k))))
 
 
