@@ -743,17 +743,39 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 loss = torch.sum(torch.stack(losses)).to(self.device)
             else:
                 loss = torch.tensor([-1.0], device=self.device)
+            self._raise_if_nonfinite_scalar("loss", loss)
         else:
             # Non-PP forward / backward
             assert len(model_parts) == 1
             with self.train_context():
                 pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
                 loss = self.loss_fn(pred, labels, global_valid_tokens)
+                self._raise_if_nonfinite_scalar("loss", loss)
                 del pred
                 loss.backward()
 
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
+
+    def _raise_if_nonfinite_scalar(self, name: str, value: torch.Tensor) -> None:
+        local_value = value.detach()
+        if hasattr(local_value, "to_local"):
+            local_value = local_value.to_local()
+        if bool(torch.isfinite(local_value).all().item()):
+            return
+
+        kind = "NaN" if bool(torch.isnan(local_value).any().item()) else "Inf"
+        value_str = (
+            str(local_value.item())
+            if local_value.numel() == 1
+            else f"shape={tuple(local_value.shape)}"
+        )
+        message = (
+            f"{name} became {kind} at step {self.step} "
+            f"(value={value_str}); stopping training."
+        )
+        logger.error(message)
+        raise RuntimeError(message)
 
     def _record_data_stats(self, stats: dict[str, Any]) -> None:
         for key, value in stats.items():
@@ -856,6 +878,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
         )
+        self._raise_if_nonfinite_scalar("grad_norm", grad_norm)
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
         self.lr_schedulers.step()
