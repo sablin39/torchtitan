@@ -140,6 +140,66 @@ def _require_fla_ops() -> _FLAOps:
     return _fla_ops
 
 
+class _VarlenTokenShift(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.dim() != 3:
+            raise ValueError("RWKV7 token shift expects input shape [B, T, D]")
+        if x.shape[0] != 1:
+            raise ValueError(
+                "RWKV7 varlen token shift expects batch size 1 after flattening"
+            )
+
+        starts = cu_seqlens[:-1].to(device=x.device, dtype=torch.long)
+        ctx.save_for_backward(starts)
+
+        y = torch.empty_like(x)
+        if x.shape[1] == 0:
+            return y
+
+        y[:, 0, :].copy_(x[:, 0, :]).neg_()
+        if x.shape[1] > 1:
+            y[:, 1:, :].copy_(x[:, :-1, :])
+            y[:, 1:, :].sub_(x[:, 1:, :])
+
+        boundary_starts = starts[starts > 0]
+        if boundary_starts.numel() > 0:
+            y.index_copy_(
+                1,
+                boundary_starts,
+                x.index_select(1, boundary_starts).neg(),
+            )
+        return y
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        dy: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
+        (starts,) = ctx.saved_tensors
+
+        dx = dy.neg()
+        if dy.shape[1] > 1:
+            dx[:, :-1, :].add_(dy[:, 1:, :])
+
+        boundary_starts = starts[starts > 0]
+        if boundary_starts.numel() > 0:
+            prev = boundary_starts - 1
+            dx.index_add_(1, prev, dy.index_select(1, boundary_starts).neg())
+        return dx, None
+
+
+def _token_shift_varlen_eager(
+    x: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    return _VarlenTokenShift.apply(x, cu_seqlens)
+
+
 @torch.compiler.disable
 def _token_shift_eager(
     x: torch.Tensor,
@@ -147,13 +207,19 @@ def _token_shift_eager(
     cp_context: Any | None,
     cu_seqlens: torch.Tensor | None,
 ) -> torch.Tensor:
-    ops = _require_fla_ops()
     if cp_context is not None:
+        ops = _require_fla_ops()
         return ops.token_shift_cp(
             x,
             cp_context=cp_context,
             cu_seqlens=cp_context.cu_seqlens,
         )
+    if cu_seqlens is not None:
+        # FLA's varlen token_shift long kernel autotunes a 3D launch from the
+        # number of chunks and sequence spans. Packed batches with many short
+        # spans can trip invalid launches during activation checkpointing.
+        return _token_shift_varlen_eager(x, cu_seqlens)
+    ops = _require_fla_ops()
     return ops.token_shift(x, cu_seqlens)
 
 
@@ -220,6 +286,15 @@ class RWKVLoRA(Module):
         return self.lora(x)
 
 
+class _ZeroGateLogits(Module):
+    def __init__(self, output_dim: int):
+        super().__init__()
+        self.output_dim = output_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.new_full((*x.shape[:-1], self.output_dim), -math.inf)
+
+
 class RWKV7TimeMix(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -276,7 +351,9 @@ class RWKV7TimeMix(Module):
             low_rank_dim=config.decay_low_rank_dim,
             activation="tanh",
         ).build()
-        if self.layer_idx != 0:
+        if self.layer_idx == 0:
+            self.v_lora = _ZeroGateLogits(self.value_dim)
+        else:
             self.v_lora = RWKVLoRA.Config(
                 input_dim=self.hidden_size,
                 output_dim=self.value_dim,
@@ -379,7 +456,7 @@ class RWKV7TimeMix(Module):
         self,
         x: torch.Tensor,
         *,
-        v_first: torch.Tensor | None,
+        v_first: torch.Tensor,
         cp_context: Any | None = None,
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -399,13 +476,8 @@ class RWKV7TimeMix(Module):
         w = -0.6065306597126334 * self.w_lora(xw).sigmoid()
         k = self.k_proj(xk)
         v = self.v_proj(xv)
-
-        if self.layer_idx == 0:
-            v_first = v
-        else:
-            if v_first is None:
-                raise RuntimeError("RWKV7 v_first was not produced by layer 0")
-            v = torch.lerp(v, v_first, self.v_lora(xv).sigmoid())
+        layer_v = v
+        v = torch.lerp(v, v_first, self.v_lora(xv).sigmoid())
 
         a = self.a_lora(xa).sigmoid()
         g = self.g_lora(xg)
@@ -438,7 +510,7 @@ class RWKV7TimeMix(Module):
         o = self.g_norm(_merge_heads(o).view(batch_size * seq_len, self.value_dim))
         o = o.view(batch_size, seq_len, self.value_dim)
         o = ops.gate_output_correction(o, r_heads, k_heads, self.r_k, v_heads, g)
-        return self.o_proj(o), v_first
+        return self.o_proj(o), layer_v
 
 
 class RWKV7ChannelMix(Module):
@@ -514,13 +586,6 @@ class RWKV7Block(Module):
         super().__init__()
         self.config = config
         self.layer_idx = config.layer_idx
-        if config.layer_idx == 0:
-            self.pre_norm = LayerNorm(
-                config.hidden_size,
-                eps=config.norm_eps,
-                elementwise_affine=True,
-                bias=config.norm_bias,
-            )
         self.attn_norm = LayerNorm(
             config.hidden_size,
             eps=config.norm_eps,
@@ -559,12 +624,10 @@ class RWKV7Block(Module):
         self,
         x: torch.Tensor,
         *,
-        v_first: torch.Tensor | None,
+        v_first: torch.Tensor,
         cp_context: Any | None = None,
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.layer_idx == 0:
-            x = self.pre_norm(x)
         attn_out, v_first = self.attn(
             self.attn_norm(x),
             v_first=v_first,
@@ -613,6 +676,12 @@ class RWKV7Backbone(Module):
             )
         ).build()
         self.layers = ModuleDict()
+        self.pre_norm = LayerNorm(
+            config.hidden_size,
+            eps=config.norm_eps,
+            elementwise_affine=True,
+            bias=config.norm_bias,
+        )
         value_dims = config.value_dim or [config.hidden_size] * config.num_hidden_layers
         for layer_idx in range(config.num_hidden_layers):
             self.layers[str(layer_idx)] = RWKV7Block.Config(
@@ -638,6 +707,31 @@ class RWKV7Backbone(Module):
             elementwise_affine=True,
             bias=config.norm_bias,
         )
+        self.register_load_state_dict_pre_hook(
+            self._remap_legacy_layer0_pre_norm_state_dict
+        )
+
+    def _remap_legacy_layer0_pre_norm_state_dict(
+        self,
+        module: Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        for name in ("weight", "bias"):
+            new_key = f"{prefix}pre_norm.{name}"
+            old_key = f"{prefix}layers.0.pre_norm.{name}"
+            if old_key not in state_dict:
+                continue
+            target = getattr(self.pre_norm, name, None)
+            if target is not None and new_key not in state_dict:
+                state_dict[new_key] = state_dict[old_key]
+            del state_dict[old_key]
 
     def forward_embeddings(
         self,
@@ -646,14 +740,27 @@ class RWKV7Backbone(Module):
         cp_context: Any | None = None,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        v_first = None
-        for layer in self.layers.values():
-            hidden_states, v_first = layer(
+        hidden_states = self.pre_norm(hidden_states)
+        v_first = hidden_states.new_zeros(
+            *hidden_states.shape[:-1],
+            self.layers["0"].attn.value_dim,
+        )
+        v_first.requires_grad_(
+            torch.is_grad_enabled()
+            and (
+                hidden_states.requires_grad
+                or self.layers["0"].attn.v_proj.weight.requires_grad
+            )
+        )
+        for layer_idx, layer in self.layers.items():
+            hidden_states, layer_v = layer(
                 hidden_states,
                 v_first=v_first,
                 cp_context=cp_context,
                 cu_seqlens=cu_seqlens,
             )
+            if layer_idx == "0":
+                v_first = layer_v
         return self.norm(hidden_states)
 
     def forward(

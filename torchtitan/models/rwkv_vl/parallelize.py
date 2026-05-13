@@ -184,6 +184,13 @@ def apply_fsdp(
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
+    _fully_shard_if_trainable(
+        model.llm.pre_norm,
+        module_name="llm.pre_norm",
+        skipped_frozen_modules=skipped_frozen_modules,
+        **fsdp_config,
+        reshard_after_forward=reshard_after_forward,
+    )
     for layer_idx, block in model.llm.layers.items():
         _fully_shard_if_trainable(
             block,

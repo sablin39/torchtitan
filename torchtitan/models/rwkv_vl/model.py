@@ -562,15 +562,28 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         cp_context: Any | None,
         cu_seqlens: torch.Tensor | None,
     ) -> torch.Tensor:
-        v_first = None
+        hidden_states = self.llm.pre_norm(hidden_states)
+        v_first = hidden_states.new_zeros(
+            *hidden_states.shape[:-1],
+            self.llm.layers["0"].attn.value_dim,
+        )
+        v_first.requires_grad_(
+            torch.is_grad_enabled()
+            and (
+                hidden_states.requires_grad
+                or self.llm.layers["0"].attn.v_proj.weight.requires_grad
+            )
+        )
         for layer_idx, layer in self.llm.layers.items():
-            hidden_states, v_first = layer(
+            hidden_states, layer_v = layer(
                 hidden_states,
                 v_first=v_first,
                 cp_context=cp_context,
                 cu_seqlens=cu_seqlens,
             )
             idx = int(layer_idx)
+            if idx == 0:
+                v_first = layer_v
             if idx < len(deepstack_features) and num_tokens_per_item is not None:
                 hidden_states = self._add_vision_embeds(
                     hidden_states,
