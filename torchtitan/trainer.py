@@ -781,11 +781,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         metrics = {
             "data/avg_num_images": avg("num_images"),
             "data/avg_vit_patches": avg("num_vit_patches"),
+            "data/avg_vit_patches_bucketed": avg("num_vit_patches_bucketed"),
+            "data/avg_vit_patch_padding": avg("vit_patch_padding"),
+            "data/avg_vit_patch_padding_ratio": avg("vit_patch_padding_ratio"),
             "data/avg_pixel_values_gib": avg("pixel_values_bytes") / (1024**3),
             "data/avg_packed_docs": avg("packed_docs"),
             "data/avg_packed_rows": avg("packed_rows"),
             "data/total_num_images": sums.get("num_images", 0.0),
             "data/total_vit_patches": sums.get("num_vit_patches", 0.0),
+            "data/total_vit_patches_bucketed": sums.get(
+                "num_vit_patches_bucketed", 0.0
+            ),
             "data/total_pixel_values_gib": pixel_bytes / (1024**3),
         }
         if sequence_tokens > 0:
