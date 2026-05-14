@@ -150,6 +150,7 @@ torch_logs="recompiles"
 # only, so they should not affect steady-state training speed.
 python_faulthandler="1"
 torch_show_cpp_stacktraces="1"
+torch_disable_addr2line="1"
 torch_cpp_log_level=""
 torch_distributed_debug=""
 flex_attention_log_file="auto"
@@ -360,6 +361,7 @@ echo "  TORCH_LOGS:    ${torch_logs:-<unset>}"
 echo "Diagnostics:"
 echo "  Python faults: ${python_faulthandler}"
 echo "  C++ stacks:    ${torch_show_cpp_stacktraces}"
+echo "  addr2line:     $([[ "${torch_disable_addr2line}" == "1" ]] && echo disabled || echo enabled)"
 echo "  FlexAttn log:  ${flex_attention_log_file:-<unset>}"
 echo "  NCCL debug:    ${nccl_debug:-<unset>}"
 echo "  NCCL flight:   ${torch_nccl_flight_recorder}"
@@ -491,7 +493,7 @@ train_env=(
     "TORCH_NCCL_LOG_CPP_STACK_ON_UNCLEAN_SHUTDOWN=${torch_nccl_log_cpp_stack_on_unclean_shutdown}"
     "TORCH_NCCL_ENABLE_TIMING=${torch_nccl_enable_timing}"
     "TORCH_NCCL_NAN_CHECK=${torch_nccl_nan_check}"
-    "TORCH_NCCL_TRACE_CPP_STACK=${torch_nccl_trace_cpp_stack}"
+    "TORCH_FR_CPP_STACK=${torch_nccl_trace_cpp_stack}"
     "TORCH_NCCL_DESYNC_DEBUG=${torch_nccl_desync_debug}"
 )
 if [[ "${python_faulthandler}" == "1" ]]; then
@@ -499,6 +501,9 @@ if [[ "${python_faulthandler}" == "1" ]]; then
 fi
 if [[ "${torch_show_cpp_stacktraces}" == "1" ]]; then
     train_env+=("TORCH_SHOW_CPP_STACKTRACES=1")
+fi
+if [[ "${torch_disable_addr2line}" == "1" ]]; then
+    train_env+=("TORCH_DISABLE_ADDR2LINE=1")
 fi
 if [[ -n "${torchinductor_cache_dir}" ]]; then
     train_env+=("TORCHINDUCTOR_CACHE_DIR=${torchinductor_cache_dir}")
@@ -527,12 +532,12 @@ fi
 if [[ "${torch_nccl_flight_recorder}" == "1" ]]; then
     train_env+=(
         "TORCH_NCCL_DUMP_ON_TIMEOUT=1"
-        "TORCH_NCCL_TRACE_BUFFER_SIZE=${torch_nccl_trace_buffer_size}"
+        "TORCH_FR_BUFFER_SIZE=${torch_nccl_trace_buffer_size}"
     )
 else
     train_env+=(
         "TORCH_NCCL_DUMP_ON_TIMEOUT=0"
-        "TORCH_NCCL_TRACE_BUFFER_SIZE=0"
+        "TORCH_FR_BUFFER_SIZE=0"
     )
 fi
 env "${train_env[@]}" "${torchrun_cmd}" \
