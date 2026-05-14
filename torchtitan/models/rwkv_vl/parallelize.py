@@ -72,6 +72,10 @@ def parallelize_rwkv_vl(
             )
         model.set_cp_process_group(parallel_dims.get_mesh("cp").get_group())
 
+    vision_patch_sync_mesh = parallel_dims.get_optional_mesh("loss")
+    if vision_patch_sync_mesh is not None:
+        model.set_vision_patch_sync_process_group(vision_patch_sync_mesh.get_group())
+
     model_compile_enabled = (
         compile_config.enable and "model" in compile_config.components
     )

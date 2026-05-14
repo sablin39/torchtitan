@@ -823,6 +823,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.data_metric_count = 0
         return metrics
 
+    def _sync_dataloader_exhaustion(self, exhausted: bool) -> bool:
+        """Return whether any rank ran out of data before starting train collectives."""
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() == 1
+        ):
+            return exhausted
+
+        exhausted_tensor = torch.tensor(
+            int(exhausted), dtype=torch.int32, device=self.device
+        )
+        torch.distributed.all_reduce(
+            exhausted_tensor, op=torch.distributed.ReduceOp.MAX
+        )
+        return bool(exhausted_tensor.item())
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -837,13 +854,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Collect all microbatches on CPU and count total valid tokens
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        dataloader_exhausted = False
         for _microbatch in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
+            try:
+                input_dict, labels = next(data_iterator)
+            except DataloaderExhaustedError:
+                dataloader_exhausted = True
+                break
             data_stats = input_dict.pop("data_stats", None)
             if isinstance(data_stats, dict):
                 self._record_data_stats(data_stats)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
             microbatches.append((input_dict, labels))
+
+        # Dataloader exhaustion can happen on different ranks at different
+        # times, especially with finite multimodal datasets that filter and
+        # pack samples. Synchronize the decision before any rank enters train
+        # collectives; otherwise one rank can enter final checkpoint collectives
+        # while another rank is still in a training all-reduce.
+        if self._sync_dataloader_exhaustion(dataloader_exhausted):
+            raise DataloaderExhaustedError()
 
         # All-reduce to get global token count across DP ranks
         # Move to GPU for distributed communication
@@ -980,7 +1010,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     canceled_step = self.step
                     self.step -= 1
                     logger.warning(
-                        f"Ran out of data; step {canceled_step} was canceled."
+                        f"At least one rank ran out of data; "
+                        f"step {canceled_step} was canceled."
                     )
                     if self.step > 0:
                         self.checkpointer.save(self.step, last_step=True)
