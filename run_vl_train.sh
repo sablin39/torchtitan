@@ -7,7 +7,8 @@
 
 set -euo pipefail
 
-# exec > >(tee -a output.log) 2>&1
+# Terminal tee is enabled after output directories are computed so the full
+# stdout/stderr stream lands in the run artifacts.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 timestamp="$(date +%Y%m%d_%H%M%S)"
@@ -143,12 +144,17 @@ vit_patch_bucket_size="32768"
 # Keep Inductor caches separate across bucket-size sweeps when benchmarking
 # cold compile/autotune behavior. Leave empty to let PyTorch choose the cache.
 torchinductor_cache_dir="/tmp/tt_vit_bucket_${vit_patch_bucket_size}_cp${context_parallel_degree}_bs${batch_size}"
-# Set to "recompiles" for bucket/recompile diagnostics. Leave empty for quiet
-# long runs after the shape set is understood.
-torch_logs="recompiles"
+# Compiler diagnostics for remote crash/debug runs. `+inductor` is DEBUG-level
+# and catches TMA/codegen decisions; avoid output_code/kernel_code by default
+# because they can flood the terminal log with generated Triton source.
+torch_logs="+inductor,recompiles,graph_breaks"
+# Set to "auto" to capture the full shell/torchrun terminal stream in the train
+# artifact directory. Set empty to disable shell-level tee logging.
+terminal_log_file="auto"
 # Low-overhead remote diagnostics. These are either fail-time only or compile-time
 # only, so they should not affect steady-state training speed.
 python_faulthandler="1"
+triton_debug="1"
 torch_show_cpp_stacktraces="1"
 torch_disable_addr2line="1"
 torch_cpp_log_level=""
@@ -261,6 +267,7 @@ require_bool() {
 for bool_name in \
     fake_thinking \
     python_faulthandler \
+    triton_debug \
     torch_show_cpp_stacktraces \
     torch_nccl_async_error_handling \
     torch_nccl_enable_monitoring \
@@ -338,6 +345,19 @@ for path in "${hf_dir}" "${dcp_dir}" "${train_dump_dir}" "${final_hf_dir}"; do
 done
 
 mkdir -p "${output_root}"
+if [[ "${terminal_log_file}" == "auto" ]]; then
+    terminal_log_file="${train_dump_dir}/terminal.log"
+fi
+if [[ -n "${terminal_log_file}" ]]; then
+    mkdir -p "$(dirname "${terminal_log_file}")"
+    if command -v stdbuf >/dev/null 2>&1; then
+        exec > >(stdbuf -oL -eL tee -a "${terminal_log_file}") 2>&1
+    else
+        exec > >(tee -a "${terminal_log_file}") 2>&1
+    fi
+    export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+    echo "Terminal log: ${terminal_log_file}"
+fi
 if [[ -n "${flex_attention_log_file}" ]]; then
     mkdir -p "$(dirname "${flex_attention_log_file}")"
 fi
@@ -359,7 +379,9 @@ echo "  ViT patches:   ${vit_patch_bucket_size} (0 disables)"
 echo "  Inductor dir:  ${torchinductor_cache_dir:-<torch default>}"
 echo "  TORCH_LOGS:    ${torch_logs:-<unset>}"
 echo "Diagnostics:"
+echo "  Terminal log:  ${terminal_log_file:-<unset>}"
 echo "  Python faults: ${python_faulthandler}"
+echo "  Triton debug:  ${triton_debug}"
 echo "  C++ stacks:    ${torch_show_cpp_stacktraces}"
 echo "  addr2line:     $([[ "${torch_disable_addr2line}" == "1" ]] && echo disabled || echo enabled)"
 echo "  FlexAttn log:  ${flex_attention_log_file:-<unset>}"
@@ -511,6 +533,9 @@ fi
 train_env+=("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0")
 train_env+=("TORCHINDUCTOR_NAN_ASSERTS=1")
 train_env+=("TORCHINDUCTOR_RUNTIME_TRITON_NAN_ASSERTS=1")
+if [[ "${triton_debug}" == "1" ]]; then
+    train_env+=("TRITON_DEBUG=1")
+fi
 if [[ -n "${torch_logs}" ]]; then
     train_env+=("TORCH_LOGS=${torch_logs}")
 fi
