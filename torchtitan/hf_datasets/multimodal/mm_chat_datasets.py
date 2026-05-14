@@ -8,6 +8,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 import torch
@@ -72,6 +73,10 @@ def _tensor_chunks(value: Any) -> list[torch.Tensor]:
 
 def _num_grid_items(value: Any) -> int:
     return sum(int(chunk.shape[0]) for chunk in _tensor_chunks(value))
+
+
+def _num_grid_patches(grid_thw: torch.Tensor | None) -> int:
+    return 0 if grid_thw is None else int(grid_thw.prod(-1).sum().item())
 
 
 def _flatten_images(images: Any) -> list[Any]:
@@ -483,6 +488,25 @@ class MMChatCollator:
     temporal_patch_size: int
     spatial_merge_size: int
     tokenizer: Any
+    vit_patch_bucket_size: int = 0
+
+    def __post_init__(self) -> None:
+        self.vit_patch_bucket_size = int(self.vit_patch_bucket_size)
+        if self.vit_patch_bucket_size < 0:
+            raise ValueError(
+                "vit_patch_bucket_size must be non-negative, "
+                f"got {self.vit_patch_bucket_size}"
+            )
+
+    @property
+    def vit_patch_bucket_unit(self) -> int:
+        if self.vit_patch_bucket_size == 0:
+            return 0
+        return math.lcm(
+            self.vit_patch_bucket_size,
+            128,
+            self.spatial_merge_size**2,
+        )
 
     def collate_images(
         self,
@@ -498,7 +522,31 @@ class MMChatCollator:
             for sample in batch
             for chunk in _tensor_chunks(sample.get("grid_thw"))
         ]
-        return torch.cat(all_patches, dim=0), torch.cat(grid_thw_list, dim=0)
+        patches = torch.cat(all_patches, dim=0)
+        grid_thw = torch.cat(grid_thw_list, dim=0)
+        real_num_patch = _num_grid_patches(grid_thw)
+        if patches.shape[0] != real_num_patch:
+            raise ValueError(
+                f"Collated pixel_values has {patches.shape[0]} patches, but "
+                f"grid_thw describes {real_num_patch} patches"
+            )
+
+        bucket_unit = self.vit_patch_bucket_unit
+        if bucket_unit > 0 and real_num_patch > 0:
+            bucket_num_patch = (
+                (real_num_patch + bucket_unit - 1) // bucket_unit
+            ) * bucket_unit
+            pad_len = bucket_num_patch - real_num_patch
+            if pad_len > 0:
+                patches = torch.cat(
+                    [
+                        patches,
+                        patches.new_zeros((pad_len, patches.shape[1])),
+                    ],
+                    dim=0,
+                )
+
+        return patches, grid_thw
 
     def collate_text(
         self,
@@ -578,12 +626,20 @@ class MMChatCollator:
             self.collate_images(batch) if total_images > 0 else (None, None)
         )
         input_ids, labels, positions, input_token_mask = self.collate_text(batch)
+        real_num_patch = _num_grid_patches(grids)
+        bucket_num_patch = 0 if patches is None else int(patches.shape[0])
+        patch_padding = bucket_num_patch - real_num_patch
         pixel_values_bytes = (
             0 if patches is None else patches.numel() * patches.element_size()
         )
         data_stats = {
             "num_images": total_images,
-            "num_vit_patches": 0 if patches is None else int(patches.shape[0]),
+            "num_vit_patches": real_num_patch,
+            "num_vit_patches_bucketed": bucket_num_patch,
+            "vit_patch_padding": patch_padding,
+            "vit_patch_padding_ratio": (
+                patch_padding / real_num_patch if real_num_patch > 0 else 0.0
+            ),
             "pixel_values_bytes": pixel_values_bytes,
             "nonpad_tokens": int(input_token_mask.sum().item()),
             "sequence_tokens": int(input_ids.numel()),
@@ -629,6 +685,7 @@ class MMChatDataLoader(ParallelAwareDataloader):
         image_std: tuple[float, ...]
         max_aspect_ratio: float = 50.0
         pixel_values_dtype: str | None = "float32"
+        vit_patch_bucket_size: int = 0
 
     def __init__(
         self,
@@ -685,6 +742,7 @@ class MMChatDataLoader(ParallelAwareDataloader):
             temporal_patch_size=config.temporal_patch_size,
             spatial_merge_size=config.spatial_merge_size,
             tokenizer=tokenizer,
+            vit_patch_bucket_size=config.vit_patch_bucket_size,
         )
         dataloader_kwargs = {
             "num_workers": config.num_workers,

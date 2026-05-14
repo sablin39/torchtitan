@@ -13,6 +13,7 @@ import torch
 from torchtitan.distributed.context_parallel import _build_flattened_cu_seqlens
 from torchtitan.config.manager import ConfigManager
 from torchtitan.models.rwkv7 import model_registry as rwkv7_model_registry
+from torchtitan.models.rwkv7.model import _token_shift_varlen_eager
 from torchtitan.models.rwkv7.state_dict_adapter import RWKV7StateDictAdapter
 from torchtitan.models.rwkv7.tokenizer import RwkvTokenizer
 import torchtitan.models.rwkv_vl.config_registry as rwkv_vl_config_registry
@@ -48,6 +49,76 @@ class TestRWKV7Backend(unittest.TestCase):
             model = spec.model.build()
         model.verify_module_protocol()
         self.assertEqual(model.vocab_size, 2048)
+
+    def test_rwkv7_first_layer_state_lives_on_backbone(self):
+        spec = rwkv7_model_registry("debugmodel")
+        with torch.device("meta"):
+            model = spec.model.build()
+
+        keys = set(model.state_dict())
+        self.assertIn("llm.pre_norm.weight", keys)
+        self.assertIn("llm.pre_norm.bias", keys)
+        self.assertNotIn("llm.layers.0.pre_norm.weight", keys)
+        self.assertNotIn("llm.layers.1.pre_norm.weight", keys)
+        self.assertFalse(
+            any(key.startswith("llm.layers.0.attn.v_lora.") for key in keys)
+        )
+        self.assertIn("llm.layers.1.attn.v_lora.lora.0.weight", keys)
+
+        hidden_states = torch.empty(2, 3, 256, device="meta")
+        v_first = hidden_states.new_zeros(
+            *hidden_states.shape[:-1],
+            model.llm.layers["0"].attn.value_dim,
+        )
+        self.assertEqual(tuple(v_first.shape), (2, 3, 256))
+
+    def test_rwkv7_backbone_loads_legacy_layer0_pre_norm_key(self):
+        spec = rwkv7_model_registry("debugmodel")
+        model = spec.model.build()
+        old_weight = torch.full_like(model.llm.pre_norm.weight, 2.0)
+        old_bias = torch.full_like(model.llm.pre_norm.bias, 3.0)
+
+        missing, unexpected = model.load_state_dict(
+            {
+                "llm.layers.0.pre_norm.weight": old_weight,
+                "llm.layers.0.pre_norm.bias": old_bias,
+            },
+            strict=False,
+        )
+
+        self.assertNotIn("llm.pre_norm.weight", missing)
+        self.assertNotIn("llm.pre_norm.bias", missing)
+        self.assertNotIn("llm.layers.0.pre_norm.weight", unexpected)
+        self.assertTrue(torch.equal(model.llm.pre_norm.weight, old_weight))
+        self.assertTrue(torch.equal(model.llm.pre_norm.bias, old_bias))
+
+    def test_rwkv7_varlen_token_shift_matches_reference_and_grad(self):
+        def ref_token_shift(
+            x: torch.Tensor,
+            cu_seqlens: torch.Tensor,
+        ) -> torch.Tensor:
+            shifted = torch.empty_like(x)
+            shifted[:, 0, :].zero_()
+            shifted[:, 1:, :].copy_(x[:, :-1, :])
+            shifted.index_fill_(1, cu_seqlens[:-1], 0)
+            return shifted - x
+
+        for cu_seqlens in (
+            torch.tensor([0, 2, 5, 8]),
+            torch.arange(0, 9),
+        ):
+            with self.subTest(cu_seqlens=cu_seqlens.tolist()):
+                x = torch.randn(1, 8, 3, dtype=torch.float32, requires_grad=True)
+                ref_x = x.detach().clone().requires_grad_()
+                grad = torch.randn_like(x)
+
+                y = _token_shift_varlen_eager(x, cu_seqlens)
+                ref_y = ref_token_shift(ref_x, cu_seqlens)
+                self.assertTrue(torch.allclose(y, ref_y))
+
+                y.backward(grad)
+                ref_y.backward(grad)
+                self.assertTrue(torch.allclose(x.grad, ref_x.grad))
 
     def test_rwkv_vl_config_builds_and_satisfies_module_protocol(self):
         spec = rwkv_vl_model_registry("debugmodel")
@@ -249,6 +320,7 @@ class TestRWKV7Backend(unittest.TestCase):
             id(model.vision_encoder): "vision_encoder",
             id(model.proj): "proj",
             id(model.llm.embeddings): "llm.embeddings",
+            id(model.llm.pre_norm): "llm.pre_norm",
             id(model.llm.norm): "llm.norm",
             id(model.lm_head): "lm_head",
             id(model.llm): "llm",
@@ -281,6 +353,7 @@ class TestRWKV7Backend(unittest.TestCase):
         self.assertNotIn("vision_encoder", sharded_modules)
         self.assertIn("proj", sharded_modules)
         self.assertIn("llm.embeddings", sharded_modules)
+        self.assertIn("llm.pre_norm", sharded_modules)
         self.assertIn("lm_head", sharded_modules)
         self.assertIn("llm", sharded_modules)
         self.assertIn("model", sharded_modules)
@@ -298,12 +371,15 @@ class TestRWKV7Backend(unittest.TestCase):
         out = adapter.from_hf(
             {
                 "model.llm.embeddings.weight": tensor,
+                "model.llm.layers.0.pre_norm.weight": tensor,
                 "model.llm.layers.0.attn.x_r": tensor,
                 "lm_head.weight": tensor,
                 "model.encoder.patch_embed.proj.weight": tensor,
             }
         )
         self.assertIn("llm.embeddings.weight", out)
+        self.assertIn("llm.pre_norm.weight", out)
+        self.assertNotIn("llm.layers.0.pre_norm.weight", out)
         self.assertIn("llm.layers.0.attn.x_r", out)
         self.assertIn("lm_head.weight", out)
         self.assertNotIn("vision_encoder.patch_embed.proj.weight", out)
@@ -324,6 +400,7 @@ class TestRWKV7Backend(unittest.TestCase):
                     vision_dim
                 ),
                 "model.proj.main.pre_norm.weight": torch.empty(hidden_size),
+                "model.llm.layers.0.pre_norm.weight": torch.empty(hidden_size),
                 "model.llm.norm.weight": torch.empty(hidden_size),
                 "lm_head.weight": torch.empty(spec.model.vocab_size, hidden_size),
             }
@@ -335,6 +412,7 @@ class TestRWKV7Backend(unittest.TestCase):
         self.assertIn("vision_encoder.layers.0.attn.qkv.weight", out)
         self.assertIn("vision_encoder.deepstack_merger_list.0.norm.weight", out)
         self.assertIn("proj.main.pre_norm.weight", out)
+        self.assertIn("llm.pre_norm.weight", out)
         self.assertIn("llm.norm.weight", out)
 
     def test_flattened_cu_seqlens_fixed_rows(self):

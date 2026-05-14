@@ -140,6 +140,11 @@ def apply_fsdp(
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
+    fully_shard(
+        model.llm.pre_norm,
+        **fsdp_config,
+        reshard_after_forward=reshard_after_forward,
+    )
     for block in model.llm.layers.values():
         fully_shard(
             block,

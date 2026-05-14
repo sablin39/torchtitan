@@ -21,6 +21,10 @@ class RWKV7StateDictAdapter(StateDictAdapter):
         self.model_config = model_config
 
     def _from_hf_key(self, key: str) -> str | None:
+        if key.startswith("model.llm.layers.0.pre_norm."):
+            return "llm.pre_norm." + key.removeprefix(
+                "model.llm.layers.0.pre_norm."
+            )
         if key.startswith("model.llm."):
             return "llm." + key.removeprefix("model.llm.")
         if key == "lm_head.weight":
@@ -28,6 +32,10 @@ class RWKV7StateDictAdapter(StateDictAdapter):
         return None
 
     def _to_hf_key(self, key: str) -> str | None:
+        if key.startswith("llm.pre_norm."):
+            return "model.llm.layers.0.pre_norm." + key.removeprefix(
+                "llm.pre_norm."
+            )
         if key.startswith("llm."):
             return "model.llm." + key.removeprefix("llm.")
         if key == "lm_head.weight":

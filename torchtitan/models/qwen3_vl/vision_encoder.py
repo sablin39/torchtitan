@@ -46,7 +46,13 @@ def get_flat_vision_block_mask_mod(patch_to_item: torch.Tensor):
     """Create a block-diagonal mask for flat concatenated visual patches."""
 
     def mask_mod(b, h, q_idx, kv_idx):
-        return patch_to_item[q_idx] == patch_to_item[kv_idx]
+        q_item = patch_to_item[q_idx]
+        kv_item = patch_to_item[kv_idx]
+        valid_q = q_item >= 0
+        valid_kv = kv_item >= 0
+        same_item = q_item == kv_item
+        padding_self = (~valid_q) & (~valid_kv) & (q_idx == kv_idx)
+        return (same_item & valid_q & valid_kv) | padding_self
 
     return mask_mod
 
@@ -806,21 +812,58 @@ class Qwen3VLVisionEncoder(Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Forward path for flat ``(total_patches, patch_dim)`` inputs."""
         num_patch = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).to(torch.long)
-        total_num_patch = int(num_patch.sum().item())
-        if pixel_values.shape[0] != total_num_patch:
+        real_num_patch = int(num_patch.sum().item())
+        total_num_patch = int(pixel_values.shape[0])
+        if total_num_patch < real_num_patch:
             raise ValueError(
-                f"Flat pixel_values has {pixel_values.shape[0]} patches, but "
-                f"grid_thw describes {total_num_patch} patches"
+                f"Flat pixel_values has {total_num_patch} patches, but "
+                f"grid_thw describes {real_num_patch} patches"
+            )
+        if total_num_patch % self.spatial_merge_unit != 0:
+            raise ValueError(
+                f"Flat pixel_values length ({total_num_patch}) must be divisible "
+                f"by spatial_merge_unit ({self.spatial_merge_unit})"
             )
 
         hidden_states = self.patch_embed(pixel_values).unsqueeze(0)
         learned_pos, rope_cache = self.compute_flat_position_embeddings(grid_thw)
+        pad_len = total_num_patch - real_num_patch
+        if pad_len > 0:
+            learned_pos = torch.cat(
+                [
+                    learned_pos,
+                    learned_pos.new_zeros((pad_len, learned_pos.shape[-1])),
+                ],
+                dim=0,
+            )
+            identity_rope = rope_cache.new_zeros(
+                (
+                    rope_cache.shape[0],
+                    pad_len,
+                    rope_cache.shape[2],
+                    rope_cache.shape[3],
+                )
+            )
+            identity_rope[..., : rope_cache.shape[-1] // 2] = 1
+            rope_cache = torch.cat([rope_cache, identity_rope], dim=1)
         hidden_states = hidden_states + learned_pos.unsqueeze(0)
 
         patch_to_item = torch.repeat_interleave(
             torch.arange(grid_thw.shape[0], device=grid_thw.device),
             num_patch,
         )
+        if pad_len > 0:
+            patch_to_item = torch.cat(
+                [
+                    patch_to_item,
+                    torch.full(
+                        (pad_len,),
+                        -1,
+                        dtype=patch_to_item.dtype,
+                        device=patch_to_item.device,
+                    ),
+                ]
+            )
         mask_mod = get_flat_vision_block_mask_mod(patch_to_item)
         attention_mask = _compiled_create_block_mask(
             mask_mod,
@@ -841,10 +884,14 @@ class Qwen3VLVisionEncoder(Module):
             if int(layer_idx) in self.deepstack_visual_indices:
                 idx = self.deepstack_visual_indices.index(int(layer_idx))
                 deepstack_features.append(
-                    self.deepstack_merger_list[idx](hidden_states).squeeze(0)
+                    self.deepstack_merger_list[idx](hidden_states).squeeze(0)[
+                        : real_num_patch // self.spatial_merge_unit
+                    ]
                 )
 
-        merged_hidden_states = self.merger(hidden_states).squeeze(0)
+        merged_hidden_states = self.merger(hidden_states).squeeze(0)[
+            : real_num_patch // self.spatial_merge_unit
+        ]
         return merged_hidden_states, deepstack_features
 
     def forward(

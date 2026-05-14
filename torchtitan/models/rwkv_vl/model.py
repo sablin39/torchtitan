@@ -11,6 +11,7 @@ from functools import partial
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from torchtitan.components.optimizer import ParamGroupConfig
@@ -306,6 +307,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             )
         ).build()
         self._cp_group = None
+        self._vision_patch_sync_group = None
         self._trainable_roots = self._apply_root_lr_selection()
 
     def _apply_root_lr_selection(self) -> tuple[str, ...]:
@@ -322,6 +324,9 @@ class RWKV7VLForConditionalGeneration(BaseModel):
 
     def set_cp_process_group(self, cp_group) -> None:
         self._cp_group = cp_group
+
+    def set_vision_patch_sync_process_group(self, group) -> None:
+        self._vision_patch_sync_group = group
 
     def _build_cp_context(
         self,
@@ -340,6 +345,63 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             group=self._cp_group,
             cu_seqlens_cpu=cu_seqlens_global_cpu,
         )
+
+    def _sync_flat_vision_patch_bucket(
+        self,
+        pixel_values: torch.Tensor | None,
+        grid_thw: torch.Tensor | None,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if not dist.is_available() or not dist.is_initialized():
+            return pixel_values, grid_thw
+
+        group = self._vision_patch_sync_group
+        world_size = (
+            dist.get_world_size(group) if group is not None else dist.get_world_size()
+        )
+        if world_size == 1:
+            return pixel_values, grid_thw
+
+        local_num_patch = 0
+        if (
+            pixel_values is not None
+            and grid_thw is not None
+            and pixel_values.dim() == 2
+        ):
+            local_num_patch = int(pixel_values.shape[0])
+
+        max_num_patch = torch.tensor(
+            local_num_patch,
+            dtype=torch.long,
+            device=device,
+        )
+        dist.all_reduce(max_num_patch, op=dist.ReduceOp.MAX, group=group)
+        target_num_patch = int(max_num_patch.item())
+        if target_num_patch == 0 or target_num_patch == local_num_patch:
+            return pixel_values, grid_thw
+        if (
+            pixel_values is None
+            or grid_thw is None
+            or pixel_values.dim() != 2
+            or local_num_patch == 0
+        ):
+            return pixel_values, grid_thw
+        if target_num_patch < local_num_patch:
+            raise RuntimeError(
+                f"Rank-synchronized ViT patch bucket target {target_num_patch} "
+                f"is smaller than local patch count {local_num_patch}."
+            )
+
+        pad_len = target_num_patch - local_num_patch
+        pixel_values = torch.cat(
+            [
+                pixel_values,
+                pixel_values.new_zeros((pad_len, pixel_values.shape[1])),
+            ],
+            dim=0,
+        )
+        return pixel_values, grid_thw
 
     def _get_vision_embeds(
         self,
@@ -440,6 +502,25 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             inputs_embeds.view(-1, inputs_embeds.shape[-1])[
                 local_start : local_start + feature_len
             ] = vision_slice
+        return inputs_embeds
+
+    def _add_empty_projector_edge(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        if "proj" not in self._trainable_roots:
+            return inputs_embeds
+
+        empty = inputs_embeds.new_zeros((0, self.proj.encoder_dim))
+        empty_deepstack = [
+            inputs_embeds.new_zeros((0, self.proj.encoder_dim))
+            for _ in range(self.proj.num_deepstack)
+        ]
+        merged_embeds, deepstack_features = self.proj(empty, empty_deepstack)
+        inputs_embeds = inputs_embeds + merged_embeds.sum().to(
+            inputs_embeds.dtype
+        ) * 0.0
+        for deepstack_embeds in deepstack_features:
+            inputs_embeds = inputs_embeds + deepstack_embeds.sum().to(
+                inputs_embeds.dtype
+            ) * 0.0
         return inputs_embeds
 
     def _add_vision_embeds(
@@ -547,6 +628,8 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                     inputs_embeds = inputs_embeds + deepstack_embeds.sum().to(
                         inputs_embeds.dtype
                     ) * 0.0
+        else:
+            inputs_embeds = self._add_empty_projector_edge(inputs_embeds)
         return inputs_embeds, deepstack_features, num_tokens_per_item, image_token_id
 
     def _forward_llm_with_deepstack(
@@ -562,15 +645,28 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         cp_context: Any | None,
         cu_seqlens: torch.Tensor | None,
     ) -> torch.Tensor:
-        v_first = None
+        hidden_states = self.llm.pre_norm(hidden_states)
+        v_first = hidden_states.new_zeros(
+            *hidden_states.shape[:-1],
+            self.llm.layers["0"].attn.value_dim,
+        )
+        v_first.requires_grad_(
+            torch.is_grad_enabled()
+            and (
+                hidden_states.requires_grad
+                or self.llm.layers["0"].attn.v_proj.weight.requires_grad
+            )
+        )
         for layer_idx, layer in self.llm.layers.items():
-            hidden_states, v_first = layer(
+            hidden_states, layer_v = layer(
                 hidden_states,
                 v_first=v_first,
                 cp_context=cp_context,
                 cu_seqlens=cu_seqlens,
             )
             idx = int(layer_idx)
+            if idx == 0:
+                v_first = layer_v
             if idx < len(deepstack_features) and num_tokens_per_item is not None:
                 hidden_states = self._add_vision_embeds(
                     hidden_states,
@@ -601,6 +697,12 @@ class RWKV7VLForConditionalGeneration(BaseModel):
     ) -> torch.Tensor:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("RWKV-VL video inputs are not implemented yet")
+
+        pixel_values, grid_thw = self._sync_flat_vision_patch_bucket(
+            pixel_values,
+            grid_thw,
+            device=tokens.device,
+        )
 
         cp_context = self._build_cp_context(cu_seqlens_global, cu_seqlens_global_cpu)
         cu_seqlens = cu_seqlens_global if cp_context is None and tokens.shape[0] == 1 else None

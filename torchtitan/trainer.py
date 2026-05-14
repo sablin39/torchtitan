@@ -743,17 +743,39 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 loss = torch.sum(torch.stack(losses)).to(self.device)
             else:
                 loss = torch.tensor([-1.0], device=self.device)
+            self._raise_if_nonfinite_scalar("loss", loss)
         else:
             # Non-PP forward / backward
             assert len(model_parts) == 1
             with self.train_context():
                 pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
                 loss = self.loss_fn(pred, labels, global_valid_tokens)
+                self._raise_if_nonfinite_scalar("loss", loss)
                 del pred
                 loss.backward()
 
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
+
+    def _raise_if_nonfinite_scalar(self, name: str, value: torch.Tensor) -> None:
+        local_value = value.detach()
+        if hasattr(local_value, "to_local"):
+            local_value = local_value.to_local()
+        if bool(torch.isfinite(local_value).all().item()):
+            return
+
+        kind = "NaN" if bool(torch.isnan(local_value).any().item()) else "Inf"
+        value_str = (
+            str(local_value.item())
+            if local_value.numel() == 1
+            else f"shape={tuple(local_value.shape)}"
+        )
+        message = (
+            f"{name} became {kind} at step {self.step} "
+            f"(value={value_str}); stopping training."
+        )
+        logger.error(message)
+        raise RuntimeError(message)
 
     def _record_data_stats(self, stats: dict[str, Any]) -> None:
         for key, value in stats.items():
@@ -781,11 +803,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         metrics = {
             "data/avg_num_images": avg("num_images"),
             "data/avg_vit_patches": avg("num_vit_patches"),
+            "data/avg_vit_patches_bucketed": avg("num_vit_patches_bucketed"),
+            "data/avg_vit_patch_padding": avg("vit_patch_padding"),
+            "data/avg_vit_patch_padding_ratio": avg("vit_patch_padding_ratio"),
             "data/avg_pixel_values_gib": avg("pixel_values_bytes") / (1024**3),
             "data/avg_packed_docs": avg("packed_docs"),
             "data/avg_packed_rows": avg("packed_rows"),
             "data/total_num_images": sums.get("num_images", 0.0),
             "data/total_vit_patches": sums.get("num_vit_patches", 0.0),
+            "data/total_vit_patches_bucketed": sums.get(
+                "num_vit_patches_bucketed", 0.0
+            ),
             "data/total_pixel_values_gib": pixel_bytes / (1024**3),
         }
         if sequence_tokens > 0:
@@ -794,6 +822,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.data_metric_sums = {}
         self.data_metric_count = 0
         return metrics
+
+    def _sync_dataloader_exhaustion(self, exhausted: bool) -> bool:
+        """Return whether any rank ran out of data before starting train collectives."""
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() == 1
+        ):
+            return exhausted
+
+        exhausted_tensor = torch.tensor(
+            int(exhausted), dtype=torch.int32, device=self.device
+        )
+        torch.distributed.all_reduce(
+            exhausted_tensor, op=torch.distributed.ReduceOp.MAX
+        )
+        return bool(exhausted_tensor.item())
 
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -809,13 +854,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Collect all microbatches on CPU and count total valid tokens
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        dataloader_exhausted = False
         for _microbatch in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
+            try:
+                input_dict, labels = next(data_iterator)
+            except DataloaderExhaustedError:
+                dataloader_exhausted = True
+                break
             data_stats = input_dict.pop("data_stats", None)
             if isinstance(data_stats, dict):
                 self._record_data_stats(data_stats)
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
             microbatches.append((input_dict, labels))
+
+        # Dataloader exhaustion can happen on different ranks at different
+        # times, especially with finite multimodal datasets that filter and
+        # pack samples. Synchronize the decision before any rank enters train
+        # collectives; otherwise one rank can enter final checkpoint collectives
+        # while another rank is still in a training all-reduce.
+        if self._sync_dataloader_exhaustion(dataloader_exhausted):
+            raise DataloaderExhaustedError()
 
         # All-reduce to get global token count across DP ranks
         # Move to GPU for distributed communication
@@ -850,6 +908,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
         )
+        self._raise_if_nonfinite_scalar("grad_norm", grad_norm)
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
         self.lr_schedulers.step()
@@ -951,7 +1010,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     canceled_step = self.step
                     self.step -= 1
                     logger.warning(
-                        f"Ran out of data; step {canceled_step} was canceled."
+                        f"At least one rank ran out of data; "
+                        f"step {canceled_step} was canceled."
                     )
                     if self.step > 0:
                         self.checkpointer.save(self.step, last_step=True)

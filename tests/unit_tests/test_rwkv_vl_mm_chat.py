@@ -28,6 +28,7 @@ from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
     normalize_mm_chat_sample,
     process_mm_chat_images,
 )
+from torchtitan.models.rwkv_vl import _vl_vision_encoder_config
 from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
 from scripts.rwkv7_exporter.export_hf_model import (
     save_processor_core,
@@ -701,6 +702,47 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertEqual(input_dict["data_stats"]["packed_docs"], 1)
             self.assertEqual(input_dict["data_stats"]["nonpad_tokens"], n)
 
+    def test_mm_chat_collator_can_bucket_flat_vit_patches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            sample = next(iter(_make_mm_chat_dataset(tok, [_two_image_sample()])))
+            collator = MMChatCollator(
+                batch_size=1,
+                seq_len=512,
+                max_images_per_batch=8,
+                patch_size=16,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+                tokenizer=tok,
+                vit_patch_bucket_size=64,
+            )
+            input_dict, _ = collator([sample])
+            real_patches = int(input_dict["grid_thw"].prod(-1).sum().item())
+            bucket_patches = input_dict["pixel_values"].shape[0]
+
+            self.assertEqual(real_patches, 12)
+            self.assertEqual(bucket_patches, 128)
+            self.assertTrue(
+                torch.equal(
+                    input_dict["pixel_values"][real_patches:],
+                    torch.zeros_like(input_dict["pixel_values"][real_patches:]),
+                )
+            )
+            self.assertEqual(input_dict["pixel_values"].dtype, sample["pixel_values"].dtype)
+            self.assertEqual(input_dict["data_stats"]["num_vit_patches"], real_patches)
+            self.assertEqual(
+                input_dict["data_stats"]["num_vit_patches_bucketed"],
+                bucket_patches,
+            )
+            self.assertEqual(
+                input_dict["data_stats"]["vit_patch_padding"],
+                bucket_patches - real_patches,
+            )
+            self.assertAlmostEqual(
+                input_dict["data_stats"]["vit_patch_padding_ratio"],
+                (bucket_patches - real_patches) / real_patches,
+            )
+
     def test_mm_chat_collator_zero_image_cap_keeps_all_images(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tok = _make_tokenizer(tmpdir)
@@ -725,6 +767,96 @@ class TestMMChatDataset(unittest.TestCase):
             )
             self.assertGreater(input_dict["input_token_mask"][1].sum().item(), 0)
             self.assertGreater((labels[1] != IGNORE_INDEX).sum().item(), 0)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for FlexAttention")
+class TestQwen3VLVisionBucketing(unittest.TestCase):
+    def test_bucketed_flat_path_matches_unbucketed_with_trainable_vit(self):
+        torch.manual_seed(1234)
+        device = torch.device("cuda")
+        encoder = _vl_vision_encoder_config(
+            dim=64,
+            ffn_dim=128,
+            n_layers=2,
+            n_heads=4,
+            patch_size=16,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            num_position_embeddings=1024,
+            deepstack_visual_indices=[0],
+        ).build()
+        encoder.to(device)
+        encoder.train()
+
+        grid_thw = torch.tensor([[1, 2, 2], [1, 2, 4]], device=device)
+        patch_dim = 3 * 2 * 16 * 16
+        real_patches = int(grid_thw.prod(-1).sum().item())
+        bucket_patches = 128
+        pixels = torch.randn(real_patches, patch_dim, device=device)
+        param_names = [
+            "pos_embed",
+            "patch_embed.proj.weight",
+            "layers.0.attn.qkv.weight",
+            "merger.linear_fc1.weight",
+        ]
+
+        def run_once(pixel_values: torch.Tensor):
+            encoder.zero_grad(set_to_none=True)
+            pixel_values = pixel_values.detach().clone().requires_grad_(True)
+            merged, deepstack = encoder(pixel_values, grid_thw=grid_thw)
+            loss = merged.float().square().mean()
+            for feature in deepstack:
+                loss = loss + feature.float().square().mean()
+            loss.backward()
+            params = dict(encoder.named_parameters())
+            return (
+                merged.detach(),
+                [feature.detach() for feature in deepstack],
+                pixel_values.grad.detach().clone(),
+                {
+                    name: params[name].grad.detach().clone()
+                    for name in param_names
+                },
+            )
+
+        unbucketed = run_once(pixels)
+        padded_pixels = torch.cat(
+            [
+                pixels,
+                pixels.new_zeros((bucket_patches - real_patches, patch_dim)),
+            ],
+            dim=0,
+        )
+        bucketed = run_once(padded_pixels)
+
+        torch.testing.assert_close(bucketed[0], unbucketed[0], rtol=5e-4, atol=5e-4)
+        self.assertEqual(len(bucketed[1]), len(unbucketed[1]))
+        for bucketed_feature, unbucketed_feature in zip(bucketed[1], unbucketed[1]):
+            torch.testing.assert_close(
+                bucketed_feature,
+                unbucketed_feature,
+                rtol=5e-4,
+                atol=5e-4,
+            )
+            self.assertTrue(torch.isfinite(bucketed_feature).all())
+        torch.testing.assert_close(
+            bucketed[2][:real_patches],
+            unbucketed[2],
+            rtol=1e-3,
+            atol=1e-3,
+        )
+        self.assertTrue(torch.isfinite(bucketed[0]).all())
+        self.assertTrue(torch.isfinite(bucketed[2]).all())
+        for name in param_names:
+            torch.testing.assert_close(
+                bucketed[3][name],
+                unbucketed[3][name],
+                rtol=1e-3,
+                atol=1e-3,
+                msg=lambda msg, name=name: f"{name} gradient mismatch:\n{msg}",
+            )
+            self.assertTrue(torch.isfinite(bucketed[3][name]).all(), name)
 
 
 if __name__ == "__main__":
