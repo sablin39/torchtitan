@@ -12,21 +12,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 timestamp="$(date +%Y%m%d_%H%M%S)"
 
-resolve_cmd() {
-    local name="$1"
-    local fallback="$2"
-    if command -v "${name}" >/dev/null 2>&1; then
-        command -v "${name}"
-    elif [[ -x "${fallback}" ]]; then
-        printf '%s\n' "${fallback}"
-    else
-        echo "Could not find ${name}; activate .venv or install it." >&2
-        return 1
-    fi
-}
-
-python_cmd="$(resolve_cmd python "${repo_root}/.venv/bin/python")"
-torchrun_cmd="$(resolve_cmd torchrun "${repo_root}/.venv/bin/torchrun")"
+python_cmd="python"
+torchrun_cmd="torchrun"
 
 # Pipeline:
 #   1. Export RWKV .pth + Qwen3-VL vision weights to an HF RWKV-VL checkpoint.
@@ -47,8 +34,10 @@ torchrun_cmd="$(resolve_cmd torchrun "${repo_root}/.venv/bin/torchrun")"
 # Edit this block directly for now. We will replace it with a smarter config
 # system later.
 
-rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1d-0.4b-20260210-ctx8192.pth"
-vision_model="/home/molin/models/Qwen3.5-0.8B"
+rwkv7_path=""
+vision_model=""
+# W&B remote path: /data/HuggingFaceM4_FineVisionMax
+dataset_path=""
 # 1.5B-v100M:
 # rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
 # vision_model="/home/molin/models/Qwen3.5-0.8B"
@@ -62,18 +51,16 @@ vision_model="/home/molin/models/Qwen3.5-0.8B"
 # Defaults below recover the 2026-05-09 FineVisionMax run from the offline
 # W&B config in outputs/rwkv_vl_train_20260509_065318_latest_dcp_wandb*.
 fake_thinking="1"
-# W&B remote path: /data/HuggingFaceM4_FineVisionMax
-dataset_path="/home/molin/data/LLaVA-OneVision-Data"
 
 split="train"
 ngpu="4"
 # Size of each context-parallel group. For ngpu=4 this creates two CP groups
 # of 2 ranks; for ngpu=8 it creates four CP groups of 2 ranks.
-context_parallel_degree="2"
+context_parallel_degree="1"
 seq_len="8192"
 # The recovered 4096-token W&B run used batch_size=24. For 8192-token local
 # stress on this shared 4x96GB workstation, batch_size=8 is the verified default.
-batch_size="8"
+batch_size="24"
 # batch_size is TorchTitan training.local_batch_size. With RWKV/FLA CP it is
 # the number of packed seq_len rows per batch-parallel group. CP shards the
 # flattened tokens inside each row group; it does not multiply batch size.
@@ -88,10 +75,10 @@ packing_buffer_size="64"
 # Conservative dataloader overlap for multimodal packing. Each worker can hold
 # prefetched packed batches containing many resized images, so keep this small
 # on RAM-constrained machines. With CP, this is per rank.
-dataloader_num_workers="4"
+dataloader_num_workers="0"
 dataloader_persistent_workers="1"
-dataloader_prefetch_factor="2"
-dataloader_pin_memory="1"
+dataloader_prefetch_factor="1"
+dataloader_pin_memory="0"
 # Store preprocessed visual patch tensors in this dtype before worker IPC and
 # H2D transfer. For BF16 training this roughly halves pixel_values host memory
 # and transfer volume compared with float32 while resize/normalize still runs
@@ -114,7 +101,7 @@ model_flavor="0.4B-v100M"
 train_config="rwkv_vl_0_4b_v100m_chat"
 # RWKV7 DPLR chunk size for the language backbone. The model default is 64;
 # local long-sequence sweeps favored 32 for packed CP training.
-backbone_chunk_size="32"
+backbone_chunk_size="64"
 # Per-root learning rates. A value of 0 freezes that root and skips selective
 # FSDP sharding for it. Leave lm_head_lr empty to follow llm_lr.
 vision_encoder_lr="0"
@@ -122,7 +109,7 @@ proj_lr="1e-4"
 llm_lr="1e-5"
 lm_head_lr=""
 projector_seed="1234"
-activation_checkpoint_mode="none"
+activation_checkpoint_mode="full"
 # Currently only "full" and "none" are supported. "selective" will fail due to `token_shift_cp`
 log_freq="1"
 wandb="0"
@@ -147,6 +134,44 @@ max_pixels="3145728"
 # across all images in one chat example; set a positive image cap only as an
 # emergency batch-memory guard.
 max_images_per_batch="0"
+# Flat ViT patch bucketing stabilizes FlexAttention sequence shapes for image
+# patch streams. 0 disables bucketing and preserves the exact old data path.
+# Useful benchmark sweep values: 0, 16384, 32768, 65536.
+# For a bucket sweep, edit vit_patch_bucket_size and keep
+# torchinductor_cache_dir distinct for each cold-cache run.
+vit_patch_bucket_size="32768"
+# Keep Inductor caches separate across bucket-size sweeps when benchmarking
+# cold compile/autotune behavior. Leave empty to let PyTorch choose the cache.
+torchinductor_cache_dir="/tmp/tt_vit_bucket_${vit_patch_bucket_size}_cp${context_parallel_degree}_bs${batch_size}"
+# Set to "recompiles" for bucket/recompile diagnostics. Leave empty for quiet
+# long runs after the shape set is understood.
+torch_logs="recompiles"
+# Low-overhead remote diagnostics. These are either fail-time only or compile-time
+# only, so they should not affect steady-state training speed.
+python_faulthandler="1"
+torch_show_cpp_stacktraces="1"
+torch_cpp_log_level=""
+torch_distributed_debug=""
+flex_attention_log_file="auto"
+nccl_debug="WARN"
+nccl_debug_subsys=""
+nccl_debug_file=""
+torch_nccl_async_error_handling="1"
+torch_nccl_enable_monitoring="1"
+torch_nccl_heartbeat_timeout_sec="600"
+torch_nccl_wait_timeout_dump_milsec="120000"
+torch_nccl_log_cpp_stack_on_unclean_shutdown="1"
+# Higher-detail NCCL tracing can help diagnose collective desyncs/timeouts, but
+# it records per-collective metadata. Keep it off for speed-equivalent runs.
+torch_nccl_flight_recorder="0"
+torch_nccl_trace_buffer_size="8192"
+torch_nccl_trace_cpp_stack="0"
+torch_nccl_desync_debug="0"
+torch_nccl_enable_timing="0"
+torch_nccl_nan_check="0"
+# Correct CUDA allocator knob. The older PYTORCH_ALLOC_CONF name is ignored by
+# PyTorch for CUDA memory management.
+pytorch_cuda_alloc_conf="expandable_segments:True"
 max_position_embeddings=""
 max_shard_size="1000GB"
 output_root="${repo_root}/outputs/rwkv_vl_train_${timestamp}"
@@ -218,9 +243,45 @@ if ! [[ "${packing_buffer_size}" =~ ^[0-9]+$ ]]; then
     echo "packing_buffer_size must be a non-negative integer, got: ${packing_buffer_size}" >&2
     exit 2
 fi
+if ! [[ "${vit_patch_bucket_size}" =~ ^[0-9]+$ ]]; then
+    echo "vit_patch_bucket_size must be a non-negative integer, got: ${vit_patch_bucket_size}" >&2
+    exit 2
+fi
 
-if [[ "${fake_thinking}" != "0" && "${fake_thinking}" != "1" ]]; then
-    echo "fake_thinking must be 0 or 1, got: ${fake_thinking}" >&2
+require_bool() {
+    local name="$1"
+    local value="${!name}"
+    if [[ "${value}" != "0" && "${value}" != "1" ]]; then
+        echo "${name} must be 0 or 1, got: ${value}" >&2
+        exit 2
+    fi
+}
+
+for bool_name in \
+    fake_thinking \
+    python_faulthandler \
+    torch_show_cpp_stacktraces \
+    torch_nccl_async_error_handling \
+    torch_nccl_enable_monitoring \
+    torch_nccl_log_cpp_stack_on_unclean_shutdown \
+    torch_nccl_flight_recorder \
+    torch_nccl_trace_cpp_stack \
+    torch_nccl_desync_debug \
+    torch_nccl_enable_timing \
+    torch_nccl_nan_check; do
+    require_bool "${bool_name}"
+done
+
+if ! [[ "${torch_nccl_trace_buffer_size}" =~ ^[0-9]+$ ]]; then
+    echo "torch_nccl_trace_buffer_size must be a non-negative integer, got: ${torch_nccl_trace_buffer_size}" >&2
+    exit 2
+fi
+if ! [[ "${torch_nccl_heartbeat_timeout_sec}" =~ ^[0-9]+$ ]] || (( torch_nccl_heartbeat_timeout_sec < 1 )); then
+    echo "torch_nccl_heartbeat_timeout_sec must be a positive integer, got: ${torch_nccl_heartbeat_timeout_sec}" >&2
+    exit 2
+fi
+if ! [[ "${torch_nccl_wait_timeout_dump_milsec}" =~ ^[0-9]+$ ]]; then
+    echo "torch_nccl_wait_timeout_dump_milsec must be a non-negative integer, got: ${torch_nccl_wait_timeout_dump_milsec}" >&2
     exit 2
 fi
 
@@ -259,6 +320,10 @@ dcp_dir="${output_root}/dcp_from_hf"
 train_dump_dir="${output_root}/train"
 final_hf_dir="${output_root}/hf_final"
 
+if [[ "${flex_attention_log_file}" == "auto" ]]; then
+    flex_attention_log_file="${output_root}/flex_attention_autotune"
+fi
+
 if [[ "${overwrite}" == "1" ]]; then
     rm -rf "${hf_dir}" "${dcp_dir}" "${train_dump_dir}" "${final_hf_dir}"
 fi
@@ -272,6 +337,12 @@ for path in "${hf_dir}" "${dcp_dir}" "${train_dump_dir}" "${final_hf_dir}"; do
 done
 
 mkdir -p "${output_root}"
+if [[ -n "${flex_attention_log_file}" ]]; then
+    mkdir -p "$(dirname "${flex_attention_log_file}")"
+fi
+if [[ -n "${nccl_debug_file}" ]]; then
+    mkdir -p "$(dirname "${nccl_debug_file}")"
+fi
 
 echo "Artifacts:"
 echo "  HF export:     ${hf_dir}"
@@ -282,6 +353,16 @@ echo "Parallelism:"
 echo "  GPUs:          ${ngpu}"
 echo "  CP degree:     ${context_parallel_degree}"
 echo "  Batch groups:  ${batch_parallel_degree}"
+echo "Bucketing:"
+echo "  ViT patches:   ${vit_patch_bucket_size} (0 disables)"
+echo "  Inductor dir:  ${torchinductor_cache_dir:-<torch default>}"
+echo "  TORCH_LOGS:    ${torch_logs:-<unset>}"
+echo "Diagnostics:"
+echo "  Python faults: ${python_faulthandler}"
+echo "  C++ stacks:    ${torch_show_cpp_stacktraces}"
+echo "  FlexAttn log:  ${flex_attention_log_file:-<unset>}"
+echo "  NCCL debug:    ${nccl_debug:-<unset>}"
+echo "  NCCL flight:   ${torch_nccl_flight_recorder}"
 
 export_args=(
     "${repo_root}/scripts/rwkv7_exporter/export_hf_model.py"
@@ -344,6 +425,7 @@ train_args=(
     --training.steps "${training_steps}"
     --training.local-batch-size "${batch_size}"
     --dataloader.packing-buffer-size "${packing_buffer_size}"
+    --dataloader.vit-patch-bucket-size "${vit_patch_bucket_size}"
     --dataloader.num-workers "${dataloader_num_workers}"
     --dataloader.prefetch-factor "${dataloader_prefetch_factor}"
     --dataloader.pixel-values-dtype "${dataloader_pixel_values_dtype}"
@@ -399,9 +481,61 @@ train_args+=("${train_extra_args[@]}")
 
 echo
 echo "==> Step 3/4: Training"
-PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}" \
-OMP_NUM_THREADS="${OMP_NUM_THREADS:-${omp_num_threads}}" \
-"${torchrun_cmd}" \
+train_env=(
+    "PYTORCH_CUDA_ALLOC_CONF=${pytorch_cuda_alloc_conf}"
+    "OMP_NUM_THREADS=${OMP_NUM_THREADS:-${omp_num_threads}}"
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING=${torch_nccl_async_error_handling}"
+    "TORCH_NCCL_ENABLE_MONITORING=${torch_nccl_enable_monitoring}"
+    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${torch_nccl_heartbeat_timeout_sec}"
+    "TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC=${torch_nccl_wait_timeout_dump_milsec}"
+    "TORCH_NCCL_LOG_CPP_STACK_ON_UNCLEAN_SHUTDOWN=${torch_nccl_log_cpp_stack_on_unclean_shutdown}"
+    "TORCH_NCCL_ENABLE_TIMING=${torch_nccl_enable_timing}"
+    "TORCH_NCCL_NAN_CHECK=${torch_nccl_nan_check}"
+    "TORCH_NCCL_TRACE_CPP_STACK=${torch_nccl_trace_cpp_stack}"
+    "TORCH_NCCL_DESYNC_DEBUG=${torch_nccl_desync_debug}"
+)
+if [[ "${python_faulthandler}" == "1" ]]; then
+    train_env+=("PYTHONFAULTHANDLER=1")
+fi
+if [[ "${torch_show_cpp_stacktraces}" == "1" ]]; then
+    train_env+=("TORCH_SHOW_CPP_STACKTRACES=1")
+fi
+if [[ -n "${torchinductor_cache_dir}" ]]; then
+    train_env+=("TORCHINDUCTOR_CACHE_DIR=${torchinductor_cache_dir}")
+fi
+if [[ -n "${torch_logs}" ]]; then
+    train_env+=("TORCH_LOGS=${torch_logs}")
+fi
+if [[ -n "${torch_cpp_log_level}" ]]; then
+    train_env+=("TORCH_CPP_LOG_LEVEL=${torch_cpp_log_level}")
+fi
+if [[ -n "${torch_distributed_debug}" ]]; then
+    train_env+=("TORCH_DISTRIBUTED_DEBUG=${torch_distributed_debug}")
+fi
+if [[ -n "${flex_attention_log_file}" ]]; then
+    train_env+=("TORCHINDUCTOR_FLEX_ATTENTION_LOGGING_FILE=${flex_attention_log_file}")
+fi
+if [[ -n "${nccl_debug}" ]]; then
+    train_env+=("NCCL_DEBUG=${nccl_debug}")
+fi
+if [[ -n "${nccl_debug_subsys}" ]]; then
+    train_env+=("NCCL_DEBUG_SUBSYS=${nccl_debug_subsys}")
+fi
+if [[ -n "${nccl_debug_file}" ]]; then
+    train_env+=("NCCL_DEBUG_FILE=${nccl_debug_file}")
+fi
+if [[ "${torch_nccl_flight_recorder}" == "1" ]]; then
+    train_env+=(
+        "TORCH_NCCL_DUMP_ON_TIMEOUT=1"
+        "TORCH_NCCL_TRACE_BUFFER_SIZE=${torch_nccl_trace_buffer_size}"
+    )
+else
+    train_env+=(
+        "TORCH_NCCL_DUMP_ON_TIMEOUT=0"
+        "TORCH_NCCL_TRACE_BUFFER_SIZE=0"
+    )
+fi
+env "${train_env[@]}" "${torchrun_cmd}" \
     --standalone \
     --nproc-per-node="${ngpu}" \
     --local-ranks-filter="${LOG_RANK:-0}" \
