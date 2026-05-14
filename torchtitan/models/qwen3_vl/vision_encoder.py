@@ -507,13 +507,16 @@ class VisionAttention(Module):
 
         self.qkv = qkv.build()
         self.proj = proj.build()
-        # Padding rows self-attend, so every query row has at least one valid
-        # key. Do not claim BLOCKS_ARE_CONTIGUOUS here: for long visual items
-        # with partial boundary blocks, PyTorch's partial-block index list can
-        # be non-contiguous even when the logical item span is contiguous.
+        # Padding rows self-attend, so every query row has at least one valid key
+        # globally. Still keep ROWS_GUARANTEED_SAFE disabled: with partial
+        # boundary blocks, a row can see an all-masked KV block before the block
+        # containing its valid keys, and FlexAttention's online softmax needs its
+        # per-block masked-row guard for that case. Do not claim
+        # BLOCKS_ARE_CONTIGUOUS either: PyTorch's partial-block index list can be
+        # non-contiguous even when the logical item span is contiguous.
         vision_kernel_options = {
             "USE_TMA": True,
-            "ROWS_GUARANTEED_SAFE": True,
+            "ROWS_GUARANTEED_SAFE": False,
             "IS_DIVISIBLE": True,
         }
         self.flex_attention = FlexAttention.Config(
