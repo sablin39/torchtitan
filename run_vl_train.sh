@@ -508,6 +508,9 @@ fi
 if [[ -n "${torchinductor_cache_dir}" ]]; then
     train_env+=("TORCHINDUCTOR_CACHE_DIR=${torchinductor_cache_dir}")
 fi
+train_env+=("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0")
+train_env+=("TORCHINDUCTOR_NAN_ASSERTS=1")
+train_env+=("TORCHINDUCTOR_RUNTIME_TRITON_NAN_ASSERTS=1")
 if [[ -n "${torch_logs}" ]]; then
     train_env+=("TORCH_LOGS=${torch_logs}")
 fi

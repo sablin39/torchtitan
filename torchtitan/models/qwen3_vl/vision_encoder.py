@@ -507,12 +507,13 @@ class VisionAttention(Module):
 
         self.qkv = qkv.build()
         self.proj = proj.build()
-        # Vision masks use contiguous per-item patch spans; padding rows
-        # self-attend so every query row has at least one valid key.
+        # Padding rows self-attend, so every query row has at least one valid
+        # key. Do not claim BLOCKS_ARE_CONTIGUOUS here: for long visual items
+        # with partial boundary blocks, PyTorch's partial-block index list can
+        # be non-contiguous even when the logical item span is contiguous.
         vision_kernel_options = {
             "USE_TMA": True,
             "ROWS_GUARANTEED_SAFE": True,
-            "BLOCKS_ARE_CONTIGUOUS": True,
             "IS_DIVISIBLE": True,
         }
         self.flex_attention = FlexAttention.Config(
