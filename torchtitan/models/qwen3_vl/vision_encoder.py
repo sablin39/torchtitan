@@ -37,7 +37,8 @@ def get_vision_block_mask_mod(num_patch: torch.Tensor, max_num_patch: int):
     def mask_mod(b, h, q_idx, kv_idx):
         valid_q = q_idx < num_patch[b]
         valid_kv = kv_idx < num_patch[b]
-        return valid_q & valid_kv
+        padding_self = (~valid_q) & (~valid_kv) & (q_idx == kv_idx)
+        return (valid_q & valid_kv) | padding_self
 
     return mask_mod
 
@@ -490,13 +491,33 @@ class VisionAttention(Module):
         self, dim: int, n_heads: int, *, qkv: Linear.Config, proj: Linear.Config
     ):
         super().__init__()
+        if dim % n_heads != 0:
+            raise ValueError(
+                f"VisionAttention dim ({dim}) must be divisible by n_heads ({n_heads})"
+            )
         self.dim = dim
         self.num_heads = n_heads
         self.head_dim = self.dim // self.num_heads
+        if dim % 8 != 0 or self.head_dim % 8 != 0:
+            raise ValueError(
+                "Vision FlexAttention TMA assumes packed QKV offsets and head "
+                "strides are 16-byte aligned for fp16/bf16 tensors; got "
+                f"dim={dim}, n_heads={n_heads}, head_dim={self.head_dim}"
+            )
 
         self.qkv = qkv.build()
         self.proj = proj.build()
-        self.flex_attention = FlexAttention.Config().build()
+        # Vision masks use contiguous per-item patch spans; padding rows
+        # self-attend so every query row has at least one valid key.
+        vision_kernel_options = {
+            "USE_TMA": True,
+            "ROWS_GUARANTEED_SAFE": True,
+            "BLOCKS_ARE_CONTIGUOUS": True,
+            "IS_DIVISIBLE": True,
+        }
+        self.flex_attention = FlexAttention.Config(
+            kernel_options=vision_kernel_options
+        ).build()
 
     def forward(
         self,
@@ -526,6 +547,13 @@ class VisionAttention(Module):
 
         q, k = apply_rotary_emb_cos_sin(q, k, rope_cache)
 
+        if max_num_patch % 128 != 0:
+            raise ValueError(
+                "Vision FlexAttention TMA expects the ViT sequence length to "
+                f"be divisible by 128; got max_num_patch={max_num_patch}. "
+                "Enable flat ViT patch bucketing or use a bucket size that is "
+                "a multiple of 128."
+            )
         attn_output = self.flex_attention(q, k, v, attention_masks=attention_mask)
         attn_output = attn_output.reshape(num_vision, max_num_patch, -1)
         return self.proj(attn_output)

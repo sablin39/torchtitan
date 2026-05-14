@@ -192,6 +192,10 @@ class FlexAttention(Module):
         # See torch/_inductor/runtime/coordinate_descent_tuner.py.
         "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
+        # Allow Inductor autotuning to consider Triton tensor descriptors/TMA
+        # on Hopper+ for compatible FlexAttention loads/stores.
+        "assume_aligned_inputs": True,
+        "triton.use_tensor_descriptor": True,
     }
 
     # pyrefly: ignore[no-matching-overload]
