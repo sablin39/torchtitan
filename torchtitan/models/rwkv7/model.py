@@ -101,6 +101,38 @@ def _merge_heads(x: torch.Tensor) -> torch.Tensor:
     batch, seq_len, n_heads, head_dim = x.shape
     return x.reshape(batch, seq_len, n_heads * head_dim)
 
+# TODO: Remove after FLA gate_output_correction handles >64K-token slices.
+_GATE_OUTPUT_CORRECTION_MAX_TOKENS = 65_536
+
+
+def _gate_output_correction_chunked(
+    ops: Any,
+    o: torch.Tensor,
+    r: torch.Tensor,
+    k: torch.Tensor,
+    r_k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+) -> torch.Tensor:
+    seq_len = o.shape[1]
+    if seq_len <= _GATE_OUTPUT_CORRECTION_MAX_TOKENS:
+        return ops.gate_output_correction(o, r, k, r_k, v, g)
+
+    outputs = []
+    for start in range(0, seq_len, _GATE_OUTPUT_CORRECTION_MAX_TOKENS):
+        end = min(start + _GATE_OUTPUT_CORRECTION_MAX_TOKENS, seq_len)
+        outputs.append(
+            ops.gate_output_correction(
+                o[:, start:end],
+                r[:, start:end],
+                k[:, start:end],
+                r_k,
+                v[:, start:end],
+                g[:, start:end],
+            )
+        )
+    return torch.cat(outputs, dim=1)
+
 
 class _FLAOps:
     def __init__(self) -> None:
@@ -139,7 +171,7 @@ def _require_fla_ops() -> _FLAOps:
         _fla_ops = _FLAOps()
     return _fla_ops
 
-
+# TODO: Replace this wrapper once FLA exposes a varlen token_shift autograd API.
 class _VarlenTokenShift(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -509,7 +541,15 @@ class RWKV7TimeMix(Module):
 
         o = self.g_norm(_merge_heads(o).view(batch_size * seq_len, self.value_dim))
         o = o.view(batch_size, seq_len, self.value_dim)
-        o = ops.gate_output_correction(o, r_heads, k_heads, self.r_k, v_heads, g)
+        o = _gate_output_correction_chunked(
+            ops,
+            o,
+            r_heads,
+            k_heads,
+            self.r_k,
+            v_heads,
+            g,
+        )
         return self.o_proj(o), layer_v
 
 
