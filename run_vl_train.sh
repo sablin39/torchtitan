@@ -55,9 +55,16 @@ fake_thinking="1"
 
 split="train"
 ngpu="4"
-# Size of each context-parallel group. For ngpu=4 this creates two CP groups
-# of 2 ranks; for ngpu=8 it creates four CP groups of 2 ranks.
+# Size of each context-parallel group. For context_parallel_degree=2, ngpu=4
+# creates two CP groups of 2 ranks; ngpu=8 creates four CP groups of 2 ranks.
 context_parallel_degree="1"
+# Data parallel layout. The default keeps current FSDP behavior by sharding
+# across all non-CP ranks. For replicated DP on 8 GPUs with CP=1, set:
+#   data_parallel_replicate_degree="8"
+#   data_parallel_shard_degree="1"
+# With CP>1, use data_parallel_replicate_degree=ngpu/context_parallel_degree.
+data_parallel_replicate_degree="1"
+data_parallel_shard_degree="-1"
 seq_len="8192"
 # The recovered 4096-token W&B run used batch_size=24. For 8192-token local
 # stress on this shared 4x96GB workstation, batch_size=8 is the verified default.
@@ -144,38 +151,15 @@ vit_patch_bucket_size="32768"
 # Keep Inductor caches separate across bucket-size sweeps when benchmarking
 # cold compile/autotune behavior. Leave empty to let PyTorch choose the cache.
 torchinductor_cache_dir="/tmp/tt_vit_bucket_${vit_patch_bucket_size}_cp${context_parallel_degree}_bs${batch_size}"
-# Compiler diagnostics for remote crash/debug runs. `+inductor` is DEBUG-level
-# and catches TMA/codegen decisions; avoid output_code/kernel_code by default
-# because they can flood the terminal log with generated Triton source.
-torch_logs="+inductor,recompiles,graph_breaks"
+# Set to 1 for crash/numerics/compiler debugging. This enables heavyweight
+# asserts and verbose logs. Leave 0 for speed-equivalent runs. FlexAttention
+# autotune stays enabled by the model config either way.
+debugging="0"
 # Set to "auto" to capture the full shell/torchrun terminal stream in the train
 # artifact directory. Set empty to disable shell-level tee logging.
 terminal_log_file="auto"
-# Low-overhead remote diagnostics. These are either fail-time only or compile-time
-# only, so they should not affect steady-state training speed.
-python_faulthandler="1"
-triton_debug="1"
-torch_show_cpp_stacktraces="1"
-torch_disable_addr2line="1"
-torch_cpp_log_level=""
-torch_distributed_debug=""
+# FlexAttention autotune choices are useful in both speed and debug runs.
 flex_attention_log_file="auto"
-nccl_debug="WARN"
-nccl_debug_subsys=""
-nccl_debug_file=""
-torch_nccl_async_error_handling="1"
-torch_nccl_enable_monitoring="1"
-torch_nccl_heartbeat_timeout_sec="600"
-torch_nccl_wait_timeout_dump_milsec="120000"
-torch_nccl_log_cpp_stack_on_unclean_shutdown="1"
-# Higher-detail NCCL tracing can help diagnose collective desyncs/timeouts, but
-# it records per-collective metadata. Keep it off for speed-equivalent runs.
-torch_nccl_flight_recorder="0"
-torch_nccl_trace_buffer_size="8192"
-torch_nccl_trace_cpp_stack="0"
-torch_nccl_desync_debug="0"
-torch_nccl_enable_timing="0"
-torch_nccl_nan_check="0"
 # Correct CUDA allocator knob. The older PYTORCH_ALLOC_CONF name is ignored by
 # PyTorch for CUDA memory management.
 pytorch_cuda_alloc_conf="expandable_segments:True"
@@ -185,6 +169,8 @@ output_root="${repo_root}/outputs/rwkv_vl_train_${timestamp}"
 
 train_extra_args=(
     # Add extra torchtitan.train args here, for example:
+    --parallelism.data-parallel-replicate-degree "${data_parallel_replicate_degree}"
+    --parallelism.data-parallel-shard-degree "${data_parallel_shard_degree}"
     --parallelism.context-parallel-degree "${context_parallel_degree}"
     --parallelism.context-parallel-load-balancer None
     --compile.enable
@@ -227,6 +213,32 @@ if (( ngpu % context_parallel_degree != 0 )); then
     exit 2
 fi
 
+if ! [[ "${data_parallel_replicate_degree}" =~ ^[0-9]+$ ]] || (( data_parallel_replicate_degree < 1 )); then
+    echo "data_parallel_replicate_degree must be a positive integer, got: ${data_parallel_replicate_degree}" >&2
+    exit 2
+fi
+if ! [[ "${data_parallel_shard_degree}" =~ ^-?[0-9]+$ ]] || (( data_parallel_shard_degree == 0 || data_parallel_shard_degree < -1 )); then
+    echo "data_parallel_shard_degree must be -1 or a positive integer, got: ${data_parallel_shard_degree}" >&2
+    exit 2
+fi
+if (( data_parallel_shard_degree == -1 )); then
+    dp_base=$((data_parallel_replicate_degree * context_parallel_degree))
+    if (( ngpu % dp_base != 0 )); then
+        echo "ngpu must be divisible by data_parallel_replicate_degree * context_parallel_degree when data_parallel_shard_degree=-1." >&2
+        echo "Got ngpu=${ngpu}, data_parallel_replicate_degree=${data_parallel_replicate_degree}, context_parallel_degree=${context_parallel_degree}." >&2
+        exit 2
+    fi
+    effective_data_parallel_shard_degree=$((ngpu / dp_base))
+else
+    effective_data_parallel_shard_degree="${data_parallel_shard_degree}"
+    if (( data_parallel_replicate_degree * data_parallel_shard_degree * context_parallel_degree != ngpu )); then
+        echo "Invalid data/context parallel layout." >&2
+        echo "Expected data_parallel_replicate_degree * data_parallel_shard_degree * context_parallel_degree == ngpu." >&2
+        echo "Got ${data_parallel_replicate_degree} * ${data_parallel_shard_degree} * ${context_parallel_degree} != ${ngpu}." >&2
+        exit 2
+    fi
+fi
+
 if ! [[ "${batch_size}" =~ ^[0-9]+$ ]] || (( batch_size < 1 )); then
     echo "batch_size must be a positive integer, got: ${batch_size}" >&2
     exit 2
@@ -265,13 +277,61 @@ require_bool() {
 }
 
 for bool_name in \
-    fake_thinking \
+    debugging \
+    fake_thinking; do
+    require_bool "${bool_name}"
+done
+
+# Internal diagnostics/env defaults derived from the single debugging switch.
+torch_logs=""
+python_faulthandler="0"
+triton_debug="0"
+torch_show_cpp_stacktraces="0"
+torch_disable_addr2line="0"
+torch_cpp_log_level=""
+torch_distributed_debug=""
+torchinductor_nan_asserts="0"
+torchinductor_runtime_triton_nan_asserts="0"
+nccl_debug="WARN"
+nccl_debug_subsys=""
+nccl_debug_file=""
+torch_nccl_async_error_handling="1"
+torch_nccl_enable_monitoring="1"
+torch_nccl_heartbeat_timeout_sec="600"
+torch_nccl_wait_timeout_dump_milsec="120000"
+torch_nccl_log_cpp_stack_on_unclean_shutdown="0"
+torch_nccl_flight_recorder="0"
+torch_nccl_trace_buffer_size="8192"
+torch_nccl_trace_cpp_stack="0"
+torch_nccl_desync_debug="0"
+torch_nccl_enable_timing="0"
+torch_nccl_nan_check="0"
+
+if [[ "${debugging}" == "1" ]]; then
+    torch_logs="+inductor,recompiles,graph_breaks"
+    python_faulthandler="1"
+    triton_debug="1"
+    torch_show_cpp_stacktraces="1"
+    torch_disable_addr2line="1"
+    torch_cpp_log_level="INFO"
+    torch_distributed_debug="DETAIL"
+    torchinductor_nan_asserts="1"
+    torchinductor_runtime_triton_nan_asserts="1"
+    torch_nccl_log_cpp_stack_on_unclean_shutdown="1"
+    torch_nccl_flight_recorder="1"
+    torch_nccl_trace_cpp_stack="1"
+    torch_nccl_desync_debug="1"
+    torch_nccl_enable_timing="1"
+    torch_nccl_nan_check="1"
+fi
+
+for bool_name in \
     python_faulthandler \
     triton_debug \
     torch_show_cpp_stacktraces \
-    torch_nccl_async_error_handling \
-    torch_nccl_enable_monitoring \
-    torch_nccl_log_cpp_stack_on_unclean_shutdown \
+    torch_disable_addr2line \
+    torchinductor_nan_asserts \
+    torchinductor_runtime_triton_nan_asserts \
     torch_nccl_flight_recorder \
     torch_nccl_trace_cpp_stack \
     torch_nccl_desync_debug \
@@ -373,16 +433,20 @@ echo "  Final HF:      ${final_hf_dir}"
 echo "Parallelism:"
 echo "  GPUs:          ${ngpu}"
 echo "  CP degree:     ${context_parallel_degree}"
+echo "  DP replicate:  ${data_parallel_replicate_degree}"
+echo "  DP shard:      ${data_parallel_shard_degree} (effective ${effective_data_parallel_shard_degree})"
 echo "  Batch groups:  ${batch_parallel_degree}"
 echo "Bucketing:"
 echo "  ViT patches:   ${vit_patch_bucket_size} (0 disables)"
 echo "  Inductor dir:  ${torchinductor_cache_dir:-<torch default>}"
 echo "  TORCH_LOGS:    ${torch_logs:-<unset>}"
 echo "Diagnostics:"
+echo "  Debugging:     ${debugging}"
 echo "  Terminal log:  ${terminal_log_file:-<unset>}"
 echo "  Python faults: ${python_faulthandler}"
 echo "  Triton debug:  ${triton_debug}"
 echo "  C++ stacks:    ${torch_show_cpp_stacktraces}"
+echo "  NaN asserts:   ${torchinductor_nan_asserts}/${torchinductor_runtime_triton_nan_asserts}"
 echo "  addr2line:     $([[ "${torch_disable_addr2line}" == "1" ]] && echo disabled || echo enabled)"
 echo "  FlexAttn log:  ${flex_attention_log_file:-<unset>}"
 echo "  NCCL debug:    ${nccl_debug:-<unset>}"
@@ -531,8 +595,12 @@ if [[ -n "${torchinductor_cache_dir}" ]]; then
     train_env+=("TORCHINDUCTOR_CACHE_DIR=${torchinductor_cache_dir}")
 fi
 train_env+=("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0")
-train_env+=("TORCHINDUCTOR_NAN_ASSERTS=1")
-train_env+=("TORCHINDUCTOR_RUNTIME_TRITON_NAN_ASSERTS=1")
+if [[ "${torchinductor_nan_asserts}" == "1" ]]; then
+    train_env+=("TORCHINDUCTOR_NAN_ASSERTS=1")
+fi
+if [[ "${torchinductor_runtime_triton_nan_asserts}" == "1" ]]; then
+    train_env+=("TORCHINDUCTOR_RUNTIME_TRITON_NAN_ASSERTS=1")
+fi
 if [[ "${triton_debug}" == "1" ]]; then
     train_env+=("TRITON_DEBUG=1")
 fi
