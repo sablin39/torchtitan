@@ -141,10 +141,12 @@ class WandBLogger(BaseLogger):
         sync_swanlab: bool = False,
         swanlab_wandb_run: bool = True,
     ):
+        self.swanlab = None
         if sync_swanlab:
             # Import swanlab before wandb.init so it can install its WandB sync hook.
             import swanlab
 
+            self.swanlab = swanlab
             swanlab.sync_wandb(wandb_run=swanlab_wandb_run)
             logger.info("SwanLab WandB sync enabled")
 
@@ -181,7 +183,11 @@ class WandBLogger(BaseLogger):
         self.wandb.log(wandb_metrics, step=step)
 
     def close(self) -> None:
+        if self.swanlab is not None:
+            logger.info("Finishing SwanLab run.")
+            self.swanlab.finish(async_log_timeout=30)
         if self.wandb.run is not None:
+            logger.info("Finishing WandB run.")
             self.wandb.finish()
 
 
