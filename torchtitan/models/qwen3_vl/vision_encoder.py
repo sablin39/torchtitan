@@ -518,6 +518,13 @@ class VisionAttention(Module):
             "USE_TMA": True,
             "ROWS_GUARANTEED_SAFE": False,
             "IS_DIVISIBLE": True,
+            # H800 ViT FlexAttention autotune favored this forward config for
+            # the observed RWKV-VL patch buckets. Keep it forward-scoped so a
+            # future unfrozen ViT backward path can tune independently.
+            "fwd_BLOCK_M": 64,
+            "fwd_BLOCK_N": 64,
+            "fwd_num_stages": 3,
+            "fwd_num_warps": 4,
         }
         self.flex_attention = FlexAttention.Config(
             kernel_options=vision_kernel_options
