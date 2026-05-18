@@ -69,7 +69,8 @@ class MemoryProfiler:
             curr_snapshot_dir, f"rank{self._rank}_memory_snapshot.pickle"
         )
         with open(output_file, "wb") as output:
-            pickle.dump(device_module.memory._snapshot(), output)
+            # Protocol 4 for compatibility with pytorch.org/memory_viz JS parser
+            pickle.dump(device_module.memory._snapshot(), output, protocol=4)
         logger.info(
             f"Finished dumping memory snapshot in {time.monotonic() - begin:.2f} seconds"
         )
