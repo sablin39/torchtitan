@@ -25,7 +25,7 @@ DEFAULT_IMAGE_PLACEHOLDER_TOKEN = "<image>"
 
 CHAT_TEMPLATE = (
     "{% for message in messages %}"
-    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ':' }}"
+    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
     "{% if message['content'] is string %}"
     "{{ message['content'] }}"
     "{% else %}"
@@ -34,6 +34,7 @@ CHAT_TEMPLATE = (
     "{% endfor %}"
     "{% endif %}"
     "{{ '\\x17' }}"
+    "{% if not loop.last or add_generation_prompt %}{{ '\\n\\n' }}{% endif %}"
     "{% endfor %}"
     "{% if add_generation_prompt %}"
     "{{ '\\x16Assistant:' }}"
@@ -43,8 +44,8 @@ CHAT_TEMPLATE = (
 
 CHAT_TEMPLATE_FAKE_THINKING = (
     "{% for message in messages %}"
-    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ':' }}"
-    "{% if message['role'] == 'assistant' %}{{ ' <think>\\n</think>\\n' }}{% endif %}"
+    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
+    "{% if message['role'] == 'assistant' %}{{ '<think>\\n</think>\\n ' }}{% endif %}"
     "{% if message['content'] is string %}"
     "{{ message['content'] }}"
     "{% else %}"
@@ -53,6 +54,7 @@ CHAT_TEMPLATE_FAKE_THINKING = (
     "{% endfor %}"
     "{% endif %}"
     "{{ '\\x17' }}"
+    "{% if not loop.last or add_generation_prompt %}{{ '\\n\\n' }}{% endif %}"
     "{% endfor %}"
     "{% if add_generation_prompt %}"
     "{{ '\\x16Assistant:' }}"

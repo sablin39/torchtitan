@@ -38,7 +38,7 @@ from scripts.rwkv7_exporter.export_hf_model import (
 
 CHAT_TEMPLATE = (
     "{% for message in messages %}"
-    "{{ '\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ':' }}"
+    "{{ '\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
     "{% if message['content'] is string %}"
     "{{ message['content'] }}"
     "{% else %}"
@@ -47,8 +47,12 @@ CHAT_TEMPLATE = (
     "{% endfor %}"
     "{% endif %}"
     "{{ '\x17' }}"
+    "{% if not loop.last or add_generation_prompt %}{{ '\n\n' }}{% endif %}"
     "{% endfor %}"
-    "{% if add_generation_prompt %}{{ '\x16Assistant:' }}{% endif %}"
+    "{% if add_generation_prompt %}"
+    "{{ '\x16Assistant:' }}"
+    "{% if thinking is defined and thinking %}{{ ' <think>' }}{% endif %}"
+    "{% endif %}"
 )
 
 
@@ -186,6 +190,38 @@ class TestRwkvVLTokenizer(unittest.TestCase):
         exporter_dir = repo_root / "scripts" / "rwkv7_exporter"
         self.assertFalse((exporter_dir / "processor_core.py").exists())
         self.assertFalse((exporter_dir / "tokenizer_core.py").exists())
+
+    def test_chat_template_spacing_and_thinking_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            messages = [{"role": "user", "content": "problem"}]
+
+            prompt = tok.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                thinking=True,
+            )
+            self.assertEqual(
+                prompt.replace("\x16", "").replace("\x17", ""),
+                "User: problem\n\nAssistant: <think>",
+            )
+
+            no_thinking_prompt = tok.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+            )
+            self.assertTrue(no_thinking_prompt.endswith("\x16Assistant:"))
+            self.assertFalse(no_thinking_prompt.endswith("\x16Assistant: "))
+
+            full = tok.apply_chat_template(
+                [
+                    {"role": "user", "content": "problem"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                add_generation_prompt=False,
+            )
+            self.assertIn("\x17\n\n\x16Assistant: answer\x17", full)
+            self.assertTrue(full.startswith(no_thinking_prompt))
 
     def test_torchtitan_and_hf_exporter_tokenizers_align(self):
         with tempfile.TemporaryDirectory() as tmpdir:
