@@ -1,5 +1,10 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import argparse
-from contextlib import contextmanager, nullcontext
 import importlib
 import json
 import os
@@ -7,9 +12,10 @@ import re
 import shutil
 import sys
 import tempfile
+import uuid
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-import uuid
 
 import torch
 from safetensors import safe_open
@@ -34,11 +40,16 @@ try:
 except ImportError:
     from configuration_rwkv7 import RWKV7Config
     from modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
-from torchtitan.models.rwkv7.tokenizer_core import CHAT_TEMPLATE_FAKE_THINKING
+from torchtitan.models.rwkv7.tokenizer_core import (
+    CHAT_TEMPLATE_FAKE_THINKING,
+    DEFAULT_BOS_TOKEN,
+    DEFAULT_EOS_TOKEN,
+    DEFAULT_IMAGE_TOKEN_ID,
+    DEFAULT_VISION_END_TOKEN_ID,
+    DEFAULT_VISION_START_TOKEN_ID,
+)
 
 
-IM_START_TOKEN = "\x16"
-IM_END_TOKEN = "\x17"
 IM_START_TOKEN_ID = 23
 IM_END_TOKEN_ID = 24
 DEFAULT_MAX_SHARD_SIZE = "1000GB"
@@ -60,7 +71,12 @@ VISION_KEY_HINTS = (
 def resolve_dtype(precision: str, sample_dtype: torch.dtype) -> tuple[str, torch.dtype]:
     normalized = precision.lower()
     if normalized in {"auto", "same", "source"}:
-        if sample_dtype in {torch.bfloat16, torch.float16, torch.float32, torch.float64}:
+        if sample_dtype in {
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+            torch.float64,
+        }:
             return str(sample_dtype).split(".")[-1], sample_dtype
         return "float32", torch.float32
     if normalized in {"bf16", "bfloat16"}:
@@ -108,23 +124,11 @@ def save_tokenizer_core(output: str) -> None:
 
 
 def save_processor_core(output: str) -> None:
-    candidates = [
-        Path(__file__).parents[2]
-        / "torchtitan"
-        / "hf_datasets"
-        / "multimodal"
-        / "processor_core.py",
-    ]
-    try:
-        import torchtitan.hf_datasets.multimodal.processor_core as processor_core
-    except ImportError:
-        pass
-    else:
-        candidates.append(Path(processor_core.__file__))
-    source = next((candidate for candidate in candidates if candidate.is_file()), None)
-    if source is None:
-        formatted = "\n".join(f"  - {candidate}" for candidate in candidates)
-        raise FileNotFoundError(f"Could not find processor_core.py. Checked:\n{formatted}")
+    import torchtitan.hf_datasets.multimodal.processor_core as processor_core
+
+    source = Path(processor_core.__file__)
+    if not source.is_file():
+        raise FileNotFoundError(f"Could not find processor_core.py at {source}")
     output_path = Path(output)
     output_path.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, output_path / "processor_core.py")
@@ -184,10 +188,7 @@ def _remote_code_package(*, include_processor: bool = False):
 
 
 def torch_load_weights(path: str) -> dict[str, torch.Tensor]:
-    try:
-        weights = torch.load(path, weights_only=True, map_location="cpu", mmap=True)
-    except TypeError:
-        weights = torch.load(path, weights_only=True, map_location="cpu")
+    weights = torch.load(path, weights_only=True, map_location="cpu", mmap=True)
     if isinstance(weights, dict) and "state_dict" in weights:
         state_dict = weights["state_dict"]
         if isinstance(state_dict, dict):
@@ -309,11 +310,14 @@ def translate_into_hf(
     transposed = False
     if re.fullmatch(r"[wvag][012]", name_parts[3]):
         typ, num = name_parts[3]
-        name_parts[3] = f"{typ}_lora.lora." + {
-            "0": "2.bias",
-            "1": "0.weight",
-            "2": "2.weight",
-        }[num]
+        name_parts[3] = (
+            f"{typ}_lora.lora."
+            + {
+                "0": "2.bias",
+                "1": "0.weight",
+                "2": "2.weight",
+            }[num]
+        )
         transposed = num in {"1", "2"}
     elif name_parts[2] == "attn" and name_parts[3] in proj:
         name_parts[3] = proj[name_parts[3]]
@@ -366,7 +370,9 @@ def build_converted_state_dict(
 
     missing_required = sorted(pending_names - possible_absent_weights)
     if missing_required:
-        raise KeyError(f"Missing required parameters after conversion: {missing_required}")
+        raise KeyError(
+            f"Missing required parameters after conversion: {missing_required}"
+        )
 
     return converted
 
@@ -427,22 +433,6 @@ def _torch_weight_files(path: Path) -> list[Path]:
         files = sorted(set(index.get("weight_map", {}).values()))
         return [path / file for file in files]
     return sorted(path.glob("pytorch_model*.bin"))
-
-
-def _ensure_qwen3_vl_vision_config(vision_config) -> Qwen3VLVisionConfig:
-    if isinstance(vision_config, Qwen3VLVisionConfig):
-        return vision_config
-    if not isinstance(vision_config, dict) and hasattr(vision_config, "to_dict"):
-        vision_config = vision_config.to_dict()
-    if isinstance(vision_config, dict):
-        model_type = vision_config.get("model_type")
-        if model_type not in {None, Qwen3VLVisionConfig.model_type}:
-            raise TypeError(
-                "Expected a Qwen3-VL vision config; "
-                f"got model_type={model_type!r}."
-            )
-        return Qwen3VLVisionConfig(**vision_config)
-    raise TypeError(f"Unsupported vision config type: {type(vision_config)!r}.")
 
 
 def _to_qwen3_vl_vision_config(vision_config) -> Qwen3VLVisionConfig:
@@ -506,16 +496,15 @@ def _extract_visual_module(model: torch.nn.Module) -> torch.nn.Module:
     )
 
 
-def _load_hf_vision_source_model(vision_model: str, dtype: torch.dtype) -> torch.nn.Module:
-    kwargs = {
-        "trust_remote_code": True,
-        "dtype": dtype,
-        "low_cpu_mem_usage": True,
-    }
-    try:
-        return AutoModelForImageTextToText.from_pretrained(vision_model, **kwargs)
-    except (ValueError, TypeError):
-        return AutoModel.from_pretrained(vision_model, **kwargs)
+def _load_hf_vision_source_model(
+    vision_model: str, dtype: torch.dtype
+) -> torch.nn.Module:
+    return AutoModelForImageTextToText.from_pretrained(
+        vision_model,
+        trust_remote_code=True,
+        dtype=dtype,
+        low_cpu_mem_usage=True,
+    )
 
 
 def load_qwen_vision_package(
@@ -554,7 +543,9 @@ def load_qwen3_vl_vision_state_dict(
                     continue
                 if normalized in state_dict:
                     continue
-                state_dict[normalized] = handle.get_tensor(key).to(dtype=dtype).contiguous()
+                state_dict[normalized] = (
+                    handle.get_tensor(key).to(dtype=dtype).contiguous()
+                )
 
     if state_dict:
         return state_dict
@@ -625,7 +616,9 @@ def build_projector_state_dict(
     except ImportError:
         from modeling_modrwkv import VisualAdapter
 
-    rng_context = torch.random.fork_rng(devices=[]) if seed is not None else nullcontext()
+    rng_context = (
+        torch.random.fork_rng(devices=[]) if seed is not None else nullcontext()
+    )
     with rng_context:
         if seed is not None:
             torch.manual_seed(seed)
@@ -663,9 +656,9 @@ def build_multimodal_config(
         text_config=text_config,
         vision_config=vision_config,
         projector_config=projector_config,
-        image_token_id=65532,
-        vision_start_token_id=65530,
-        vision_end_token_id=65531,
+        image_token_id=DEFAULT_IMAGE_TOKEN_ID,
+        vision_start_token_id=DEFAULT_VISION_START_TOKEN_ID,
+        vision_end_token_id=DEFAULT_VISION_END_TOKEN_ID,
         tie_word_embeddings=False,
     )
     config.architectures = ["RWKV7VLForConditionalGeneration"]
@@ -729,7 +722,9 @@ def save_multimodal_processor(
         save_processor_core(output)
 
 
-def verify_text_export(output: str, *, dtype: torch.dtype, verify_model_load: bool) -> None:
+def verify_text_export(
+    output: str, *, dtype: torch.dtype, verify_model_load: bool
+) -> None:
     print("Verifying AutoConfig / AutoTokenizer loading...")
     loaded_config = AutoConfig.from_pretrained(output, trust_remote_code=True)
     loaded_tokenizer = AutoTokenizer.from_pretrained(output, trust_remote_code=True)
@@ -758,10 +753,7 @@ def verify_text_export(output: str, *, dtype: torch.dtype, verify_model_load: bo
         add_generation_prompt=True,
         return_tensors="pt",
     )
-    if hasattr(sample_batch, "keys"):
-        prompt_shape = tuple(sample_batch["input_ids"].shape)
-    else:
-        prompt_shape = tuple(sample_batch.shape)
+    prompt_shape = tuple(sample_batch["input_ids"].shape)
     del loaded_config, loaded_model
     print("Rendered chat_template preview:")
     print(rendered_prompt)
@@ -803,11 +795,15 @@ def convert(
     output = os.path.realpath(output)
     text_weights = extract_text_weights(torch_load_weights(rwkv7))
 
-    precision_name, dtype = resolve_dtype(precision, next(iter(text_weights.values())).dtype)
+    precision_name, dtype = resolve_dtype(
+        precision, next(iter(text_weights.values())).dtype
+    )
     config = build_config(
         text_weights,
         precision=precision_name,
-        max_position_embeddings=infer_max_position_embeddings(rwkv7, max_position_embeddings),
+        max_position_embeddings=infer_max_position_embeddings(
+            rwkv7, max_position_embeddings
+        ),
     )
     print(f"Creating text-only RWKV7 HF model with config:\n{config}")
 
@@ -816,9 +812,13 @@ def convert(
 
     model = build_model(config)
     converted_state = build_converted_state_dict(text_weights, model, dtype)
-    missing, unexpected = model.load_state_dict(converted_state, strict=True, assign=True)
+    missing, unexpected = model.load_state_dict(
+        converted_state, strict=True, assign=True
+    )
     if missing or unexpected:
-        raise RuntimeError(f"Unexpected load_state_dict result: missing={missing}, unexpected={unexpected}")
+        raise RuntimeError(
+            f"Unexpected load_state_dict result: missing={missing}, unexpected={unexpected}"
+        )
 
     os.makedirs(output, exist_ok=True)
     model.save_pretrained(
@@ -830,10 +830,10 @@ def convert(
     with _remote_code_package() as remote_code:
         tokenizer = remote_code.RwkvTokenizer(
             vocab_file=str(resolve_vocab_file("wr_vocab_v20230424.txt")),
-            bos_token=IM_START_TOKEN,
-            eos_token=IM_END_TOKEN,
-            pad_token=IM_END_TOKEN,
-            unk_token=IM_START_TOKEN,
+            bos_token=DEFAULT_BOS_TOKEN,
+            eos_token=DEFAULT_EOS_TOKEN,
+            pad_token=DEFAULT_EOS_TOKEN,
+            unk_token=DEFAULT_BOS_TOKEN,
             chat_template=CHAT_TEMPLATE_FAKE_THINKING if fake_thinking else None,
         )
         tokenizer.register_for_auto_class()
@@ -861,12 +861,16 @@ def convert_multimodal(
 ) -> None:
     output = os.path.realpath(output)
     text_weights = extract_text_weights(torch_load_weights(rwkv7))
-    precision_name, dtype = resolve_dtype(precision, next(iter(text_weights.values())).dtype)
+    precision_name, dtype = resolve_dtype(
+        precision, next(iter(text_weights.values())).dtype
+    )
 
     text_config = build_config(
         text_weights,
         precision=precision_name,
-        max_position_embeddings=infer_max_position_embeddings(rwkv7, max_position_embeddings),
+        max_position_embeddings=infer_max_position_embeddings(
+            rwkv7, max_position_embeddings
+        ),
     )
     vision_config, vision_state = load_qwen_vision_package(vision_model, dtype=dtype)
     config = build_multimodal_config(
@@ -881,7 +885,9 @@ def convert_multimodal(
         build_converted_state_dict(text_weights, text_model, dtype)
     )
 
-    vision_state = {"model.encoder." + key: value for key, value in vision_state.items()}
+    vision_state = {
+        "model.encoder." + key: value for key, value in vision_state.items()
+    }
 
     projector_state = build_projector_state_dict(
         encoder_dim=vision_config.out_hidden_size,
@@ -925,60 +931,73 @@ def convert_multimodal(
     )
     print(f"Export completed successfully: {output}")
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Convert RWKV7 .pth checkpoints to HF format.')
-    parser.add_argument('--rwkv7', type=str, required=True, help='Path to the input RWKV .pth checkpoint.')
-    parser.add_argument('--output', type=str, required=True, help='Directory to save the exported model.')
-    parser.add_argument('--precision', type=str, default='bfloat16')
-    parser.add_argument('--max-position-embeddings', type=int, default=None)
-    parser.add_argument('--max-shard-size', type=str, default=DEFAULT_MAX_SHARD_SIZE)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Convert RWKV7 .pth checkpoints to HF format."
+    )
     parser.add_argument(
-        '--multimodal',
-        action='store_true',
+        "--rwkv7",
+        type=str,
+        required=True,
+        help="Path to the input RWKV .pth checkpoint.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help="Directory to save the exported model.",
+    )
+    parser.add_argument("--precision", type=str, default="bfloat16")
+    parser.add_argument("--max-position-embeddings", type=int, default=None)
+    parser.add_argument("--max-shard-size", type=str, default=DEFAULT_MAX_SHARD_SIZE)
+    parser.add_argument(
+        "--multimodal",
+        action="store_true",
         help=(
-            'Export an RWKV-VL checkpoint by combining RWKV text weights with '
-            'Qwen3-VL-compatible vision weights.'
+            "Export an RWKV-VL checkpoint by combining RWKV text weights with "
+            "Qwen3-VL-compatible vision weights."
         ),
     )
     parser.add_argument(
-        '--vision-model',
+        "--vision-model",
         type=str,
         default=None,
-        help='HF-compatible Qwen3-VL model or vision-encoder path used when --multimodal is set.',
+        help="HF-compatible Qwen3-VL model or vision-encoder path used when --multimodal is set.",
     )
     parser.add_argument(
-        '--image-processor',
+        "--image-processor",
         type=str,
         default=None,
-        help='Optional image processor source. Defaults to --vision-model for multimodal exports.',
+        help="Optional image processor source. Defaults to --vision-model for multimodal exports.",
     )
     parser.add_argument(
-        '--projector-hidden-dim',
+        "--projector-hidden-dim",
         type=int,
         default=None,
-        help='Optional hidden dimension for the freshly initialized visual adapter.',
+        help="Optional hidden dimension for the freshly initialized visual adapter.",
     )
     parser.add_argument(
-        '--projector-seed',
+        "--projector-seed",
         type=int,
         default=None,
-        help='Optional RNG seed for reproducible fresh visual adapter initialization.',
+        help="Optional RNG seed for reproducible fresh visual adapter initialization.",
     )
     parser.add_argument(
-        '--max-pixels',
+        "--max-pixels",
         type=int,
         default=None,
-        help='Optional max spatial pixel budget used to cap the saved image processor longest_edge.',
+        help="Optional max spatial pixel budget used to cap the saved image processor longest_edge.",
     )
     parser.add_argument(
-        '--verify-model-load',
-        action='store_true',
-        help='After saving, load the full exported model through AutoModel. This can require substantial RAM.',
+        "--verify-model-load",
+        action="store_true",
+        help="After saving, load the full exported model through AutoModel. This can require substantial RAM.",
     )
     parser.add_argument(
-        '--fake-thinking',
-        action='store_true',
-        help='Save a chat template that prefixes every assistant message with an empty <think> block.',
+        "--fake-thinking",
+        action="store_true",
+        help="Save a chat template that prefixes every assistant message with an empty <think> block.",
     )
     args = parser.parse_args()
 

@@ -9,7 +9,6 @@
 import numpy as np
 import torch
 
-# pyrefly: ignore [missing-import]
 import torchvision.transforms.v2.functional as TVF
 
 from torchtitan.tools.logging import logger
@@ -39,7 +38,7 @@ def load_video(
         or None if loading fails.
     """
     try:
-        import av  # pyrefly: ignore [missing-import]
+        import av
 
         with av.open(path) as container:
             stream = container.streams.video[0]

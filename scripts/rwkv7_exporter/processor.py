@@ -1,23 +1,46 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import copy
 
 import torch
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 from transformers.feature_extraction_utils import BatchFeature
-from transformers.processing_utils import MultiModalData, ProcessingKwargs, ProcessorMixin, Unpack
+from transformers.processing_utils import (
+    MultiModalData,
+    ProcessingKwargs,
+    ProcessorMixin,
+    Unpack,
+)
 
 try:
     from .processor_core import (
+        append_missing_image_tags,
         CHAT_TEMPLATE,
         CHAT_TEMPLATE_FAKE_THINKING,
+        flatten_images,
+        get_images_per_text_sample,
         make_image_config_from_processor,
+        normalize_image_tags,
         process_images,
+        strip_excess_image_tags,
+        validate_image_token_alignment,
     )
 except ImportError:
-    from processor_core import (  # type: ignore[no-redef]
+    from torchtitan.hf_datasets.multimodal.processor_core import (
+        append_missing_image_tags,
         CHAT_TEMPLATE,
         CHAT_TEMPLATE_FAKE_THINKING,
+        flatten_images,
+        get_images_per_text_sample,
         make_image_config_from_processor,
+        normalize_image_tags,
         process_images,
+        strip_excess_image_tags,
+        validate_image_token_alignment,
     )
 
 
@@ -53,11 +76,17 @@ class ModRWKVProcessor(ProcessorMixin):
         self.auto_insert_image_tags = auto_insert_image_tags
         self.total_pixels_budget = total_pixels_budget
         self.image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
-        self.vision_start_token = getattr(tokenizer, "vision_start_token", "<|vision_start|>")
+        self.vision_start_token = getattr(
+            tokenizer, "vision_start_token", "<|vision_start|>"
+        )
         self.vision_end_token = getattr(tokenizer, "vision_end_token", "<|vision_end|>")
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
-        self.vision_start_token_id = self.tokenizer.convert_tokens_to_ids(self.vision_start_token)
-        self.vision_end_token_id = self.tokenizer.convert_tokens_to_ids(self.vision_end_token)
+        self.vision_start_token_id = self.tokenizer.convert_tokens_to_ids(
+            self.vision_start_token
+        )
+        self.vision_end_token_id = self.tokenizer.convert_tokens_to_ids(
+            self.vision_end_token
+        )
         self.vision_image_token = (
             f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
         )
@@ -66,7 +95,7 @@ class ModRWKVProcessor(ProcessorMixin):
         output = {}
         if self.image_processor is not None:
             output["image_processor"] = self.image_processor.to_dict()
-        if getattr(self, "auto_map", None) is not None:
+        if self.auto_map is not None:
             output["auto_map"] = copy.deepcopy(self.auto_map)
         output["processor_class"] = self.__class__.__name__
         if not self.auto_insert_image_tags:
@@ -74,42 +103,10 @@ class ModRWKVProcessor(ProcessorMixin):
         output["total_pixels_budget"] = self.total_pixels_budget
         return output
 
-    def _flatten_images(self, images):
-        if images is None:
-            return []
-        if not isinstance(images, (list, tuple)):
-            return [images]
-
-        flat_images = []
-        for item in images:
-            if isinstance(item, (list, tuple)):
-                flat_images.extend(self._flatten_images(item))
-            else:
-                flat_images.append(item)
-        return flat_images
-
-    def _get_num_images_per_text_sample(self, images, batch_size):
-        if images is None:
-            return [0] * batch_size
-        if batch_size == 1:
-            return [len(self._flatten_images(images))]
-        if isinstance(images, (list, tuple)) and len(images) == batch_size:
-            return [len(self._flatten_images(sample_images)) for sample_images in images]
-        return None
-
-    def _get_images_per_text_sample(self, images, batch_size):
-        if images is None:
-            return [[] for _ in range(batch_size)]
-        if batch_size == 1:
-            return [self._flatten_images(images)]
-        if isinstance(images, (list, tuple)) and len(images) == batch_size:
-            return [self._flatten_images(sample_images) for sample_images in images]
-        return None
-
     def _process_images(self, images, batch_size, images_kwargs):
-        image_groups = self._get_images_per_text_sample(images, batch_size)
+        image_groups = get_images_per_text_sample(images, batch_size)
         if image_groups is None:
-            image_groups = [self._flatten_images(images)]
+            image_groups = [flatten_images(images)]
             num_images_per_sample = None
         else:
             num_images_per_sample = [len(group) for group in image_groups]
@@ -118,7 +115,9 @@ class ModRWKVProcessor(ProcessorMixin):
             self.image_processor,
             **images_kwargs,
         )
-        processed_groups = [process_images(group, image_config) for group in image_groups]
+        processed_groups = [
+            process_images(group, image_config) for group in image_groups
+        ]
         num_image_tokens = [
             count
             for processed in processed_groups
@@ -153,34 +152,22 @@ class ModRWKVProcessor(ProcessorMixin):
             num_images_per_sample,
         )
 
-    def _normalize_image_tags(self, text):
-        return text.replace(self.user_image_tag, self.vision_image_token)
-
-    def _strip_excess_image_tags(self, text, num_allowed):
-        tag = self.user_image_tag
-        count = text.count(tag)
-        if count <= num_allowed:
-            return text
-        parts = text.split(tag)
-        kept = tag.join(parts[: num_allowed + 1])
-        rest = "".join(parts[num_allowed + 1 :])
-        return kept + rest
-
-    def _append_missing_image_tags(self, text, num_missing_images):
-        if num_missing_images <= 0:
-            return text
-        return text + self.vision_image_token * num_missing_images
-
     def _get_num_multimodal_tokens(self, image_grid_thw=None, **kwargs):
         vision_data = {}
         if image_grid_thw is not None:
             processor_defaults = getattr(self.image_processor, "_defaults", {})
             images_kwargs = dict(processor_defaults.get("images_kwargs", {}))
             images_kwargs.update(kwargs)
-            merge_size = images_kwargs.get("merge_size", None) or self.image_processor.merge_size
+            merge_size = (
+                images_kwargs.get("merge_size", None) or self.image_processor.merge_size
+            )
 
-            num_image_patches = [int(grid[0] * grid[1] * grid[2]) for grid in image_grid_thw]
-            num_image_tokens = [num_patches // merge_size**2 for num_patches in num_image_patches]
+            num_image_patches = [
+                int(grid[0] * grid[1] * grid[2]) for grid in image_grid_thw
+            ]
+            num_image_tokens = [
+                num_patches // merge_size**2 for num_patches in num_image_patches
+            ]
             vision_data.update(
                 {
                     "num_image_tokens": num_image_tokens,
@@ -189,27 +176,9 @@ class ModRWKVProcessor(ProcessorMixin):
             )
         return MultiModalData(**vision_data)
 
-    def _count_token_occurrences(self, input_ids, token_id):
-        return [sum(1 for token in sample_ids if token == token_id) for sample_ids in input_ids]
-
-    def _validate_image_token_alignment(self, text_inputs, expected_image_tokens, expected_num_images):
-        input_ids = text_inputs["input_ids"]
-        actual_image_tokens = self._count_token_occurrences(input_ids, self.image_token_id)
-        actual_vision_starts = self._count_token_occurrences(input_ids, self.vision_start_token_id)
-        actual_vision_ends = self._count_token_occurrences(input_ids, self.vision_end_token_id)
-
-        if actual_image_tokens != expected_image_tokens:
-            raise ValueError(
-                "Image token count does not match image_grid_thw-derived token count: "
-                f"expected {expected_image_tokens}, got {actual_image_tokens}."
-            )
-        if actual_vision_starts != expected_num_images or actual_vision_ends != expected_num_images:
-            raise ValueError(
-                "Vision boundary token count does not match the number of image placeholders: "
-                f"expected {expected_num_images}, got starts={actual_vision_starts}, ends={actual_vision_ends}."
-            )
-
-    def __call__(self, images=None, text=None, **kwargs: Unpack[ModRWKVProcessorKwargs]):
+    def __call__(
+        self, images=None, text=None, **kwargs: Unpack[ModRWKVProcessorKwargs]
+    ):
         output_kwargs = self._merge_kwargs(
             ModRWKVProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
@@ -250,12 +219,24 @@ class ModRWKVProcessor(ProcessorMixin):
                     text[i] = text[i].replace(self.user_image_tag, " ")
                 else:
                     if num_images_per_sample is not None:
-                        text[i] = self._strip_excess_image_tags(text[i], num_images_per_sample[i])
-                    text[i] = self._normalize_image_tags(text[i])
+                        text[i] = strip_excess_image_tags(
+                            text[i],
+                            user_image_tag=self.user_image_tag,
+                            num_allowed=num_images_per_sample[i],
+                        )
+                    text[i] = normalize_image_tags(
+                        text[i],
+                        user_image_tag=self.user_image_tag,
+                        vision_image_token=self.vision_image_token,
+                    )
 
                 if self.auto_insert_image_tags and num_images_per_sample is not None:
                     missing = num_images_per_sample[i] - text[i].count(self.image_token)
-                    text[i] = self._append_missing_image_tags(text[i], missing)
+                    text[i] = append_missing_image_tags(
+                        text[i],
+                        vision_image_token=self.vision_image_token,
+                        num_missing_images=missing,
+                    )
 
                 if self.auto_insert_image_tags:
                     placeholder_count = text[i].count(self.vision_image_token)
@@ -301,13 +282,18 @@ class ModRWKVProcessor(ProcessorMixin):
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
         text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
         if image_grid_thw is not None:
-            self._validate_image_token_alignment(
-                text_inputs,
-                expected_image_tokens,
-                expected_num_images,
+            validate_image_token_alignment(
+                text_inputs["input_ids"],
+                expected_image_tokens=expected_image_tokens,
+                expected_num_images=expected_num_images,
+                image_token_id=self.image_token_id,
+                vision_start_token_id=self.vision_start_token_id,
+                vision_end_token_id=self.vision_end_token_id,
             )
         self._check_special_mm_tokens(text, text_inputs, modalities=["image"])
-        return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
+        return BatchFeature(
+            data={**text_inputs, **image_inputs}, tensor_type=return_tensors
+        )
 
     def apply_chat_template(self, conversation, chat_template=None, **kwargs):
         kwargs.setdefault("return_dict", True)

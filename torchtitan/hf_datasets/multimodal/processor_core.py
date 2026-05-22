@@ -26,10 +26,8 @@ import einops as E
 import requests
 import torch
 
-# pyrefly: ignore [missing-import]
 import torchvision.io
 
-# pyrefly: ignore [missing-import]
 import torchvision.transforms.v2.functional as TVF
 
 from PIL import Image
@@ -119,6 +117,112 @@ class RWKVVLProcessedImages:
     image_token_counts: list[int]
     grid_thw: torch.Tensor
     flat_patches: torch.Tensor
+
+
+def flatten_images(images: Any) -> list[Any]:
+    if images is None:
+        return []
+    if not isinstance(images, (list, tuple)):
+        return [images]
+
+    flat_images = []
+    for item in images:
+        if isinstance(item, (list, tuple)):
+            flat_images.extend(flatten_images(item))
+        else:
+            flat_images.append(item)
+    return flat_images
+
+
+def get_images_per_text_sample(
+    images: Any,
+    batch_size: int,
+) -> list[list[Any]] | None:
+    if images is None:
+        return [[] for _ in range(batch_size)]
+    if batch_size == 1:
+        return [flatten_images(images)]
+    if isinstance(images, (list, tuple)) and len(images) == batch_size:
+        return [flatten_images(sample_images) for sample_images in images]
+    return None
+
+
+def get_num_images_per_text_sample(
+    images: Any,
+    batch_size: int,
+) -> list[int] | None:
+    image_groups = get_images_per_text_sample(images, batch_size)
+    if image_groups is None:
+        return None
+    return [len(group) for group in image_groups]
+
+
+def normalize_image_tags(
+    text: str,
+    *,
+    user_image_tag: str,
+    vision_image_token: str,
+) -> str:
+    return text.replace(user_image_tag, vision_image_token)
+
+
+def strip_excess_image_tags(
+    text: str,
+    *,
+    user_image_tag: str,
+    num_allowed: int,
+) -> str:
+    count = text.count(user_image_tag)
+    if count <= num_allowed:
+        return text
+    parts = text.split(user_image_tag)
+    kept = user_image_tag.join(parts[: num_allowed + 1])
+    rest = "".join(parts[num_allowed + 1 :])
+    return kept + rest
+
+
+def append_missing_image_tags(
+    text: str,
+    *,
+    vision_image_token: str,
+    num_missing_images: int,
+) -> str:
+    if num_missing_images <= 0:
+        return text
+    return text + vision_image_token * num_missing_images
+
+
+def count_token_occurrences(
+    input_ids: list[list[int]],
+    token_id: int,
+) -> list[int]:
+    return [sum(1 for token in sample_ids if token == token_id) for sample_ids in input_ids]
+
+
+def validate_image_token_alignment(
+    input_ids: list[list[int]],
+    *,
+    expected_image_tokens: list[int],
+    expected_num_images: list[int],
+    image_token_id: int,
+    vision_start_token_id: int,
+    vision_end_token_id: int,
+) -> None:
+    actual_image_tokens = count_token_occurrences(input_ids, image_token_id)
+    actual_vision_starts = count_token_occurrences(input_ids, vision_start_token_id)
+    actual_vision_ends = count_token_occurrences(input_ids, vision_end_token_id)
+
+    if actual_image_tokens != expected_image_tokens:
+        raise ValueError(
+            "Image token count does not match image_grid_thw-derived token count: "
+            f"expected {expected_image_tokens}, got {actual_image_tokens}."
+        )
+    if actual_vision_starts != expected_num_images or actual_vision_ends != expected_num_images:
+        raise ValueError(
+            "Vision boundary token count does not match the number of image placeholders: "
+            f"expected {expected_num_images}, got starts={actual_vision_starts}, "
+            f"ends={actual_vision_ends}."
+        )
 
 
 def _decode_image(image: str | bytes | Image.Image) -> torch.Tensor:

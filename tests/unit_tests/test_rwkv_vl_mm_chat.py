@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import importlib
 import os
 from pathlib import Path
 import shutil
@@ -144,21 +145,33 @@ def _make_mm_chat_dataset(
 def _load_exported_remote_code(tmpdir: str):
     export_dir = Path(tmpdir) / "remote"
     export_dir.mkdir()
+    (export_dir / "__init__.py").write_text("", encoding="utf-8")
     exporter_dir = Path(__file__).parents[2] / "scripts" / "rwkv7_exporter"
     shutil.copyfile(exporter_dir / "tokenizer.py", export_dir / "tokenizer.py")
     shutil.copyfile(exporter_dir / "processor.py", export_dir / "processor.py")
     save_tokenizer_core(str(export_dir))
     save_processor_core(str(export_dir))
-    sys.path.insert(0, str(export_dir))
+    package_name = export_dir.name
+    module_names = (
+        package_name,
+        f"{package_name}.tokenizer",
+        f"{package_name}.tokenizer_core",
+        f"{package_name}.processor",
+        f"{package_name}.processor_core",
+    )
+    sys.path.insert(0, str(export_dir.parent))
     try:
-        for module_name in ("tokenizer", "tokenizer_core", "processor", "processor_core"):
+        for module_name in module_names:
             sys.modules.pop(module_name, None)
-        from processor import ModRWKVProcessor
-        from tokenizer import RwkvTokenizer
-
-        return RwkvTokenizer, ModRWKVProcessor
+        tokenizer_module = importlib.import_module(f"{package_name}.tokenizer")
+        processor_module = importlib.import_module(f"{package_name}.processor")
+        tokenizer_core_module = importlib.import_module(f"{package_name}.tokenizer_core")
+        processor_core_module = importlib.import_module(f"{package_name}.processor_core")
+        assert tokenizer_module.RWKVTokenizerCore is tokenizer_core_module.RWKVTokenizerCore
+        assert processor_module.process_images is processor_core_module.process_images
+        return tokenizer_module.RwkvTokenizer, processor_module.ModRWKVProcessor
     finally:
-        sys.path.remove(str(export_dir))
+        sys.path.remove(str(export_dir.parent))
 
 
 def _contains_tensor(value) -> bool:
@@ -190,6 +203,18 @@ class TestRwkvVLTokenizer(unittest.TestCase):
         exporter_dir = repo_root / "scripts" / "rwkv7_exporter"
         self.assertFalse((exporter_dir / "processor_core.py").exists())
         self.assertFalse((exporter_dir / "tokenizer_core.py").exists())
+
+    def test_source_exporter_wrappers_use_live_cores(self):
+        import scripts.rwkv7_exporter.processor as exporter_processor
+        import scripts.rwkv7_exporter.tokenizer as exporter_tokenizer
+        import torchtitan.hf_datasets.multimodal.processor_core as processor_core
+        import torchtitan.models.rwkv7.tokenizer_core as tokenizer_core
+
+        self.assertIs(
+            exporter_tokenizer.RWKVTokenizerCore,
+            tokenizer_core.RWKVTokenizerCore,
+        )
+        self.assertIs(exporter_processor.process_images, processor_core.process_images)
 
     def test_chat_template_spacing_and_thinking_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -823,10 +848,12 @@ class TestQwen3VLVisionBucketing(unittest.TestCase):
             deepstack_visual_indices=[0],
         ).build()
         encoder.to(device)
+        encoder.init_states(buffer_device=device)
         encoder.train()
 
         grid_thw = torch.tensor([[1, 2, 2], [1, 2, 4]], device=device)
         patch_dim = 3 * 2 * 16 * 16
+        num_patch = grid_thw.prod(-1).to(torch.long)
         real_patches = int(grid_thw.prod(-1).sum().item())
         bucket_patches = 128
         pixels = torch.randn(real_patches, patch_dim, device=device)
@@ -856,7 +883,41 @@ class TestQwen3VLVisionBucketing(unittest.TestCase):
                 },
             )
 
-        unbucketed = run_once(pixels)
+        def run_padded_reference(pixel_values: torch.Tensor):
+            encoder.zero_grad(set_to_none=True)
+            padded = pixel_values.new_zeros((grid_thw.shape[0], bucket_patches, patch_dim))
+            offset = 0
+            for item_idx, patches in enumerate(num_patch.tolist()):
+                padded[item_idx, :patches] = pixel_values[offset : offset + patches]
+                offset += patches
+            padded = padded.detach().clone().requires_grad_(True)
+            merged, deepstack = encoder(padded, grid_thw=grid_thw)
+            valid_merged = []
+            valid_deepstack = [[] for _ in deepstack]
+            for item_idx, patches in enumerate(num_patch.tolist()):
+                valid_tokens = patches // encoder.spatial_merge_unit
+                valid_merged.append(merged[item_idx, :valid_tokens])
+                for layer_idx, feature in enumerate(deepstack):
+                    valid_deepstack[layer_idx].append(feature[item_idx, :valid_tokens])
+            loss = torch.cat(valid_merged, dim=0).float().square().mean()
+            for chunks in valid_deepstack:
+                loss = loss + torch.cat(chunks, dim=0).float().square().mean()
+            loss.backward()
+            valid_grad = []
+            for item_idx, patches in enumerate(num_patch.tolist()):
+                valid_grad.append(padded.grad[item_idx, :patches])
+            params = dict(encoder.named_parameters())
+            return (
+                torch.cat(valid_merged, dim=0).detach(),
+                [torch.cat(chunks, dim=0).detach() for chunks in valid_deepstack],
+                torch.cat(valid_grad, dim=0).detach(),
+                {
+                    name: params[name].grad.detach().clone()
+                    for name in param_names
+                },
+            )
+
+        unbucketed = run_padded_reference(pixels)
         padded_pixels = torch.cat(
             [
                 pixels,

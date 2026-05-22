@@ -28,7 +28,7 @@ torchrun_cmd="torchrun"
 # WandB logging uses TorchTitan's built-in logger. Configure it with normal
 # environment variables if needed:
 #   export WANDB_PROJECT=torchtitan
-#   export WANDB_RUN_NAME=rwkv-vl-train
+#   export WANDB_RUN_NAME=rwkv-vl-train  # defaults to ${train_config}_${timestamp}
 #   export WANDB_MODE=offline  # optional, for offline/local logging
 # Set swanlab="1" below to call swanlab.sync_wandb() before wandb.init().
 #
@@ -117,8 +117,9 @@ proj_lr="1e-4"
 llm_lr="1e-5"
 lm_head_lr=""
 projector_seed="1234"
-activation_checkpoint_mode="full"
-# Currently only "full" and "none" are supported. "selective" will fail due to `token_shift_cp`
+activation_checkpoint_mode="selective"
+# RWKV-VL selective activation checkpointing is usable with CP on and off when
+# using BF16 model construction, compile, and normal FSDP.
 log_freq="1"
 wandb="0"
 swanlab="1"
@@ -166,6 +167,9 @@ pytorch_cuda_alloc_conf="expandable_segments:True"
 max_position_embeddings=""
 max_shard_size="1000GB"
 output_root="${repo_root}/outputs/rwkv_vl_train_${timestamp}"
+tracking_run_name="${train_config}_${timestamp}"
+wandb_run_name="${WANDB_RUN_NAME:-${tracking_run_name}}"
+swanlab_run_name="${SWANLAB_EXP_NAME:-${SWANLAB_EXPERIMENT_NAME:-${wandb_run_name}}}"
 
 train_extra_args=(
     # Add extra torchtitan.train args here, for example:
@@ -430,6 +434,9 @@ echo "  HF export:     ${hf_dir}"
 echo "  DCP export:    ${dcp_dir}"
 echo "  Train dump:    ${train_dump_dir}"
 echo "  Final HF:      ${final_hf_dir}"
+echo "Tracking:"
+echo "  W&B name:      ${wandb_run_name}"
+echo "  SwanLab name:  ${swanlab_run_name}"
 echo "Parallelism:"
 echo "  GPUs:          ${ngpu}"
 echo "  CP degree:     ${context_parallel_degree}"
@@ -581,6 +588,9 @@ train_env=(
     "TORCH_NCCL_NAN_CHECK=${torch_nccl_nan_check}"
     "TORCH_FR_CPP_STACK=${torch_nccl_trace_cpp_stack}"
     "TORCH_NCCL_DESYNC_DEBUG=${torch_nccl_desync_debug}"
+    "WANDB_RUN_NAME=${wandb_run_name}"
+    "SWANLAB_EXP_NAME=${swanlab_run_name}"
+    "SWANLAB_EXPERIMENT_NAME=${swanlab_run_name}"
 )
 if [[ "${python_faulthandler}" == "1" ]]; then
     train_env+=("PYTHONFAULTHANDLER=1")

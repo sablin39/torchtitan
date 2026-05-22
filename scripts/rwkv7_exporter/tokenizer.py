@@ -2,7 +2,7 @@
 """HF remote-code tokenizer wrapper for RWKV/RWKV-VL exports."""
 
 import os
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from transformers import AddedToken, PreTrainedTokenizer
 from transformers.utils import logging
@@ -18,7 +18,7 @@ try:
         RWKVTokenizerCore,
     )
 except ImportError:
-    from tokenizer_core import (  # type: ignore[no-redef]
+    from torchtitan.models.rwkv7.tokenizer_core import (
         CHAT_TEMPLATE,
         CHAT_TEMPLATE_FAKE_THINKING,
         DEFAULT_IMAGE_TOKEN,
@@ -28,9 +28,6 @@ except ImportError:
         RWKVTokenizerCore,
     )
 
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.get_logger(__name__)
 
