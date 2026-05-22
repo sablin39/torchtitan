@@ -101,6 +101,7 @@ def _merge_heads(x: torch.Tensor) -> torch.Tensor:
     batch, seq_len, n_heads, head_dim = x.shape
     return x.reshape(batch, seq_len, n_heads * head_dim)
 
+
 # TODO: Remove after FLA gate_output_correction handles >64K-token slices.
 _GATE_OUTPUT_CORRECTION_MAX_TOKENS = 65_536
 
@@ -170,6 +171,7 @@ def _require_fla_ops() -> _FLAOps:
     if _fla_ops is None:
         _fla_ops = _FLAOps()
     return _fla_ops
+
 
 # TODO: Replace this wrapper once FLA exposes a varlen token_shift autograd API.
 class _VarlenTokenShift(torch.autograd.Function):
@@ -429,7 +431,10 @@ class RWKV7TimeMix(Module):
             / self.hidden_size
         ).view(1, 1, -1)
         zigzag = (
-            (torch.arange(self.hidden_size, device=device, dtype=torch.float32) % self.head_dim)
+            (
+                torch.arange(self.hidden_size, device=device, dtype=torch.float32)
+                % self.head_dim
+            )
             - ((self.head_dim - 1) / 2)
         ) / ((self.head_dim - 1) / 2)
         zigzag = zigzag * zigzag.abs()
@@ -578,7 +583,9 @@ class RWKV7ChannelMix(Module):
 
     def _init_self_parameters(self) -> None:
         ratio_1_to_almost0 = 1.0 - (self.layer_idx / self.num_hidden_layers)
-        ddd = torch.arange(self.hidden_size, device=self.x_k.device, dtype=torch.float32)
+        ddd = torch.arange(
+            self.hidden_size, device=self.x_k.device, dtype=torch.float32
+        )
         ddd = ddd / self.hidden_size
         with torch.no_grad():
             _copy_tensor_(
@@ -747,31 +754,6 @@ class RWKV7Backbone(Module):
             elementwise_affine=True,
             bias=config.norm_bias,
         )
-        self.register_load_state_dict_pre_hook(
-            self._remap_legacy_layer0_pre_norm_state_dict
-        )
-
-    def _remap_legacy_layer0_pre_norm_state_dict(
-        self,
-        module: Module,
-        state_dict: dict[str, torch.Tensor],
-        prefix: str,
-        local_metadata: dict[str, Any],
-        strict: bool,
-        missing_keys: list[str],
-        unexpected_keys: list[str],
-        error_msgs: list[str],
-    ) -> None:
-        del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        for name in ("weight", "bias"):
-            new_key = f"{prefix}pre_norm.{name}"
-            old_key = f"{prefix}layers.0.pre_norm.{name}"
-            if old_key not in state_dict:
-                continue
-            target = getattr(self.pre_norm, name, None)
-            if target is not None and new_key not in state_dict:
-                state_dict[new_key] = state_dict[old_key]
-            del state_dict[old_key]
 
     def forward_embeddings(
         self,
@@ -779,18 +761,12 @@ class RWKV7Backbone(Module):
         *,
         cp_context: Any | None = None,
         cu_seqlens: torch.Tensor | None = None,
+        after_layer: Callable[[int, torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         hidden_states = self.pre_norm(hidden_states)
         v_first = hidden_states.new_zeros(
             *hidden_states.shape[:-1],
             self.layers["0"].attn.value_dim,
-        )
-        v_first.requires_grad_(
-            torch.is_grad_enabled()
-            and (
-                hidden_states.requires_grad
-                or self.layers["0"].attn.v_proj.weight.requires_grad
-            )
         )
         for layer_idx, layer in self.layers.items():
             hidden_states, layer_v = layer(
@@ -799,22 +775,12 @@ class RWKV7Backbone(Module):
                 cp_context=cp_context,
                 cu_seqlens=cu_seqlens,
             )
-            if layer_idx == "0":
+            idx = int(layer_idx)
+            if idx == 0:
                 v_first = layer_v
+            if after_layer is not None:
+                hidden_states = after_layer(idx, hidden_states)
         return self.norm(hidden_states)
-
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        *,
-        cp_context: Any | None = None,
-        cu_seqlens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.forward_embeddings(
-            self.embeddings(tokens),
-            cp_context=cp_context,
-            cu_seqlens=cu_seqlens,
-        )
 
 
 class RWKV7ForCausalLM(BaseModel):
@@ -834,9 +800,13 @@ class RWKV7ForCausalLM(BaseModel):
             compile_config = getattr(trainer_config, "compile", None)
 
             if parallelism.tensor_parallel_degree > 1:
-                raise NotImplementedError("RWKV7 v1 does not support tensor parallelism")
+                raise NotImplementedError(
+                    "RWKV7 v1 does not support tensor parallelism"
+                )
             if parallelism.pipeline_parallel_degree > 1:
-                raise NotImplementedError("RWKV7 v1 does not support pipeline parallelism")
+                raise NotImplementedError(
+                    "RWKV7 v1 does not support pipeline parallelism"
+                )
 
             if parallelism.context_parallel_degree > 1:
                 if parallelism.context_parallel_load_balancer is not None:
@@ -910,8 +880,14 @@ class RWKV7ForCausalLM(BaseModel):
         **kwargs,
     ) -> torch.Tensor:
         cp_context = self._build_cp_context(cu_seqlens_global, cu_seqlens_global_cpu)
-        cu_seqlens = cu_seqlens_global if cp_context is None and tokens.shape[0] == 1 else None
-        hidden_states = self.llm(tokens, cp_context=cp_context, cu_seqlens=cu_seqlens)
+        cu_seqlens = (
+            cu_seqlens_global if cp_context is None and tokens.shape[0] == 1 else None
+        )
+        hidden_states = self.llm.forward_embeddings(
+            self.llm.embeddings(tokens),
+            cp_context=cp_context,
+            cu_seqlens=cu_seqlens,
+        )
         if self._skip_lm_head:
             return hidden_states
         return self.lm_head(hidden_states)
@@ -936,7 +912,9 @@ def rwkv7_backbone_config(
     chunk_size: int = 64,
     skip_embedding_init: bool = False,
 ) -> RWKV7Backbone.Config:
-    embedding_init = {"weight": skip_param_init if skip_embedding_init else _embedding_init}
+    embedding_init = {
+        "weight": skip_param_init if skip_embedding_init else _embedding_init
+    }
     return RWKV7Backbone.Config(
         vocab_size=vocab_size,
         hidden_size=hidden_size,

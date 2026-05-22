@@ -9,20 +9,20 @@ import tempfile
 import unittest
 
 import torch
+import torchtitan.models.rwkv_vl.config_registry as rwkv_vl_config_registry
+import torchtitan.models.rwkv_vl.parallelize as rwkv_vl_parallelize
+from torchtitan.config.manager import ConfigManager
 
 from torchtitan.distributed.context_parallel import _build_flattened_cu_seqlens
-from torchtitan.config.manager import ConfigManager
 from torchtitan.models.rwkv7 import model_registry as rwkv7_model_registry
 from torchtitan.models.rwkv7.model import _token_shift_varlen_eager
 from torchtitan.models.rwkv7.state_dict_adapter import RWKV7StateDictAdapter
 from torchtitan.models.rwkv7.tokenizer import RwkvTokenizer
-import torchtitan.models.rwkv_vl.config_registry as rwkv_vl_config_registry
 from torchtitan.models.rwkv_vl import (
     model_registry as rwkv_vl_model_registry,
     rwkv_vl_configs,
 )
 from torchtitan.models.rwkv_vl.model import VisualAdapter
-import torchtitan.models.rwkv_vl.parallelize as rwkv_vl_parallelize
 from torchtitan.models.rwkv_vl.state_dict_adapter import RWKVVLStateDictAdapter
 from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
 
@@ -71,26 +71,6 @@ class TestRWKV7Backend(unittest.TestCase):
             model.llm.layers["0"].attn.value_dim,
         )
         self.assertEqual(tuple(v_first.shape), (2, 3, 256))
-
-    def test_rwkv7_backbone_loads_legacy_layer0_pre_norm_key(self):
-        spec = rwkv7_model_registry("debugmodel")
-        model = spec.model.build()
-        old_weight = torch.full_like(model.llm.pre_norm.weight, 2.0)
-        old_bias = torch.full_like(model.llm.pre_norm.bias, 3.0)
-
-        missing, unexpected = model.load_state_dict(
-            {
-                "llm.layers.0.pre_norm.weight": old_weight,
-                "llm.layers.0.pre_norm.bias": old_bias,
-            },
-            strict=False,
-        )
-
-        self.assertNotIn("llm.pre_norm.weight", missing)
-        self.assertNotIn("llm.pre_norm.bias", missing)
-        self.assertNotIn("llm.layers.0.pre_norm.weight", unexpected)
-        self.assertTrue(torch.equal(model.llm.pre_norm.weight, old_weight))
-        self.assertTrue(torch.equal(model.llm.pre_norm.bias, old_bias))
 
     def test_rwkv7_varlen_token_shift_matches_reference_and_grad(self):
         def ref_token_shift(
@@ -251,8 +231,7 @@ class TestRWKV7Backend(unittest.TestCase):
 
         cfg.model_spec.model.update_from_config(trainer_config=cfg)
         groups = {
-            group.pattern: group.lr_multiplier
-            for group in cfg.optimizer.param_groups
+            group.pattern: group.lr_multiplier for group in cfg.optimizer.param_groups
         }
         self.assertNotIn(r"^vision_encoder\.", groups)
         self.assertEqual(groups[r"^proj\."], 10.0)
@@ -461,7 +440,9 @@ class TestRWKVTokenizer(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             _write_tiny_rwkv_vocab(os.path.join(tmpdir, "wr_vocab_v20230424.txt"))
             tok = RwkvVLMultiModalTokenizer(tokenizer_path=tmpdir)
-            self.assertEqual(tok.TOKEN_FIELDS, ("image", "vision_start", "vision_end", "pad"))
+            self.assertEqual(
+                tok.TOKEN_FIELDS, ("image", "vision_start", "vision_end", "pad")
+            )
             self.assertFalse(hasattr(tok, "video_id"))
             self.assertEqual(tok.pad_id, 24)
 
