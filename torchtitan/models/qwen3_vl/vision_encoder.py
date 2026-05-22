@@ -58,6 +58,91 @@ def get_flat_vision_block_mask_mod(patch_to_item: torch.Tensor):
     return mask_mod
 
 
+def _group_grid_by_hw(grid_thw: torch.Tensor) -> dict[tuple[int, int], list[int]]:
+    hw_to_indices: dict[tuple[int, int], list[int]] = {}
+    for i in range(grid_thw.shape[0]):
+        h, w = int(grid_thw[i, 1].item()), int(grid_thw[i, 2].item())
+        hw_to_indices.setdefault((h, w), []).append(i)
+    return hw_to_indices
+
+
+def _learned_pos_hw_block(
+    learned_pos_embed: torch.Tensor,
+    *,
+    h: int,
+    w: int,
+    num_grid_per_side: int,
+    spatial_merge_size: int,
+    dim: int,
+) -> torch.Tensor:
+    pos_grid = (
+        learned_pos_embed.reshape(num_grid_per_side, num_grid_per_side, -1)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .float()
+    )
+    pos_hw = F.interpolate(
+        pos_grid,
+        size=(h, w),
+        mode="bilinear",
+        align_corners=True,
+    )
+    pos_hw = pos_hw.squeeze(0).permute(1, 2, 0).reshape(-1, dim)
+    return (
+        pos_hw.view(
+            h // spatial_merge_size,
+            spatial_merge_size,
+            w // spatial_merge_size,
+            spatial_merge_size,
+            -1,
+        )
+        .permute(0, 2, 1, 3, 4)
+        .flatten(0, 3)
+        .to(learned_pos_embed.dtype)
+    )
+
+
+def _rope_2d_for_hw(
+    freq_table: torch.Tensor,
+    *,
+    h: int,
+    w: int,
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    device = freq_table.device
+    merge_size = spatial_merge_size
+    merged_h, merged_w = h // merge_size, w // merge_size
+    row_base = torch.arange(merged_h, device=device) * merge_size
+    col_base = torch.arange(merged_w, device=device) * merge_size
+    intra_row = torch.arange(merge_size, device=device)
+    intra_col = torch.arange(merge_size, device=device)
+
+    row_idx = (
+        (row_base[:, None, None, None] + intra_row[None, None, :, None])
+        .expand(merged_h, merged_w, merge_size, merge_size)
+        .reshape(-1)
+    )
+    col_idx = (
+        (col_base[None, :, None, None] + intra_col[None, None, None, :])
+        .expand(merged_h, merged_w, merge_size, merge_size)
+        .reshape(-1)
+    )
+    return torch.cat([freq_table[row_idx], freq_table[col_idx]], dim=-1)
+
+
+def _rope_cache_from_embeds(
+    rope_embeds: torch.Tensor,
+    *,
+    flat: bool,
+    head_dim: int,
+) -> torch.Tensor:
+    rope_embeds = torch.cat((rope_embeds, rope_embeds), dim=-1)
+    rope_cache = torch.cat([rope_embeds.cos(), rope_embeds.sin()], dim=-1)
+    if flat:
+        return rope_cache.view(1, rope_embeds.shape[0], 1, head_dim * 2)
+    return rope_cache.unsqueeze(2)
+
+
 def _compute_learned_pos_embeds(
     learned_pos_embed: torch.Tensor,
     grid_thw: torch.Tensor,
@@ -93,42 +178,15 @@ def _compute_learned_pos_embeds(
     merge_size = spatial_merge_size
 
     pos_embeds = torch.zeros(num_vision, max_num_patch, dim, device=device, dtype=dtype)
-
-    # Group images by (h, w) to batch compute position embeddings
-    hw_to_indices: dict[tuple[int, int], list[int]] = {}
-    for i in range(num_vision):
-        h, w = int(grid_thw[i, 1].item()), int(grid_thw[i, 2].item())
-        key = (h, w)
-        if key not in hw_to_indices:
-            hw_to_indices[key] = []
-        hw_to_indices[key].append(i)
-
-    # Reshape pos_embed to 2D grid for F.interpolate:
-    # (num_position_embeddings, dim) → (1, dim, grid_side, grid_side)
-    pos_grid = (
-        learned_pos_embed.reshape(num_grid_per_side, num_grid_per_side, -1)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .float()
-    )
-
-    for (h, w), indices in hw_to_indices.items():
-        pos_hw = F.interpolate(
-            pos_grid,
-            size=(h, w),
-            mode="bilinear",
-            align_corners=True,
+    for (h, w), indices in _group_grid_by_hw(grid_thw).items():
+        pos_hw_block = _learned_pos_hw_block(
+            learned_pos_embed,
+            h=h,
+            w=w,
+            num_grid_per_side=num_grid_per_side,
+            spatial_merge_size=merge_size,
+            dim=dim,
         )
-        # (1, dim, h, w) → (h*w, dim)
-        pos_hw = pos_hw.squeeze(0).permute(1, 2, 0).reshape(-1, dim).to(dtype)
-
-        # Permute learned pos_hw from raster order to block order
-        # to match the patch sequence produced by image_to_patches
-        pos_hw_block = (
-            pos_hw.view(h // merge_size, merge_size, w // merge_size, merge_size, -1)
-            .permute(0, 2, 1, 3, 4)
-            .flatten(0, 3)
-        )  # (h*w, dim)
 
         # Apply to all images with this (h, w)
         # For videos (t > 1), repeat spatial embeddings per frame;
@@ -136,10 +194,9 @@ def _compute_learned_pos_embeds(
         for i in indices:
             t = int(grid_thw[i, 0].item())
             seq_len = t * h * w
-            if t > 1:
-                pos_embeds[i, :seq_len] = pos_hw_block.repeat(t, 1)
-            else:
-                pos_embeds[i, :seq_len] = pos_hw_block
+            pos_embeds[i, :seq_len] = (
+                pos_hw_block.repeat(t, 1) if t > 1 else pos_hw_block
+            )
 
     return pos_embeds
 
@@ -158,39 +215,21 @@ def _compute_learned_pos_embeds_flat(
     merge_size = spatial_merge_size
     pos_embeds = torch.zeros(total_num_patch, dim, device=device, dtype=dtype)
 
-    hw_to_indices: dict[tuple[int, int], list[int]] = {}
-    for i in range(grid_thw.shape[0]):
-        h, w = int(grid_thw[i, 1].item()), int(grid_thw[i, 2].item())
-        key = (h, w)
-        if key not in hw_to_indices:
-            hw_to_indices[key] = []
-        hw_to_indices[key].append(i)
-
-    pos_grid = (
-        learned_pos_embed.reshape(num_grid_per_side, num_grid_per_side, -1)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .float()
-    )
     patch_offsets = torch.cat(
         [
-            torch.zeros(1, dtype=torch.long, device=device),
+            torch.zeros(1, dtype=torch.long, device=grid_thw.device),
             grid_thw.prod(-1).to(torch.long).cumsum(0),
         ]
     )
 
-    for (h, w), indices in hw_to_indices.items():
-        pos_hw = F.interpolate(
-            pos_grid,
-            size=(h, w),
-            mode="bilinear",
-            align_corners=True,
-        )
-        pos_hw = pos_hw.squeeze(0).permute(1, 2, 0).reshape(-1, dim).to(dtype)
-        pos_hw_block = (
-            pos_hw.view(h // merge_size, merge_size, w // merge_size, merge_size, -1)
-            .permute(0, 2, 1, 3, 4)
-            .flatten(0, 3)
+    for (h, w), indices in _group_grid_by_hw(grid_thw).items():
+        pos_hw_block = _learned_pos_hw_block(
+            learned_pos_embed,
+            h=h,
+            w=w,
+            num_grid_per_side=num_grid_per_side,
+            spatial_merge_size=merge_size,
+            dim=dim,
         )
 
         for i in indices:
@@ -236,51 +275,13 @@ def _compute_2d_rope_cache(
         num_vision, max_num_patch, head_dim // 2, device=device, dtype=torch.float32
     )
 
-    # Group images by (h, w) to batch compute RoPE embeddings
-    hw_to_indices: dict[tuple[int, int], list[int]] = {}
-    for i in range(num_vision):
-        h, w = int(grid_thw[i, 1].item()), int(grid_thw[i, 2].item())
-        key = (h, w)
-        if key not in hw_to_indices:
-            hw_to_indices[key] = []
-        hw_to_indices[key].append(i)
-
-    for (h, w), indices in hw_to_indices.items():
-        # Compute RoPE position ids in block order (once per unique h, w)
-        # A "block" is a merge_size x merge_size group of patches that will
-        # be merged into one LLM visual token. RoPE indices must follow
-        # block order to match the patch layout from image_to_patches
-        merged_h, merged_w = h // merge_size, w // merge_size
-        row_base = (
-            torch.arange(merged_h, device=device) * merge_size
-        )  # starting row of each block
-        col_base = (
-            torch.arange(merged_w, device=device) * merge_size
-        )  # starting col of each block
-        intra_row = torch.arange(merge_size, device=device)
-        intra_col = torch.arange(merge_size, device=device)
-
-        # Build row and col indices in block order
-        # The 4 dimensions represent: [block_row, block_col, intra_row, intra_col]
-        # e.g., for merge_size=2 on a 4x4 patch grid (2x2 blocks):
-        #   row_idx = [0,0,1,1, 0,0,1,1, 2,2,3,3, 2,2,3,3]
-        #   col_idx = [0,1,0,1, 2,3,2,3, 0,1,0,1, 2,3,2,3]
-        row_idx = (
-            (row_base[:, None, None, None] + intra_row[None, None, :, None])
-            .expand(merged_h, merged_w, merge_size, merge_size)
-            .reshape(-1)
+    for (h, w), indices in _group_grid_by_hw(grid_thw).items():
+        rope_2d = _rope_2d_for_hw(
+            freq_table,
+            h=h,
+            w=w,
+            spatial_merge_size=merge_size,
         )
-        col_idx = (
-            (col_base[None, :, None, None] + intra_col[None, None, None, :])
-            .expand(merged_h, merged_w, merge_size, merge_size)
-            .reshape(-1)
-        )
-
-        # 2D RoPE: row and col each get separate frequency sets, concatenated
-        # (not interleaved). freq_table shape: (max_hw, head_dim//4)
-        rope_row = freq_table[row_idx]  # (h*w, head_dim//4)
-        rope_col = freq_table[col_idx]  # (h*w, head_dim//4)
-        rope_2d = torch.cat([rope_row, rope_col], dim=-1)  # (h*w, head_dim//2)
 
         # Apply to all images with this (h, w)
         # For videos (t > 1), repeat spatial embeddings per frame;
@@ -288,18 +289,10 @@ def _compute_2d_rope_cache(
         for i in indices:
             t = int(grid_thw[i, 0].item())
             seq_len = t * h * w
-            if t > 1:
-                rope_embeds[i, :seq_len] = rope_2d.repeat(t, 1)
-            else:
-                rope_embeds[i, :seq_len] = rope_2d
+            rope_embeds[i, :seq_len] = rope_2d.repeat(t, 1) if t > 1 else rope_2d
 
     # Compute cos/sin in model dtype (HF uses .float() here)
-    rope_embeds = torch.cat((rope_embeds, rope_embeds), dim=-1)  # (N, L, head_dim)
-    rope_cache = torch.cat([rope_embeds.cos(), rope_embeds.sin()], dim=-1).unsqueeze(
-        2
-    )  # (N, L, 1, head_dim*2)
-
-    return rope_cache
+    return _rope_cache_from_embeds(rope_embeds, flat=False, head_dim=head_dim)
 
 
 def _compute_2d_rope_cache_flat(
@@ -309,7 +302,6 @@ def _compute_2d_rope_cache_flat(
     head_dim: int,
 ) -> torch.Tensor:
     """Compute 2D RoPE cache for flat concatenated visual patches."""
-    device = grid_thw.device
     merge_size = spatial_merge_size
     rope_chunks = []
 
@@ -319,36 +311,17 @@ def _compute_2d_rope_cache_flat(
         h, w = int(grid_thw[i, 1].item()), int(grid_thw[i, 2].item())
         key = (h, w)
         if key not in hw_cache:
-            merged_h, merged_w = h // merge_size, w // merge_size
-            row_base = torch.arange(merged_h, device=device) * merge_size
-            col_base = torch.arange(merged_w, device=device) * merge_size
-            intra_row = torch.arange(merge_size, device=device)
-            intra_col = torch.arange(merge_size, device=device)
-
-            row_idx = (
-                (row_base[:, None, None, None] + intra_row[None, None, :, None])
-                .expand(merged_h, merged_w, merge_size, merge_size)
-                .reshape(-1)
+            hw_cache[key] = _rope_2d_for_hw(
+                freq_table,
+                h=h,
+                w=w,
+                spatial_merge_size=merge_size,
             )
-            col_idx = (
-                (col_base[None, :, None, None] + intra_col[None, None, None, :])
-                .expand(merged_h, merged_w, merge_size, merge_size)
-                .reshape(-1)
-            )
-            rope_row = freq_table[row_idx]
-            rope_col = freq_table[col_idx]
-            hw_cache[key] = torch.cat([rope_row, rope_col], dim=-1)
         rope_2d = hw_cache[key]
         rope_chunks.append(rope_2d.repeat(t, 1) if t > 1 else rope_2d)
 
     rope_embeds = torch.cat(rope_chunks, dim=0)
-    rope_embeds = torch.cat((rope_embeds, rope_embeds), dim=-1)
-    return torch.cat([rope_embeds.cos(), rope_embeds.sin()], dim=-1).view(
-        1,
-        rope_embeds.shape[0],
-        1,
-        head_dim * 2,
-    )
+    return _rope_cache_from_embeds(rope_embeds, flat=True, head_dim=head_dim)
 
 
 class PatchEmbed(Module):
@@ -715,6 +688,10 @@ class Qwen3VLVisionEncoder(Module):
         # DeepStack mergers for intermediate layers
         # DeepStack mergers use postshuffle norm (norm after spatial reshape)
         self.deepstack_visual_indices = config.deepstack_visual_indices
+        self._deepstack_index_by_layer = {
+            layer_idx: deepstack_idx
+            for deepstack_idx, layer_idx in enumerate(config.deepstack_visual_indices)
+        }
         self.deepstack_merger_list = ModuleList(
             [
                 PatchMerger(
@@ -843,6 +820,38 @@ class Qwen3VLVisionEncoder(Module):
         )
         return learned_pos, rope_cache
 
+    def _run_layers_with_deepstack(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        rope_cache: torch.Tensor,
+        attention_mask: BlockMask,
+        trim_real_len: int | None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Run transformer layers and collect DeepStack features.
+
+        ``trim_real_len`` (in *merged* tokens) is set on the flat path to strip
+        padding from each DeepStack feature and from the final merger output;
+        on the padded path it is ``None``.
+        """
+
+        def trim(x: torch.Tensor) -> torch.Tensor:
+            return x.squeeze(0)[:trim_real_len] if trim_real_len is not None else x
+
+        deepstack_features: list[torch.Tensor] = []
+        for layer_idx, layer in self.layers.items():
+            hidden_states = layer(
+                hidden_states,
+                rope_cache=rope_cache,
+                attention_mask=attention_mask,
+            )
+            idx = self._deepstack_index_by_layer.get(int(layer_idx))
+            if idx is not None:
+                deepstack_features.append(
+                    trim(self.deepstack_merger_list[idx](hidden_states))
+                )
+        return trim(self.merger(hidden_states)), deepstack_features
+
     def _forward_flat(
         self,
         pixel_values: torch.Tensor,
@@ -912,26 +921,12 @@ class Qwen3VLVisionEncoder(Module):
             total_num_patch,
             device=hidden_states.device,
         )
-        deepstack_features = []
-
-        for layer_idx, layer in self.layers.items():
-            hidden_states = layer(
-                hidden_states,
-                rope_cache=rope_cache,
-                attention_mask=attention_mask,
-            )
-            if int(layer_idx) in self.deepstack_visual_indices:
-                idx = self.deepstack_visual_indices.index(int(layer_idx))
-                deepstack_features.append(
-                    self.deepstack_merger_list[idx](hidden_states).squeeze(0)[
-                        : real_num_patch // self.spatial_merge_unit
-                    ]
-                )
-
-        merged_hidden_states = self.merger(hidden_states).squeeze(0)[
-            : real_num_patch // self.spatial_merge_unit
-        ]
-        return merged_hidden_states, deepstack_features
+        return self._run_layers_with_deepstack(
+            hidden_states,
+            rope_cache=rope_cache,
+            attention_mask=attention_mask,
+            trim_real_len=real_num_patch // self.spatial_merge_unit,
+        )
 
     def forward(
         self,
@@ -974,19 +969,9 @@ class Qwen3VLVisionEncoder(Module):
             max_num_patch,
             device=hidden_states.device,
         )
-        deepstack_features = []
-
-        for layer_idx, layer in self.layers.items():
-            hidden_states = layer(
-                hidden_states,
-                rope_cache=rope_cache,
-                attention_mask=attention_mask,
-            )
-            if int(layer_idx) in self.deepstack_visual_indices:
-                idx = self.deepstack_visual_indices.index(int(layer_idx))
-                deepstack_feature = self.deepstack_merger_list[idx](hidden_states)
-                deepstack_features.append(deepstack_feature)
-
-        merged_hidden_states = self.merger(hidden_states)
-
-        return merged_hidden_states, deepstack_features
+        return self._run_layers_with_deepstack(
+            hidden_states,
+            rope_cache=rope_cache,
+            attention_mask=attention_mask,
+            trim_real_len=None,
+        )

@@ -12,6 +12,11 @@ import torch
 from torch import nn
 
 from torchtitan.models.common.attention import AttentionMasksType, GQAttention
+from torchtitan.models.common.vision_features import (
+    _find_vision_spans,
+    _VisionSpan,
+    apply_vision_slices,
+)
 from torchtitan.models.qwen3.model import Qwen3Model
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.tools.logging import logger
@@ -328,40 +333,6 @@ class Qwen3VLModel(Qwen3Model):
 
         return torch.cat([mrope_cos, mrope_sin], dim=-1).unsqueeze(2)
 
-    def _compute_vision_positions(
-        self,
-        tokens: torch.Tensor,
-        num_tokens_per_item: torch.Tensor,
-        vision_token_id: int,
-    ) -> list[tuple[int, int, int, int]]:
-        """Compute (item_idx, sample_idx, vision_start, n_tokens) for each vision item.
-
-        Finds where each contiguous run of vision placeholder tokens starts
-        in the text sequence.
-
-        Args:
-            tokens: Token IDs (batch, seq_len)
-            num_tokens_per_item: (num_items,) actual tokens per vision item
-            vision_token_id: Placeholder token ID
-
-        Returns:
-            List of (item_idx, sample_idx, vision_start, n_tokens) tuples
-        """
-        vision_mask = tokens == vision_token_id
-        flat_mask = vision_mask.view(-1)
-        prev_mask = torch.cat(
-            [torch.zeros(1, dtype=torch.bool, device=flat_mask.device), flat_mask[:-1]]
-        )
-        region_starts = torch.where(flat_mask & ~prev_mask)[0]
-        seq_len = tokens.shape[1]
-
-        positions = []
-        for i in range(num_tokens_per_item.shape[0]):
-            start = int(region_starts[i].item())
-            n_tokens = int(num_tokens_per_item[i].item())
-            positions.append((i, start // seq_len, start % seq_len, n_tokens))
-        return positions
-
     def _get_vision_embeds(
         self,
         pixel_values: torch.Tensor,
@@ -395,70 +366,61 @@ class Qwen3VLModel(Qwen3Model):
 
         return merged_embeds, deepstack_features, num_tokens_per_item
 
-    def _scatter_vision_embeds(
+    def _apply_vision_embeds(
+        self,
+        target: torch.Tensor,
+        *,
+        features: torch.Tensor,
+        vision_positions: list[_VisionSpan],
+        num_tokens_per_item: torch.Tensor,
+        reduce: str,
+    ) -> torch.Tensor:
+        """Write or accumulate vision features into ``target`` at vision positions."""
+        flat_target = target.view(-1, target.shape[-1])
+        apply_vision_slices(
+            flat_target,
+            features,
+            vision_positions,
+            num_tokens_per_item,
+            shard_start=0,
+            shard_length=flat_target.shape[0],
+            reduce=reduce,
+        )
+        return target
+
+    def _prepare_vision_modality(
         self,
         inputs_embeds: torch.Tensor,
+        tokens: torch.Tensor,
         *,
-        merged_embeds: torch.Tensor,
-        vision_positions: list[tuple[int, int, int, int]],
-    ) -> torch.Tensor:
-        """Scatter vision embeddings into text embeddings at placeholder positions.
+        pixel_values: torch.Tensor | None,
+        grid_thw: torch.Tensor | None,
+        vision_token_id: int,
+    ) -> tuple[
+        torch.Tensor,
+        list[_VisionSpan],
+        list[torch.Tensor] | None,
+        torch.Tensor | None,
+    ]:
+        if pixel_values is None or grid_thw is None:
+            return inputs_embeds, [], None, None
 
-        Copies directly from the padded vision encoder output into the text
-        sequence.
+        merged_embeds, deepstack_features, num_tokens = self._get_vision_embeds(
+            pixel_values,
+            grid_thw=grid_thw,
+        )
+        vision_positions = _find_vision_spans(tokens, num_tokens, vision_token_id)
+        if not vision_positions:
+            return inputs_embeds, vision_positions, None, None
 
-        Args:
-            inputs_embeds: Text embeddings (batch, seq_len, dim)
-            merged_embeds: Padded vision embeddings (num_items, max_tokens, dim)
-            vision_positions: List of (item_idx, sample_idx, vision_start, n_tokens)
-
-        Returns:
-            Updated embeddings
-        """
-        feature_offset = 0
-        for item_idx, sample_idx, vision_start, n_tokens in vision_positions:
-            if merged_embeds.dim() == 2:
-                vision_slice = merged_embeds[
-                    feature_offset : feature_offset + n_tokens, :
-                ]
-                feature_offset += n_tokens
-            else:
-                vision_slice = merged_embeds[item_idx, :n_tokens, :]
-            inputs_embeds[
-                sample_idx, vision_start : vision_start + n_tokens, :
-            ] = vision_slice
-        return inputs_embeds
-
-    def _deepstack_process(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        vision_positions: list[tuple[int, int, int, int]],
-        deepstack_embeds: torch.Tensor,
-    ) -> torch.Tensor:
-        """Add vision embeddings to hidden states at vision token positions.
-
-        Args:
-            hidden_states: LLM hidden states (batch, seq_len, dim)
-            vision_positions: List of (item_idx, sample_idx, vision_start, n_tokens)
-            deepstack_embeds: Padded vision embeddings (num_items, max_tokens, dim)
-
-        Returns:
-            Updated hidden states
-        """
-        feature_offset = 0
-        for item_idx, sample_idx, vision_start, n_tokens in vision_positions:
-            if deepstack_embeds.dim() == 2:
-                vision_slice = deepstack_embeds[
-                    feature_offset : feature_offset + n_tokens, :
-                ]
-                feature_offset += n_tokens
-            else:
-                vision_slice = deepstack_embeds[item_idx, :n_tokens, :]
-            hidden_states[
-                sample_idx, vision_start : vision_start + n_tokens, :
-            ] += vision_slice
-        return hidden_states
+        inputs_embeds = self._apply_vision_embeds(
+            inputs_embeds,
+            features=merged_embeds,
+            vision_positions=vision_positions,
+            num_tokens_per_item=num_tokens,
+            reduce="set",
+        )
+        return inputs_embeds, vision_positions, deepstack_features, num_tokens
 
     def _prepare_multimodal_embeds(
         self,
@@ -471,8 +433,10 @@ class Qwen3VLModel(Qwen3Model):
         special_tokens: dict[str, int],
     ) -> tuple[
         torch.Tensor,
-        list[tuple[int, int, int, int]],
-        list[tuple[int, int, int, int]],
+        list[_VisionSpan],
+        list[_VisionSpan],
+        torch.Tensor | None,
+        torch.Tensor | None,
         list[torch.Tensor] | None,
         list[torch.Tensor] | None,
     ]:
@@ -488,58 +452,49 @@ class Qwen3VLModel(Qwen3Model):
 
         Returns:
             inputs_embeds: (batch, seq_len, dim) with vision tokens scattered in
-            image_positions: List of (item_idx, sample_idx, vision_start, n_tokens)
-            video_positions: List of (item_idx, sample_idx, vision_start, n_tokens)
+            image_positions: Image spans in flattened token order
+            video_positions: Video spans in flattened token order
+            image_num_tokens: Token counts for each image item, or None
+            video_num_tokens: Token counts for each video item, or None
             deepstack_image_features: List of (num_items, max_tokens, dim) or None
             deepstack_video_features: List of (num_items, max_tokens, dim) or None
         """
-        image_token_id = special_tokens["image_id"]
-        video_token_id = special_tokens["video_id"]
-
         inputs_embeds = (
             self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         )
 
-        # Process image inputs
-        image_positions: list[tuple[int, int, int, int]] = []
-        deepstack_image_features = None
-        if pixel_values is not None and grid_thw is not None:
-            merged_embeds, deepstack_features, num_tokens = self._get_vision_embeds(
-                pixel_values, grid_thw=grid_thw
+        modalities = (
+            ("image", pixel_values, grid_thw, special_tokens["image_id"]),
+            ("video", pixel_values_videos, grid_thw_videos, special_tokens["video_id"]),
+        )
+        results: dict[
+            str,
+            tuple[list[_VisionSpan], list[torch.Tensor] | None, torch.Tensor | None],
+        ] = {}
+        for name, pixels, grids, vision_token_id in modalities:
+            (
+                inputs_embeds,
+                positions_,
+                deepstack_features,
+                num_tokens,
+            ) = self._prepare_vision_modality(
+                inputs_embeds,
+                tokens,
+                pixel_values=pixels,
+                grid_thw=grids,
+                vision_token_id=vision_token_id,
             )
-            image_positions = self._compute_vision_positions(
-                tokens, num_tokens, image_token_id
-            )
-            if image_positions:
-                inputs_embeds = self._scatter_vision_embeds(
-                    inputs_embeds,
-                    merged_embeds=merged_embeds,
-                    vision_positions=image_positions,
-                )
-                deepstack_image_features = deepstack_features
+            results[name] = (positions_, deepstack_features, num_tokens)
 
-        # Process video inputs
-        video_positions: list[tuple[int, int, int, int]] = []
-        deepstack_video_features = None
-        if pixel_values_videos is not None and grid_thw_videos is not None:
-            merged_embeds, deepstack_features, num_tokens = self._get_vision_embeds(
-                pixel_values_videos, grid_thw=grid_thw_videos
-            )
-            video_positions = self._compute_vision_positions(
-                tokens, num_tokens, video_token_id
-            )
-            if video_positions:
-                inputs_embeds = self._scatter_vision_embeds(
-                    inputs_embeds,
-                    merged_embeds=merged_embeds,
-                    vision_positions=video_positions,
-                )
-                deepstack_video_features = deepstack_features
+        image_positions, deepstack_image_features, image_num_tokens = results["image"]
+        video_positions, deepstack_video_features, video_num_tokens = results["video"]
 
         return (
             inputs_embeds,
             image_positions,
             video_positions,
+            image_num_tokens,
+            video_num_tokens,
             deepstack_image_features,
             deepstack_video_features,
         )
@@ -576,6 +531,8 @@ class Qwen3VLModel(Qwen3Model):
             inputs_embeds,
             image_positions,
             video_positions,
+            image_num_tokens,
+            video_num_tokens,
             deepstack_image_features,
             deepstack_video_features,
         ) = self._prepare_multimodal_embeds(
@@ -603,32 +560,32 @@ class Qwen3VLModel(Qwen3Model):
 
         # Apply transformer layers with DeepStack
         hidden_states = inputs_embeds
+        deepstack_modalities = (
+            (image_positions, image_num_tokens, deepstack_image_features),
+            (video_positions, video_num_tokens, deepstack_video_features),
+        )
         for layer_idx, layer in self.layers.items():
             hidden_states = layer(hidden_states, freqs_cis, attention_masks, positions)
 
             # Apply DeepStack: add visual features to early layer hidden states
             layer_idx_int = int(layer_idx)
-            if layer_idx_int < self.num_deepstack_layers:
+            if layer_idx_int >= self.num_deepstack_layers:
+                continue
+            for positions_, num_tokens, features in deepstack_modalities:
                 if (
-                    deepstack_image_features is not None
-                    and image_positions
-                    and layer_idx_int < len(deepstack_image_features)
+                    features is None
+                    or not positions_
+                    or num_tokens is None
+                    or layer_idx_int >= len(features)
                 ):
-                    hidden_states = self._deepstack_process(
-                        hidden_states,
-                        vision_positions=image_positions,
-                        deepstack_embeds=deepstack_image_features[layer_idx_int],
-                    )
-                if (
-                    deepstack_video_features is not None
-                    and video_positions
-                    and layer_idx_int < len(deepstack_video_features)
-                ):
-                    hidden_states = self._deepstack_process(
-                        hidden_states,
-                        vision_positions=video_positions,
-                        deepstack_embeds=deepstack_video_features[layer_idx_int],
-                    )
+                    continue
+                hidden_states = self._apply_vision_embeds(
+                    hidden_states,
+                    features=features[layer_idx_int],
+                    vision_positions=positions_,
+                    num_tokens_per_item=num_tokens,
+                    reduce="add",
+                )
 
         hidden_states = (
             self.norm(hidden_states) if self.norm is not None else hidden_states

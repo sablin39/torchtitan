@@ -16,12 +16,16 @@ import torch.nn as nn
 
 from torchtitan.components.optimizer import ParamGroupConfig
 from torchtitan.models.common import Linear
+from torchtitan.models.common.vision_features import (
+    _find_vision_spans,
+    apply_vision_slices,
+)
 from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
 from torchtitan.models.rwkv7.model import (
-    LayerNorm,
-    RWKV7Backbone,
     _output_linear_init,
     _zero_,
+    LayerNorm,
+    RWKV7Backbone,
 )
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleList, Sequential
@@ -103,13 +107,11 @@ def _validate_backbone_chunk_size(chunk_size: int) -> int:
     chunk_size = int(chunk_size)
     if chunk_size < 16:
         raise ValueError(
-            "RWKV-VL backbone_chunk_size must be at least 16; "
-            f"got {chunk_size}"
+            "RWKV-VL backbone_chunk_size must be at least 16; " f"got {chunk_size}"
         )
     if chunk_size & (chunk_size - 1):
         raise ValueError(
-            "RWKV-VL backbone_chunk_size must be a power of two; "
-            f"got {chunk_size}"
+            "RWKV-VL backbone_chunk_size must be a power of two; " f"got {chunk_size}"
         )
     return chunk_size
 
@@ -257,9 +259,13 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             )
 
             if parallelism.tensor_parallel_degree > 1:
-                raise NotImplementedError("RWKV-VL v1 does not support tensor parallelism")
+                raise NotImplementedError(
+                    "RWKV-VL v1 does not support tensor parallelism"
+                )
             if parallelism.pipeline_parallel_degree > 1:
-                raise NotImplementedError("RWKV-VL v1 does not support pipeline parallelism")
+                raise NotImplementedError(
+                    "RWKV-VL v1 does not support pipeline parallelism"
+                )
             if parallelism.context_parallel_degree > 1:
                 if parallelism.context_parallel_load_balancer is not None:
                     raise ValueError(
@@ -363,29 +369,19 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         if world_size == 1:
             return pixel_values, grid_thw
 
-        local_num_patch = 0
-        if (
+        has_local = (
             pixel_values is not None
             and grid_thw is not None
             and pixel_values.dim() == 2
-        ):
-            local_num_patch = int(pixel_values.shape[0])
-
-        max_num_patch = torch.tensor(
-            local_num_patch,
-            dtype=torch.long,
-            device=device,
         )
+        local_num_patch = int(pixel_values.shape[0]) if has_local else 0
+
+        max_num_patch = torch.tensor(local_num_patch, dtype=torch.long, device=device)
         dist.all_reduce(max_num_patch, op=dist.ReduceOp.MAX, group=group)
         target_num_patch = int(max_num_patch.item())
         if target_num_patch == 0 or target_num_patch == local_num_patch:
             return pixel_values, grid_thw
-        if (
-            pixel_values is None
-            or grid_thw is None
-            or pixel_values.dim() != 2
-            or local_num_patch == 0
-        ):
+        if not has_local:
             return pixel_values, grid_thw
         if target_num_patch < local_num_patch:
             raise RuntimeError(
@@ -409,7 +405,9 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         *,
         grid_thw: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
-        pixel_values = pixel_values.to(self.vision_encoder.patch_embed.proj.weight.dtype)
+        pixel_values = pixel_values.to(
+            self.vision_encoder.patch_embed.proj.weight.dtype
+        )
         merged_embeds, deepstack_features = self.vision_encoder(
             pixel_values,
             grid_thw=grid_thw,
@@ -418,171 +416,70 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             merged_embeds,
             deepstack_features,
         )
-        num_tokens_per_item = grid_thw.prod(-1) // self.vision_encoder.spatial_merge_unit
+        num_tokens_per_item = (
+            grid_thw.prod(-1) // self.vision_encoder.spatial_merge_unit
+        )
         return merged_embeds, deepstack_features, num_tokens_per_item
 
-    def _global_vision_positions(
+    def _apply_vision_features(
         self,
+        target: torch.Tensor,
         *,
-        global_tokens: torch.Tensor,
-        num_tokens_per_item: torch.Tensor,
-        vision_token_id: int,
-    ) -> list[tuple[int, int, int]]:
-        flat = global_tokens.reshape(-1)
-        mask = flat == vision_token_id
-        prev = torch.cat([torch.zeros(1, dtype=torch.bool, device=mask.device), mask[:-1]])
-        starts = torch.where(mask & ~prev)[0]
-        positions = []
-        for item_idx in range(num_tokens_per_item.shape[0]):
-            positions.append(
-                (
-                    item_idx,
-                    int(starts[item_idx].item()),
-                    int(num_tokens_per_item[item_idx].item()),
-                )
-            )
-        return positions
-
-    def _scatter_vision_embeds(
-        self,
-        inputs_embeds: torch.Tensor,
-        *,
-        merged_embeds: torch.Tensor,
+        features: torch.Tensor,
         num_tokens_per_item: torch.Tensor,
         vision_token_id: int,
         global_input_ids: torch.Tensor | None,
         global_start: torch.Tensor | None,
         local_tokens: torch.Tensor,
+        reduce: str,
     ) -> torch.Tensor:
         if global_input_ids is None:
             global_input_ids = local_tokens
             shard_start = 0
         else:
             shard_start = int(global_start.item()) if global_start is not None else 0
+        flat_target = target.view(-1, target.shape[-1])
+        spans = _find_vision_spans(
+            global_input_ids, num_tokens_per_item, vision_token_id
+        )
+        apply_vision_slices(
+            flat_target,
+            features,
+            spans,
+            num_tokens_per_item,
+            shard_start=shard_start,
+            shard_length=local_tokens.numel(),
+            reduce=reduce,
+            cast_to_target=(reduce == "add"),
+        )
+        return target
 
-        feature_offsets = None
-        if merged_embeds.dim() == 2:
-            feature_offsets = torch.cat(
-                [
-                    torch.zeros(
-                        1,
-                        dtype=torch.long,
-                        device=num_tokens_per_item.device,
-                    ),
-                    num_tokens_per_item.to(torch.long).cumsum(0),
-                ]
-            )
+    def _add_zero_grad_edge(
+        self,
+        inputs_embeds: torch.Tensor,
+        *tensors: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add a 0-valued autograd edge from each tensor into ``inputs_embeds``.
 
-        shard_end = shard_start + local_tokens.numel()
-        for item_idx, start, n_tokens in self._global_vision_positions(
-            global_tokens=global_input_ids,
-            num_tokens_per_item=num_tokens_per_item,
-            vision_token_id=vision_token_id,
-        ):
-            end = start + n_tokens
-            overlap_start = max(start, shard_start)
-            overlap_end = min(end, shard_end)
-            if overlap_start >= overlap_end:
-                continue
-            local_start = overlap_start - shard_start
-            feature_start = overlap_start - start
-            feature_len = overlap_end - overlap_start
-            if feature_offsets is None:
-                vision_slice = merged_embeds[
-                    item_idx, feature_start : feature_start + feature_len
-                ]
-            else:
-                item_offset = int(feature_offsets[item_idx].item())
-                vision_slice = merged_embeds[
-                    item_offset
-                    + feature_start : item_offset
-                    + feature_start
-                    + feature_len
-                ]
-            inputs_embeds.view(-1, inputs_embeds.shape[-1])[
-                local_start : local_start + feature_len
-            ] = vision_slice
+        FSDP collective backward requires every rank that wraps the projector /
+        vision encoder to enter backward; a CP rank or no-image batch may own
+        no real vision contribution, so we splice in a zero-valued edge so the
+        graph still passes through those modules.
+        """
+        for tensor in tensors:
+            inputs_embeds = inputs_embeds + tensor.sum().to(inputs_embeds.dtype) * 0.0
         return inputs_embeds
 
-    def _add_empty_projector_edge(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
-        if "proj" not in self._trainable_roots:
-            return inputs_embeds
-
+    def _empty_projector_outputs(
+        self,
+        inputs_embeds: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         empty = inputs_embeds.new_zeros((0, self.proj.encoder_dim))
         empty_deepstack = [
             inputs_embeds.new_zeros((0, self.proj.encoder_dim))
             for _ in range(self.proj.num_deepstack)
         ]
-        merged_embeds, deepstack_features = self.proj(empty, empty_deepstack)
-        inputs_embeds = inputs_embeds + merged_embeds.sum().to(
-            inputs_embeds.dtype
-        ) * 0.0
-        for deepstack_embeds in deepstack_features:
-            inputs_embeds = inputs_embeds + deepstack_embeds.sum().to(
-                inputs_embeds.dtype
-            ) * 0.0
-        return inputs_embeds
-
-    def _add_vision_embeds(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        vision_embeds: torch.Tensor,
-        num_tokens_per_item: torch.Tensor,
-        vision_token_id: int,
-        global_input_ids: torch.Tensor | None,
-        global_start: torch.Tensor | None,
-        local_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        if global_input_ids is None:
-            global_input_ids = local_tokens
-            shard_start = 0
-        else:
-            shard_start = int(global_start.item()) if global_start is not None else 0
-
-        feature_offsets = None
-        if vision_embeds.dim() == 2:
-            feature_offsets = torch.cat(
-                [
-                    torch.zeros(
-                        1,
-                        dtype=torch.long,
-                        device=num_tokens_per_item.device,
-                    ),
-                    num_tokens_per_item.to(torch.long).cumsum(0),
-                ]
-            )
-
-        shard_end = shard_start + local_tokens.numel()
-        for item_idx, start, n_tokens in self._global_vision_positions(
-            global_tokens=global_input_ids,
-            num_tokens_per_item=num_tokens_per_item,
-            vision_token_id=vision_token_id,
-        ):
-            end = start + n_tokens
-            overlap_start = max(start, shard_start)
-            overlap_end = min(end, shard_end)
-            if overlap_start >= overlap_end:
-                continue
-            local_start = overlap_start - shard_start
-            feature_start = overlap_start - start
-            feature_len = overlap_end - overlap_start
-            if feature_offsets is None:
-                vision_slice = vision_embeds[
-                    item_idx, feature_start : feature_start + feature_len
-                ]
-            else:
-                item_offset = int(feature_offsets[item_idx].item())
-                vision_slice = vision_embeds[
-                    item_offset
-                    + feature_start : item_offset
-                    + feature_start
-                    + feature_len
-                ]
-            hidden_states.view(-1, hidden_states.shape[-1])[
-                local_start : local_start + feature_len
-            ] += vision_slice.to(hidden_states.dtype)
-        return hidden_states
+        return self.proj(empty, empty_deepstack)
 
     def _prepare_inputs_embeds(
         self,
@@ -601,83 +498,38 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             else self.config.image_token_id
         )
         deepstack_features: list[torch.Tensor] = []
-        num_tokens_per_item = None
+        num_tokens_per_item: torch.Tensor | None = None
         if pixel_values is not None and grid_thw is not None:
-            merged_embeds, deepstack_features, num_tokens_per_item = self._get_vision_embeds(
+            (
+                merged_embeds,
+                deepstack_features,
+                num_tokens_per_item,
+            ) = self._get_vision_embeds(
                 pixel_values,
                 grid_thw=grid_thw,
             )
-            inputs_embeds = self._scatter_vision_embeds(
+            inputs_embeds = self._apply_vision_features(
                 inputs_embeds,
-                merged_embeds=merged_embeds,
+                features=merged_embeds,
                 num_tokens_per_item=num_tokens_per_item,
                 vision_token_id=image_token_id,
                 global_input_ids=fla_cp_global_input_ids,
                 global_start=fla_cp_global_start,
                 local_tokens=tokens,
+                reduce="set",
             )
             if fla_cp_global_input_ids is not None:
                 # CP v1 computes vision redundantly on every rank, but a rank
                 # may own no image placeholder tokens after contiguous sharding.
-                # Keep a zero-valued autograd edge so FSDP-wrapped vision
-                # modules enter backward collectively on all CP ranks.
-                inputs_embeds = inputs_embeds + merged_embeds.sum().to(
-                    inputs_embeds.dtype
-                ) * 0.0
-                for deepstack_embeds in deepstack_features:
-                    inputs_embeds = inputs_embeds + deepstack_embeds.sum().to(
-                        inputs_embeds.dtype
-                    ) * 0.0
-        else:
-            inputs_embeds = self._add_empty_projector_edge(inputs_embeds)
-        return inputs_embeds, deepstack_features, num_tokens_per_item, image_token_id
-
-    def _forward_llm_with_deepstack(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        deepstack_features: list[torch.Tensor],
-        num_tokens_per_item: torch.Tensor | None,
-        vision_token_id: int,
-        tokens: torch.Tensor,
-        fla_cp_global_input_ids: torch.Tensor | None,
-        fla_cp_global_start: torch.Tensor | None,
-        cp_context: Any | None,
-        cu_seqlens: torch.Tensor | None,
-    ) -> torch.Tensor:
-        hidden_states = self.llm.pre_norm(hidden_states)
-        v_first = hidden_states.new_zeros(
-            *hidden_states.shape[:-1],
-            self.llm.layers["0"].attn.value_dim,
-        )
-        v_first.requires_grad_(
-            torch.is_grad_enabled()
-            and (
-                hidden_states.requires_grad
-                or self.llm.layers["0"].attn.v_proj.weight.requires_grad
-            )
-        )
-        for layer_idx, layer in self.llm.layers.items():
-            hidden_states, layer_v = layer(
-                hidden_states,
-                v_first=v_first,
-                cp_context=cp_context,
-                cu_seqlens=cu_seqlens,
-            )
-            idx = int(layer_idx)
-            if idx == 0:
-                v_first = layer_v
-            if idx < len(deepstack_features) and num_tokens_per_item is not None:
-                hidden_states = self._add_vision_embeds(
-                    hidden_states,
-                    vision_embeds=deepstack_features[idx],
-                    num_tokens_per_item=num_tokens_per_item,
-                    vision_token_id=vision_token_id,
-                    global_input_ids=fla_cp_global_input_ids,
-                    global_start=fla_cp_global_start,
-                    local_tokens=tokens,
+                inputs_embeds = self._add_zero_grad_edge(
+                    inputs_embeds, merged_embeds, *deepstack_features
                 )
-        return self.llm.norm(hidden_states)
+        elif "proj" in self._trainable_roots:
+            empty_merged, empty_deepstack = self._empty_projector_outputs(inputs_embeds)
+            inputs_embeds = self._add_zero_grad_edge(
+                inputs_embeds, empty_merged, *empty_deepstack
+            )
+        return inputs_embeds, deepstack_features, num_tokens_per_item, image_token_id
 
     def forward(
         self,
@@ -705,7 +557,9 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         )
 
         cp_context = self._build_cp_context(cu_seqlens_global, cu_seqlens_global_cpu)
-        cu_seqlens = cu_seqlens_global if cp_context is None and tokens.shape[0] == 1 else None
+        cu_seqlens = (
+            cu_seqlens_global if cp_context is None and tokens.shape[0] == 1 else None
+        )
         (
             inputs_embeds,
             deepstack_features,
@@ -719,16 +573,26 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             fla_cp_global_input_ids=fla_cp_global_input_ids,
             fla_cp_global_start=fla_cp_global_start,
         )
-        hidden_states = self._forward_llm_with_deepstack(
+
+        def add_deepstack(idx: int, layer_hidden_states: torch.Tensor) -> torch.Tensor:
+            if idx >= len(deepstack_features) or num_tokens_per_item is None:
+                return layer_hidden_states
+            return self._apply_vision_features(
+                layer_hidden_states,
+                features=deepstack_features[idx],
+                num_tokens_per_item=num_tokens_per_item,
+                vision_token_id=image_token_id,
+                global_input_ids=fla_cp_global_input_ids,
+                global_start=fla_cp_global_start,
+                local_tokens=tokens,
+                reduce="add",
+            )
+
+        hidden_states = self.llm.forward_embeddings(
             inputs_embeds,
-            deepstack_features=deepstack_features,
-            num_tokens_per_item=num_tokens_per_item,
-            vision_token_id=image_token_id,
-            tokens=tokens,
-            fla_cp_global_input_ids=fla_cp_global_input_ids,
-            fla_cp_global_start=fla_cp_global_start,
             cp_context=cp_context,
             cu_seqlens=cu_seqlens,
+            after_layer=add_deepstack,
         )
         if self._skip_lm_head:
             return hidden_states
