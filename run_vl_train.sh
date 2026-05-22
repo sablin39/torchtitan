@@ -25,12 +25,14 @@ torchrun_cmd="torchrun"
 # Activate the environment before running:
 #   source .venv/bin/activate
 #
-# WandB logging uses TorchTitan's built-in logger. Configure it with normal
-# environment variables if needed:
+# Experiment tracking uses TorchTitan's built-in logger. SwanLab runs as a
+# backup mirror of W&B (via swanlab.sync_wandb) when the remote W&B connection
+# is unstable, so the single tracking="1" switch below enables both backends
+# with the same run name. SwanLab inherits the run name from W&B, so only the
+# W&B env vars need to be configured:
 #   export WANDB_PROJECT=torchtitan
 #   export WANDB_RUN_NAME=rwkv-vl-train  # defaults to ${train_config}_${timestamp}
 #   export WANDB_MODE=offline  # optional, for offline/local logging
-# Set swanlab="1" below to call swanlab.sync_wandb() before wandb.init().
 #
 # Edit this block directly for now. We will replace it with a smarter config
 # system later.
@@ -121,8 +123,9 @@ activation_checkpoint_mode="selective"
 # RWKV-VL selective activation checkpointing is usable with CP on and off when
 # using BF16 model construction, compile, and normal FSDP.
 log_freq="1"
-wandb="0"
-swanlab="1"
+# Enable W&B + SwanLab together. SwanLab is configured as the backup mirror so
+# runs survive transient W&B connectivity issues.
+tracking="1"
 nvml_metrics="1"
 overwrite="0"
 optimizer_name="Adam"
@@ -167,9 +170,7 @@ pytorch_cuda_alloc_conf="expandable_segments:True"
 max_position_embeddings=""
 max_shard_size="1000GB"
 output_root="${repo_root}/outputs/rwkv_vl_train_${timestamp}"
-tracking_run_name="${train_config}_${timestamp}"
-wandb_run_name="${WANDB_RUN_NAME:-${tracking_run_name}}"
-swanlab_run_name="${SWANLAB_EXP_NAME:-${SWANLAB_EXPERIMENT_NAME:-${wandb_run_name}}}"
+tracking_run_name="${WANDB_RUN_NAME:-${train_config}_${timestamp}}"
 
 train_extra_args=(
     # Add extra torchtitan.train args here, for example:
@@ -435,8 +436,8 @@ echo "  DCP export:    ${dcp_dir}"
 echo "  Train dump:    ${train_dump_dir}"
 echo "  Final HF:      ${final_hf_dir}"
 echo "Tracking:"
-echo "  W&B name:      ${wandb_run_name}"
-echo "  SwanLab name:  ${swanlab_run_name}"
+echo "  Enabled:       ${tracking} (W&B + SwanLab backup)"
+echo "  Run name:      ${tracking_run_name}"
 echo "Parallelism:"
 echo "  GPUs:          ${ngpu}"
 echo "  CP degree:     ${context_parallel_degree}"
@@ -541,10 +542,9 @@ fi
 if [[ -n "${lm_head_lr}" ]]; then
     train_args+=(--module-lrs.lm-head "${lm_head_lr}")
 fi
-if [[ "${wandb}" == "1" ]]; then
+if [[ "${tracking}" == "1" ]]; then
+    # SwanLab mirrors W&B as a connectivity backup; enable them together.
     train_args+=(--metrics.enable-wandb)
-fi
-if [[ "${swanlab}" == "1" ]]; then
     train_args+=(--metrics.enable-swanlab)
 fi
 if [[ "${nvml_metrics}" == "1" ]]; then
@@ -588,9 +588,7 @@ train_env=(
     "TORCH_NCCL_NAN_CHECK=${torch_nccl_nan_check}"
     "TORCH_FR_CPP_STACK=${torch_nccl_trace_cpp_stack}"
     "TORCH_NCCL_DESYNC_DEBUG=${torch_nccl_desync_debug}"
-    "WANDB_RUN_NAME=${wandb_run_name}"
-    "SWANLAB_EXP_NAME=${swanlab_run_name}"
-    "SWANLAB_EXPERIMENT_NAME=${swanlab_run_name}"
+    "WANDB_RUN_NAME=${tracking_run_name}"
 )
 if [[ "${python_faulthandler}" == "1" ]]; then
     train_env+=("PYTHONFAULTHANDLER=1")
