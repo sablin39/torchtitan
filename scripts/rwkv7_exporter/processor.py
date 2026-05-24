@@ -95,8 +95,9 @@ class ModRWKVProcessor(ProcessorMixin):
         output = {}
         if self.image_processor is not None:
             output["image_processor"] = self.image_processor.to_dict()
-        if self.auto_map is not None:
-            output["auto_map"] = copy.deepcopy(self.auto_map)
+        auto_map = getattr(self, "auto_map", None)
+        if auto_map is not None:
+            output["auto_map"] = copy.deepcopy(auto_map)
         output["processor_class"] = self.__class__.__name__
         if not self.auto_insert_image_tags:
             output["auto_insert_image_tags"] = False
