@@ -61,6 +61,13 @@ _BUCKET_MIN = 64
 # a single FlexAttention kernel that large would also be a memory hazard.
 _BUCKET_MAX = 1 << 24  # 16,777,216
 
+# Target K/V tokens per chunked cross-attn call. Images are packed greedily
+# into chunks of at most this many K/V tokens so each FlexAttention call
+# allocates Q/K/V padded to ``next_pow2(<= this)`` regardless of how many
+# images the batch holds. Matches ``vit_patch_bucket_size`` so the encoder
+# and projector see similar per-call shapes on Hopper.
+_CROSS_ATTN_CHUNK_KV_TARGET = 65536
+
 
 def _next_pow2_bucket(n: int) -> int:
     """Round ``n`` up to the next power of two, clamped to ``[_BUCKET_MIN, _BUCKET_MAX]``.
@@ -93,6 +100,30 @@ def _ceil_to_bucket(n: int, ladder: tuple[int, ...]) -> int:
         f"{ladder[-1]}; widen projector q_buckets/kv_buckets or leave them "
         "unset to use auto power-of-two bucketing."
     )
+
+
+def _pack_images_into_chunks(
+    num_kv_per_item: list[int], target_kv: int
+) -> list[tuple[int, int]]:
+    """Greedily pack images into contiguous ``[img_lo, img_hi)`` ranges whose
+    K/V token sum stays within ``target_kv`` whenever possible.
+
+    A single image larger than ``target_kv`` forms its own chunk (it can't be
+    split since per-image attention must stay intact).
+    """
+    if not num_kv_per_item:
+        return []
+    chunks: list[tuple[int, int]] = []
+    cur_lo = 0
+    cur_count = 0
+    for i, n in enumerate(num_kv_per_item):
+        if cur_count > 0 and cur_count + n > target_kv:
+            chunks.append((cur_lo, i))
+            cur_lo = i
+            cur_count = 0
+        cur_count += n
+    chunks.append((cur_lo, len(num_kv_per_item)))
+    return chunks
 
 
 _compiled_create_block_mask = create_block_mask
@@ -1086,92 +1117,147 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             del empty_callback
             return lambda idx, h: h
 
-        q_real_len = sum(end - start for start, end, _ in local_ranges)
-        kv_real_len = int(num_kv_per_item.sum().item())
-
         q_ladder = self.proj.config.q_buckets
         kv_ladder = self.proj.config.kv_buckets
-        q_bucket = (
-            _ceil_to_bucket(q_real_len, q_ladder)
-            if q_ladder
-            else _next_pow2_bucket(q_real_len)
-        )
-        kv_bucket = (
-            _ceil_to_bucket(kv_real_len, kv_ladder)
-            if kv_ladder
-            else _next_pow2_bucket(kv_real_len)
-        )
 
-        # Per-row image_id labels, padded with -1 for masked rows.
-        q_image_id = torch.full((q_bucket,), -1, dtype=torch.int32, device=device)
-        cursor = 0
-        for start, end, image_id in local_ranges:
-            length = end - start
-            q_image_id[cursor : cursor + length] = image_id
-            cursor += length
-
-        kv_image_id = torch.full(
-            (kv_bucket,), -1, dtype=torch.int32, device=device
-        )
-        kv_cursor = 0
-        for i in range(num_kv_per_item.shape[0]):
-            length = int(num_kv_per_item[i].item())
-            kv_image_id[kv_cursor : kv_cursor + length] = i
-            kv_cursor += length
-
-        def mask_mod(b, h, q_idx, kv_idx):
-            q_id = q_image_id[q_idx]
-            kv_id = kv_image_id[kv_idx]
-            valid_q = q_id >= 0
-            valid_kv = kv_id >= 0
-            same_image = q_id == kv_id
-            # padding rows self-attend so every q has at least one valid kv
-            padding_self = (~valid_q) & (~valid_kv) & (q_idx == kv_idx)
-            return (same_image & valid_q & valid_kv) | padding_self
-
-        block_mask = _compiled_create_block_mask(
-            mask_mod,
-            B=None,
-            H=None,
-            Q_LEN=q_bucket,
-            KV_LEN=kv_bucket,
-        )
-
-        # Precompute gather/scatter index tensor for the local Q rows.
-        q_index = torch.empty(q_real_len, dtype=torch.long, device=device)
-        cursor = 0
-        for start, end, _ in local_ranges:
-            length = end - start
-            q_index[cursor : cursor + length] = torch.arange(
-                start, end, device=device
+        def _bucket_q(n: int) -> int:
+            return (
+                _ceil_to_bucket(n, q_ladder)
+                if q_ladder
+                else _next_pow2_bucket(n)
             )
-            cursor += length
+
+        def _bucket_kv(n: int) -> int:
+            return (
+                _ceil_to_bucket(n, kv_ladder)
+                if kv_ladder
+                else _next_pow2_bucket(n)
+            )
+
+        # Group local Q ranges by their image_id for fast per-chunk filtering.
+        ranges_by_image: dict[int, list[tuple[int, int]]] = {}
+        for start, end, image_id in local_ranges:
+            ranges_by_image.setdefault(image_id, []).append((start, end))
+
+        num_kv_list = [int(n) for n in num_kv_per_item.tolist()]
+        chunk_image_ranges = _pack_images_into_chunks(
+            num_kv_list, _CROSS_ATTN_CHUNK_KV_TARGET
+        )
+        # Cumulative K/V offset per image, so chunk [img_lo, img_hi) maps to
+        # a contiguous K/V slice [kv_cum[img_lo], kv_cum[img_hi]).
+        kv_cum = [0]
+        for n in num_kv_list:
+            kv_cum.append(kv_cum[-1] + n)
+
+        chunks: list[dict] = []
+        for img_lo, img_hi in chunk_image_ranges:
+            kv_start = kv_cum[img_lo]
+            kv_end = kv_cum[img_hi]
+            kv_real_len_chunk = kv_end - kv_start
+
+            chunk_ranges: list[tuple[int, int, int]] = []
+            for image_id in range(img_lo, img_hi):
+                for start, end in ranges_by_image.get(image_id, ()):
+                    chunk_ranges.append((start, end, image_id - img_lo))
+
+            if not chunk_ranges:
+                # No Q rows on this rank touch images in this chunk; skip.
+                continue
+
+            q_real_len_chunk = sum(end - start for start, end, _ in chunk_ranges)
+            q_bucket_chunk = _bucket_q(q_real_len_chunk)
+            kv_bucket_chunk = _bucket_kv(kv_real_len_chunk)
+
+            q_image_id_chunk = torch.full(
+                (q_bucket_chunk,), -1, dtype=torch.int32, device=device
+            )
+            cursor = 0
+            for start, end, rel_id in chunk_ranges:
+                length = end - start
+                q_image_id_chunk[cursor : cursor + length] = rel_id
+                cursor += length
+
+            kv_image_id_chunk = torch.full(
+                (kv_bucket_chunk,), -1, dtype=torch.int32, device=device
+            )
+            kv_cursor = 0
+            for image_id in range(img_lo, img_hi):
+                length = num_kv_list[image_id]
+                kv_image_id_chunk[kv_cursor : kv_cursor + length] = (
+                    image_id - img_lo
+                )
+                kv_cursor += length
+
+            # Per-chunk closure: mask_mod captures this chunk's id tensors so
+            # each chunk gets its own compiled FlexAttention specialisation
+            # against (q_bucket_chunk, kv_bucket_chunk).
+            def _make_mask_mod(qid: torch.Tensor, kid: torch.Tensor):
+                def mask_mod(b, h, q_idx, kv_idx):
+                    q_id = qid[q_idx]
+                    kv_id = kid[kv_idx]
+                    valid_q = q_id >= 0
+                    valid_kv = kv_id >= 0
+                    same_image = q_id == kv_id
+                    padding_self = (~valid_q) & (~valid_kv) & (q_idx == kv_idx)
+                    return (same_image & valid_q & valid_kv) | padding_self
+
+                return mask_mod
+
+            block_mask_chunk = _compiled_create_block_mask(
+                _make_mask_mod(q_image_id_chunk, kv_image_id_chunk),
+                B=None,
+                H=None,
+                Q_LEN=q_bucket_chunk,
+                KV_LEN=kv_bucket_chunk,
+            )
+
+            q_index_chunk = torch.empty(
+                q_real_len_chunk, dtype=torch.long, device=device
+            )
+            cursor = 0
+            for start, end, _ in chunk_ranges:
+                length = end - start
+                q_index_chunk[cursor : cursor + length] = torch.arange(
+                    start, end, device=device
+                )
+                cursor += length
+
+            chunks.append(
+                {
+                    "kv_start": kv_start,
+                    "kv_end": kv_end,
+                    "q_bucket": q_bucket_chunk,
+                    "kv_bucket": kv_bucket_chunk,
+                    "block_mask": block_mask_chunk,
+                    "q_index": q_index_chunk,
+                }
+            )
+
+        if not chunks:
+            return lambda idx, h: h
 
         def inject(idx: int, layer_hidden_states: torch.Tensor) -> torch.Tensor:
             if idx >= len(deepstack_features):
                 return layer_hidden_states
-            k_real, v_real = deepstack_features[idx]
-            # Trim K/V to real length (deepstack tensors may carry padding
-            # rows from the dataloader bucket — those would be masked out
-            # via kv_image_id, but kv_real_len <= k_real.shape[0] so we cap.
-            k_real = k_real[:kv_real_len]
-            v_real = v_real[:kv_real_len]
-
+            k_all, v_all = deepstack_features[idx]
             flat = layer_hidden_states.reshape(-1, layer_hidden_states.shape[-1])
-            q_real = flat.index_select(0, q_index)
-            delta = self.proj.deepstack[idx].attend(
-                q_real,
-                k_real,
-                v_real,
-                block_mask=block_mask,
-                q_bucket=q_bucket,
-                kv_bucket=kv_bucket,
-            )
-            # ``index_add`` (non-inplace) returns a fresh tensor; the in-place
-            # variant would overwrite ``layer_hidden_states`` while the previous
-            # LLM block's autograd graph still references it as a saved input.
-            scattered = flat.index_add(0, q_index, delta.to(flat.dtype))
-            return scattered.view_as(layer_hidden_states)
+            for chunk in chunks:
+                k_chunk = k_all[chunk["kv_start"] : chunk["kv_end"]]
+                v_chunk = v_all[chunk["kv_start"] : chunk["kv_end"]]
+                q_real = flat.index_select(0, chunk["q_index"])
+                delta = self.proj.deepstack[idx].attend(
+                    q_real,
+                    k_chunk,
+                    v_chunk,
+                    block_mask=chunk["block_mask"],
+                    q_bucket=chunk["q_bucket"],
+                    kv_bucket=chunk["kv_bucket"],
+                )
+                # ``index_add`` (non-inplace) returns a fresh tensor; the in-place
+                # variant would overwrite ``layer_hidden_states`` while the previous
+                # LLM block's autograd graph still references it as a saved input.
+                flat = flat.index_add(0, chunk["q_index"], delta.to(flat.dtype))
+            return flat.view_as(layer_hidden_states)
 
         return inject
 
