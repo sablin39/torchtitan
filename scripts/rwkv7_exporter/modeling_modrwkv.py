@@ -40,6 +40,18 @@ class ModRWKVProjectorConfig:
     project_dim: int = 1024
     hidden_dim: Optional[int] = None
     num_deepstack: int = 0
+    # Variant selectors. Defaults preserve the original ReLU/LayerNorm MLP
+    # projector for back-compat with existing exported checkpoints.
+    kind: str = "mlp"  # "mlp" | "cross_attn"
+    norm: str = "layernorm"  # "layernorm" | "rmsnorm"
+    ffn: str = "relu"  # "relu" | "gelu" | "swiglu"
+    # cross_attn-only fields.
+    num_heads: Optional[int] = None
+    head_dim: Optional[int] = None
+    # Extra PatchMerger on the main stream when the processor's spatial merge
+    # size is coarser than the vision encoder's. ``1`` (default) means the
+    # extra merger is omitted entirely.
+    extra_merge_size: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,6 +60,12 @@ class ModRWKVProjectorConfig:
             "project_dim": self.project_dim,
             "hidden_dim": self.hidden_dim,
             "num_deepstack": self.num_deepstack,
+            "kind": self.kind,
+            "norm": self.norm,
+            "ffn": self.ffn,
+            "num_heads": self.num_heads,
+            "head_dim": self.head_dim,
+            "extra_merge_size": self.extra_merge_size,
         }
 
 
@@ -121,9 +139,13 @@ class ModRWKVConfig(PretrainedConfig):
         vision_end_token_id: int = 65531,
         tie_word_embeddings: bool = False,
         use_conv_in_projector: bool = False,
+        processor_spatial_merge_size: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        # Resolved later (after vision_config is parsed) so it can default to
+        # the vision encoder's spatial_merge_size when not explicitly set.
+        self._processor_spatial_merge_size_override = processor_spatial_merge_size
 
         if text_config is None:
             text_config = {}
@@ -155,6 +177,17 @@ class ModRWKVConfig(PretrainedConfig):
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
         self.use_conv_in_projector = use_conv_in_projector
+        # Default the processor-side spatial merge size to the vision encoder's
+        # when not explicitly set. Used by the projector's optional extra
+        # merger and by image_pad token counting.
+        if self._processor_spatial_merge_size_override is not None:
+            self.processor_spatial_merge_size = (
+                self._processor_spatial_merge_size_override
+            )
+        else:
+            self.processor_spatial_merge_size = getattr(
+                vision_config, "spatial_merge_size", 2
+            )
 
     def to_dict(self) -> dict[str, Any]:
         output = super().to_dict()
@@ -177,6 +210,7 @@ class ModRWKVConfig(PretrainedConfig):
         output["vision_start_token_id"] = self.vision_start_token_id
         output["vision_end_token_id"] = self.vision_end_token_id
         output["use_conv_in_projector"] = self.use_conv_in_projector
+        output["processor_spatial_merge_size"] = self.processor_spatial_merge_size
         return output
 
 
@@ -189,28 +223,165 @@ class ModRWKVPreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = ["past_key_values"]
 
 
+def _build_norm(kind: str, dim: int, eps: float = 1e-5) -> nn.Module:
+    if kind == "layernorm":
+        return nn.LayerNorm(dim, eps=eps)
+    if kind == "rmsnorm":
+        return nn.RMSNorm(dim, eps=eps)
+    raise ValueError(f"Unknown norm kind: {kind!r}; expected layernorm|rmsnorm")
+
+
+class _SwiGLUFFN(nn.Module):
+    """SwiGLU feed-forward (HF mirror of the torchtitan projector FFN)."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, bias: bool = True):
+        super().__init__()
+        self.w1 = nn.Linear(in_dim, hidden_dim, bias=bias)
+        self.w2 = nn.Linear(hidden_dim, out_dim, bias=bias)
+        self.w3 = nn.Linear(in_dim, hidden_dim, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+def _build_ffn(
+    kind: str, in_dim: int, hidden_dim: int, out_dim: int, bias: bool = True
+) -> nn.Module:
+    if kind == "relu":
+        return nn.Sequential(
+            nn.Linear(in_dim, hidden_dim, bias=bias),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, out_dim, bias=bias),
+        )
+    if kind == "gelu":
+        return nn.Sequential(
+            nn.Linear(in_dim, hidden_dim, bias=bias),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim, bias=bias),
+        )
+    if kind == "swiglu":
+        return _SwiGLUFFN(in_dim, hidden_dim, out_dim, bias=bias)
+    raise ValueError(f"Unknown ffn kind: {kind!r}; expected relu|gelu|swiglu")
+
+
+class _ExtraPatchMerger(nn.Module):
+    """HF mirror of ``Qwen3VLVisionModel.PatchMerger`` for the projector's
+    optional main-stream compression.
+
+    Pre-shuffle LayerNorm + spatial reshape (``merge_size**2`` adjacent
+    tokens concatenated along channels) + 2-layer MLP that projects back
+    to ``out_hidden_size``.
+    """
+
+    def __init__(self, hidden_size: int, out_hidden_size: int, merge_size: int):
+        super().__init__()
+        self.spatial_merge_size = merge_size
+        self.merged_hidden_size = hidden_size * (merge_size**2)
+        self.norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.linear_fc1 = nn.Linear(self.merged_hidden_size, self.merged_hidden_size)
+        self.act_fn = nn.GELU(approximate="tanh")
+        self.linear_fc2 = nn.Linear(self.merged_hidden_size, out_hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        x = self.norm(x)
+        x = x.view(batch, seq_len // (self.spatial_merge_size**2), self.merged_hidden_size)
+        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
+
+
 class _VisualStreamProjector(nn.Module):
     def __init__(
         self,
         encoder_dim: int,
         project_dim: int,
         hidden_dim: Optional[int] = None,
+        norm: str = "layernorm",
+        ffn: str = "relu",
     ):
         super().__init__()
         self.encoder_dim = encoder_dim
         self.project_dim = project_dim
         self.hidden_dim = hidden_dim or project_dim * 4
 
-        self.pre_norm = nn.LayerNorm(project_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(encoder_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, project_dim),
-        )
+        self.pre_norm = _build_norm(norm, project_dim)
+        self.mlp = _build_ffn(ffn, encoder_dim, self.hidden_dim, project_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.mlp(x)
         return x + self.pre_norm(x)
+
+
+class _VisualStreamCrossAttnProjector(nn.Module):
+    """HF mirror of the torchtitan cross-attn projector. Uses plain SDPA at
+    inference time (no triton dependency).
+    """
+
+    def __init__(
+        self,
+        encoder_dim: int,
+        project_dim: int,
+        num_heads: int,
+        head_dim: int,
+        hidden_dim: Optional[int] = None,
+        norm: str = "layernorm",
+        ffn: str = "relu",
+    ):
+        super().__init__()
+        if num_heads * head_dim != project_dim:
+            raise ValueError(
+                f"cross_attn projector requires num_heads*head_dim "
+                f"({num_heads}*{head_dim}) == project_dim ({project_dim})"
+            )
+        self.encoder_dim = encoder_dim
+        self.project_dim = project_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.hidden_dim = hidden_dim or project_dim * 4
+        self.kv_norm = _build_norm(norm, encoder_dim)
+        self.k_proj = nn.Linear(encoder_dim, num_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(encoder_dim, num_heads * head_dim, bias=False)
+        self.q_norm = _build_norm(norm, project_dim)
+        self.o_proj = nn.Linear(num_heads * head_dim, project_dim, bias=False)
+        self.ffn_norm = _build_norm(norm, project_dim)
+        self.ffn = _build_ffn(ffn, project_dim, self.hidden_dim, project_dim)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.kv_norm(x)
+        k = self.k_proj(x).reshape(-1, self.num_heads, self.head_dim)
+        v = self.v_proj(x).reshape(-1, self.num_heads, self.head_dim)
+        return k, v
+
+    def attend(
+        self,
+        q_real: torch.Tensor,
+        k_real: torch.Tensor,
+        v_real: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """SDPA cross-attention with a dense (Q_real, KV_real) bool mask.
+
+        Args:
+            q_real: ``(Q_real, project_dim)``.
+            k_real: ``(KV_real, num_heads, head_dim)``.
+            v_real: ``(KV_real, num_heads, head_dim)``.
+            attn_mask: ``(Q_real, KV_real)`` bool, ``True`` = attend.
+
+        Returns the per-query delta to ADD into the LLM hidden state.
+        """
+        q = self.q_norm(q_real).reshape(-1, self.num_heads, self.head_dim)
+        # SDPA wants (B, H, S, D); pack Q_real into a single batch.
+        q4 = q.transpose(0, 1).unsqueeze(0)
+        k4 = k_real.transpose(0, 1).unsqueeze(0)
+        v4 = v_real.transpose(0, 1).unsqueeze(0)
+        # attn_mask comes in as (Q, KV); broadcast to (1, 1, Q, KV).
+        mask4 = attn_mask[None, None, :, :]
+        attn = F.scaled_dot_product_attention(q4, k4, v4, attn_mask=mask4)
+        attn = attn.squeeze(0).transpose(0, 1).reshape(q_real.shape[0], -1)
+        attn = self.o_proj(attn)
+        post_attn = q_real + attn
+        return self.ffn(self.ffn_norm(post_attn)) + attn
 
 
 class VisualAdapter(nn.Module):
@@ -221,35 +392,94 @@ class VisualAdapter(nn.Module):
         hidden_dim: Optional[int] = None,
         num_deepstack: int = 0,
         use_conv: bool = False,
+        kind: str = "mlp",
+        norm: str = "layernorm",
+        ffn: str = "relu",
+        num_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        extra_merge_size: int = 1,
     ):
         super().__init__()
         if use_conv:
             raise ValueError("Convolutional visual projectors are not supported.")
+        if extra_merge_size < 1:
+            raise ValueError(
+                f"extra_merge_size must be >= 1; got {extra_merge_size}"
+            )
+        if extra_merge_size > 1 and kind != "cross_attn":
+            raise ValueError(
+                "extra_merge_size > 1 is only supported with kind='cross_attn'"
+            )
         self.encoder_dim = encoder_dim
         self.project_dim = project_dim
         self.hidden_dim = hidden_dim or project_dim * 4
         self.num_deepstack = num_deepstack
+        self.kind = kind
+        self.extra_merge_size = extra_merge_size
+
+        if extra_merge_size > 1:
+            self.extra_merger = _ExtraPatchMerger(
+                hidden_size=encoder_dim,
+                out_hidden_size=encoder_dim,
+                merge_size=extra_merge_size,
+            )
+        else:
+            self.extra_merger = None
+
         self.main = _VisualStreamProjector(
             encoder_dim=encoder_dim,
             project_dim=project_dim,
             hidden_dim=self.hidden_dim,
+            norm=norm,
+            ffn=ffn,
         )
-        self.deepstack = nn.ModuleList(
-            [
-                _VisualStreamProjector(
-                    encoder_dim=encoder_dim,
-                    project_dim=project_dim,
-                    hidden_dim=self.hidden_dim,
+        if kind == "mlp":
+            self.deepstack = nn.ModuleList(
+                [
+                    _VisualStreamProjector(
+                        encoder_dim=encoder_dim,
+                        project_dim=project_dim,
+                        hidden_dim=self.hidden_dim,
+                        norm=norm,
+                        ffn=ffn,
+                    )
+                    for _ in range(num_deepstack)
+                ]
+            )
+        elif kind == "cross_attn":
+            if num_heads is None:
+                raise ValueError(
+                    "VisualAdapter num_heads is required when kind='cross_attn'"
                 )
-                for _ in range(num_deepstack)
-            ]
-        )
+            resolved_head_dim = head_dim or (project_dim // num_heads)
+            if num_heads * resolved_head_dim != project_dim:
+                raise ValueError(
+                    f"cross_attn projector requires num_heads*head_dim "
+                    f"({num_heads}*{resolved_head_dim}) == project_dim "
+                    f"({project_dim})"
+                )
+            self.deepstack = nn.ModuleList(
+                [
+                    _VisualStreamCrossAttnProjector(
+                        encoder_dim=encoder_dim,
+                        project_dim=project_dim,
+                        num_heads=num_heads,
+                        head_dim=resolved_head_dim,
+                        hidden_dim=self.hidden_dim,
+                        norm=norm,
+                        ffn=ffn,
+                    )
+                    for _ in range(num_deepstack)
+                ]
+            )
+        else:
+            raise ValueError(f"Unknown projector kind: {kind!r}")
 
     def forward(
         self,
         x: torch.Tensor,
         deepstack_features: Optional[list[torch.Tensor]] = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, list[Any]]:
         if deepstack_features is None:
             deepstack_features = []
         if len(deepstack_features) != self.num_deepstack:
@@ -257,6 +487,10 @@ class VisualAdapter(nn.Module):
                 f"Expected {self.num_deepstack} DeepStack feature tensors, "
                 f"got {len(deepstack_features)}."
             )
+        if self.extra_merger is not None:
+            # Flat (total_tokens, hidden) -> (1, total_tokens, hidden) for the
+            # PatchMerger view-reshape; squeeze back to flat.
+            x = self.extra_merger(x.unsqueeze(0)).squeeze(0)
         projected_deepstack = [
             projector(feature)
             for projector, feature in zip(self.deepstack, deepstack_features)
@@ -276,6 +510,20 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
             hidden_dim=proj_cfg.hidden_dim,
             num_deepstack=proj_cfg.num_deepstack,
             use_conv=config.use_conv_in_projector,
+            kind=getattr(proj_cfg, "kind", "mlp"),
+            norm=getattr(proj_cfg, "norm", "layernorm"),
+            ffn=getattr(proj_cfg, "ffn", "relu"),
+            num_heads=getattr(proj_cfg, "num_heads", None),
+            head_dim=getattr(proj_cfg, "head_dim", None),
+            extra_merge_size=getattr(proj_cfg, "extra_merge_size", 1),
+        )
+        # processor_spatial_merge_size determines how many ``<image_pad>``
+        # tokens the processor inserts per image; the vision encoder may use
+        # a smaller merge size, in which case the projector's extra_merger
+        # bridges the gap on the main stream.
+        self._processor_spatial_merge_size = getattr(
+            config, "processor_spatial_merge_size",
+            getattr(self.encoder.config, "spatial_merge_size", 2),
         )
         self.llm = RWKV7Model(config.text_config)
         self.post_init()
@@ -290,7 +538,20 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         self,
         pixel_values: torch.FloatTensor,
         image_grid_thw: torch.LongTensor,
-    ) -> tuple[torch.FloatTensor, list[torch.FloatTensor]]:
+    ) -> tuple[torch.FloatTensor, list[Any], torch.LongTensor]:
+        """Run the vision encoder + projector.
+
+        Returns ``(main_features, deepstack_levels, num_kv_per_item)`` where
+        ``main_features`` has shape ``(total_image_pad_tokens, hidden_size)``
+        (already compressed to image_pad length by the projector's extra
+        merger if any), and ``deepstack_levels`` is either:
+          - ``kind='mlp'``: a list of ``(total_image_pad_tokens, hidden_size)``
+            tensors to scatter-add into the LLM hidden state, or
+          - ``kind='cross_attn'``: a list of ``(k, v)`` tuples each of shape
+            ``(total_kv_tokens, num_heads, head_dim)``.
+        ``num_kv_per_item`` is the per-image vision-merged token count, used
+        by the cross_attn path to build per-image attention masks.
+        """
         vision_output = self.encoder(pixel_values, image_grid_thw)
         if hasattr(vision_output, "pooler_output"):
             vision_embeds = vision_output.pooler_output
@@ -309,28 +570,35 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
             list(deepstack_features),
         )
         projected = projected.reshape(-1, self.config.text_config.hidden_size)
-        projected_deepstack = [
-            feature.reshape(-1, self.config.text_config.hidden_size)
-            for feature in projected_deepstack
-        ]
 
-        spatial_merge_size = getattr(self.encoder.config, "spatial_merge_size", 2)
-        expected_tokens = int(
-            (image_grid_thw.prod(-1) // (spatial_merge_size**2)).sum().item()
+        vision_merge = getattr(self.encoder.config, "spatial_merge_size", 2)
+        processor_merge = self._processor_spatial_merge_size
+        num_kv_per_item = image_grid_thw.prod(-1) // (vision_merge**2)
+        expected_main_tokens = int(
+            (image_grid_thw.prod(-1) // (processor_merge**2)).sum().item()
         )
-        if expected_tokens != projected.shape[0]:
+        if expected_main_tokens != projected.shape[0]:
             raise ValueError(
                 "Projected image features and image grid do not match: "
-                f"features={projected.shape[0]} grid_tokens={expected_tokens}"
+                f"features={projected.shape[0]} grid_tokens={expected_main_tokens}"
             )
+
+        if self.proj.kind == "mlp":
+            projected_deepstack = [
+                feature.reshape(-1, self.config.text_config.hidden_size)
+                for feature in projected_deepstack
+            ]
+        # For cross_attn, projected_deepstack is a list of (k, v) tuples
+        # already shaped (total_kv_tokens, num_heads, head_dim); leave as-is.
+
         if projected.numel() == 0:
             empty = torch.empty(
                 0,
                 self.config.text_config.hidden_size,
                 device=self.get_input_embeddings().weight.device,
             )
-            return empty, []
-        return projected, projected_deepstack
+            return empty, [], num_kv_per_item
+        return projected, projected_deepstack, num_kv_per_item
 
     def _inject_image_features(
         self,
@@ -369,6 +637,66 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
             dtype=hidden_states.dtype,
         )
         return hidden_states
+
+    def _cross_attn_image_features(
+        self,
+        input_ids: torch.LongTensor,
+        hidden_states: torch.FloatTensor,
+        kv_pair: tuple[torch.Tensor, torch.Tensor],
+        *,
+        num_kv_per_item: torch.LongTensor,
+        num_tokens_per_item: torch.LongTensor,
+        projector: "_VisualStreamCrossAttnProjector",
+    ) -> torch.FloatTensor:
+        """Cross-attention deepstack injection (HF inference path).
+
+        Q is gathered from ``<image_pad>`` positions in the LLM hidden state;
+        K/V come from the projector's per-level deepstack output. The
+        attention mask is block-diagonal so each query attends only to its
+        own image's K/V.
+        """
+        flat_input = input_ids.view(-1)
+        flat_hidden = hidden_states.view(-1, hidden_states.shape[-1]).clone()
+        q_positions = (flat_input == self.config.image_token_id).nonzero(
+            as_tuple=False
+        ).reshape(-1)
+        if q_positions.numel() == 0:
+            return hidden_states
+        if q_positions.shape[0] != int(num_tokens_per_item.sum().item()):
+            raise ValueError(
+                "image_pad token count does not match expected per-image counts: "
+                f"got {q_positions.shape[0]}, expected "
+                f"{int(num_tokens_per_item.sum().item())}"
+            )
+
+        # Build per-row image_id labels for Q and K/V.
+        device = hidden_states.device
+        q_image_id = torch.empty(
+            q_positions.shape[0], dtype=torch.long, device=device
+        )
+        cursor = 0
+        for i, count in enumerate(num_tokens_per_item.tolist()):
+            q_image_id[cursor : cursor + count] = i
+            cursor += count
+        k_real, v_real = kv_pair
+        kv_total = int(num_kv_per_item.sum().item())
+        k_real = k_real[:kv_total]
+        v_real = v_real[:kv_total]
+        kv_image_id = torch.empty(kv_total, dtype=torch.long, device=device)
+        cursor = 0
+        for i, count in enumerate(num_kv_per_item.tolist()):
+            kv_image_id[cursor : cursor + count] = i
+            cursor += count
+
+        # (Q, KV) bool mask: True where same image.
+        attn_mask = q_image_id[:, None] == kv_image_id[None, :]
+
+        q_real = flat_hidden.index_select(0, q_positions)
+        delta = projector.attend(
+            q_real.to(k_real.dtype), k_real, v_real, attn_mask
+        )
+        flat_hidden.index_add_(0, q_positions, delta.to(flat_hidden.dtype))
+        return flat_hidden.view_as(hidden_states)
 
     def forward(
         self,
@@ -419,11 +747,15 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
-        deepstack_features: list[torch.Tensor] = []
+        deepstack_features: list[Any] = []
+        num_kv_per_item: Optional[torch.Tensor] = None
+        num_tokens_per_item: Optional[torch.Tensor] = None
         if pixel_values is not None:
-            image_features, deepstack_features = self._get_image_features(
-                pixel_values,
-                image_grid_thw,
+            image_features, deepstack_features, num_kv_per_item = (
+                self._get_image_features(pixel_values, image_grid_thw)
+            )
+            num_tokens_per_item = image_grid_thw.prod(-1) // (
+                self._processor_spatial_merge_size**2
             )
             inputs_embeds = self._inject_image_features(
                 input_ids,
@@ -457,11 +789,21 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
                 **kwargs,
             )
             if layer_idx < len(deepstack_features):
-                hidden_states = self._add_image_features(
-                    input_ids,
-                    hidden_states,
-                    deepstack_features[layer_idx],
-                )
+                if self.proj.kind == "cross_attn":
+                    hidden_states = self._cross_attn_image_features(
+                        input_ids,
+                        hidden_states,
+                        deepstack_features[layer_idx],
+                        num_kv_per_item=num_kv_per_item,
+                        num_tokens_per_item=num_tokens_per_item,
+                        projector=self.proj.deepstack[layer_idx],
+                    )
+                else:
+                    hidden_states = self._add_image_features(
+                        input_ids,
+                        hidden_states,
+                        deepstack_features[layer_idx],
+                    )
             if output_attentions:
                 all_attns += (attentions,)
 

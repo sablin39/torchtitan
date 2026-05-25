@@ -7,6 +7,7 @@
 import argparse
 import importlib
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -21,6 +22,27 @@ from torchtitan.components.checkpoint import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
 
 
+def _apply_rwkv_vl_projector_overrides(model_config, args):
+    proj_overrides = {}
+    for src_attr, dst_attr in (
+        ("projector_kind", "kind"),
+        ("projector_norm", "norm"),
+        ("projector_ffn", "ffn"),
+        ("projector_num_heads", "num_heads"),
+        ("projector_head_dim", "head_dim"),
+        ("projector_extra_merge_size", "extra_merge_size"),
+    ):
+        value = getattr(args, src_attr, None)
+        if value is not None:
+            proj_overrides[dst_attr] = value
+    if proj_overrides and hasattr(model_config, "proj"):
+        model_config.proj = replace(model_config.proj, **proj_overrides)
+    pmerge = getattr(args, "processor_spatial_merge_size", None)
+    if pmerge is not None and hasattr(model_config, "processor_spatial_merge_size"):
+        model_config.processor_spatial_merge_size = int(pmerge)
+    return model_config
+
+
 @torch.inference_mode()
 def convert_to_hf(
     input_dir,
@@ -29,11 +51,14 @@ def convert_to_hf(
     model_flavor,
     hf_assets_path,
     export_dtype,
+    args=None,
 ):
     # load model and model args so that we can get the state dict shape
     model_module = importlib.import_module(f"torchtitan.models.{model_name}")
     model_spec = model_module.model_registry(model_flavor)
     model_config = model_spec.model
+    if args is not None:
+        _apply_rwkv_vl_projector_overrides(model_config, args)
 
     with torch.device("cpu"):
         model = model_config.build()
@@ -97,6 +122,13 @@ if __name__ == "__main__":
         default="float32",
         help="Export dtype for HF checkpoint (default: float32)",
     )
+    parser.add_argument("--projector_kind", type=str, default=None)
+    parser.add_argument("--projector_norm", type=str, default=None)
+    parser.add_argument("--projector_ffn", type=str, default=None)
+    parser.add_argument("--projector_num_heads", type=int, default=None)
+    parser.add_argument("--projector_head_dim", type=int, default=None)
+    parser.add_argument("--projector_extra_merge_size", type=int, default=None)
+    parser.add_argument("--processor_spatial_merge_size", type=int, default=None)
     args = parser.parse_args()
 
     convert_to_hf(
@@ -106,4 +138,5 @@ if __name__ == "__main__":
         args.model_flavor,
         args.hf_assets_path,
         args.export_dtype,
+        args=args,
     )

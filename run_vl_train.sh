@@ -37,10 +37,10 @@ torchrun_cmd="torchrun"
 # Edit this block directly for now. We will replace it with a smarter config
 # system later.
 
-rwkv7_path=""
-vision_model=""
+rwkv7_path="/mnt/raid0_8t/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
+vision_model="/home/rwkv/models/Qwen3-VL-2B-Instruct"
 # W&B remote path: /data/HuggingFaceM4_FineVisionMax
-dataset_path=""
+dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/tqa(cauldron,llava_format)"
 # 1.5B-v100M:
 # rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
 # vision_model="/home/molin/models/Qwen3.5-0.8B"
@@ -107,8 +107,8 @@ max_epoch_steps="1000000000"
 precision="bfloat16"
 export_dtype="bfloat16"
 model_name="rwkv_vl"
-model_flavor="0.4B-v100M"
-train_config="rwkv_vl_0_4b_v100m_chat"
+model_flavor="1.5B-v400M"
+train_config="rwkv_vl_1_5b_v400m_chat"
 # RWKV7 DPLR chunk size for the language backbone. The model default is 64;
 # local long-sequence sweeps favored 32 for packed CP training.
 backbone_chunk_size="64"
@@ -119,7 +119,42 @@ proj_lr="1e-4"
 llm_lr="1e-5"
 lm_head_lr=""
 projector_seed="1234"
-activation_checkpoint_mode="selective"
+# --- Visual projector configuration ------------------------------------------
+# "mlp" (default) uses the original ReLU/LayerNorm projector and is bit-
+# identical to the pre-refactor checkpoint format. "cross_attn" replaces the
+# additive DeepStack injection with masked cross-attention between
+# <image_pad> queries and projected DeepStack K/V (one cross-attn per level,
+# matched to one LLM layer).
+projector_kind="mlp"
+# Norm used inside the projector ("layernorm" or "rmsnorm").
+projector_norm="layernorm"
+# Inner-FFN activation ("relu" / "gelu" / "swiglu"). For cross_attn this picks
+# the post-attention FFN; for mlp it picks the inner activation.
+projector_ffn="relu"
+# Cross-attention head config (cross_attn only). project_dim must equal
+# num_heads * head_dim; leave head_dim empty to default to project_dim/num_heads.
+projector_num_heads="8"
+projector_head_dim=""
+# Extra projector-side PatchMerger ratio. = processor_spatial_merge_size /
+# vision_encoder.spatial_merge_size. ``1`` (default) disables it. Set > 1 to
+# let the processor produce fewer <image_pad> tokens than vision K/V tokens;
+# only supported with projector_kind=cross_attn.
+projector_extra_merge_size="1"
+# Spatial merge size used by the processor when counting <image_pad> tokens.
+# Defaults to the vision encoder's spatial_merge_size when empty; must be a
+# positive integer multiple of it.
+processor_spatial_merge_size="4"
+# Spatial merge size used by the dataloader collator. Should match
+# processor_spatial_merge_size; defaults to 2 to match today's flavors.
+dataloader_spatial_merge_size="2"
+# Static FlexAttention buckets for the cross_attn projector (cross_attn only).
+# Each forward pads Q and K/V to exactly these sizes so the compiled FlexAttention
+# kernel sees a single static shape. Pick values >= the largest expected per-batch
+# image_pad / vision token counts. Leave empty to use the dynamic ladder (faster
+# kernels but may re-compile per shape).
+projector_q_bucket=""
+projector_kv_bucket=""
+activation_checkpoint_mode="full"
 # RWKV-VL selective activation checkpointing is usable with CP on and off when
 # using BF16 model construction, compile, and normal FSDP.
 log_freq="1"
@@ -485,10 +520,54 @@ fi
 if [[ "${fake_thinking}" == "1" ]]; then
     export_args+=(--fake-thinking)
 fi
+if [[ -n "${projector_kind}" ]]; then
+    export_args+=(--projector-kind "${projector_kind}")
+fi
+if [[ -n "${projector_norm}" ]]; then
+    export_args+=(--projector-norm "${projector_norm}")
+fi
+if [[ -n "${projector_ffn}" ]]; then
+    export_args+=(--projector-ffn "${projector_ffn}")
+fi
+if [[ -n "${projector_num_heads}" ]]; then
+    export_args+=(--projector-num-heads "${projector_num_heads}")
+fi
+if [[ -n "${projector_head_dim}" ]]; then
+    export_args+=(--projector-head-dim "${projector_head_dim}")
+fi
+if [[ -n "${projector_extra_merge_size}" ]]; then
+    export_args+=(--projector-extra-merge-size "${projector_extra_merge_size}")
+fi
+if [[ -n "${processor_spatial_merge_size}" ]]; then
+    export_args+=(--processor-spatial-merge-size "${processor_spatial_merge_size}")
+fi
 
 echo
 echo "==> Step 1/4: Exporting RWKV-VL HF checkpoint"
 "${python_cmd}" "${export_args[@]}"
+
+convert_proj_args=()
+if [[ -n "${projector_kind}" ]]; then
+    convert_proj_args+=(--projector_kind "${projector_kind}")
+fi
+if [[ -n "${projector_norm}" ]]; then
+    convert_proj_args+=(--projector_norm "${projector_norm}")
+fi
+if [[ -n "${projector_ffn}" ]]; then
+    convert_proj_args+=(--projector_ffn "${projector_ffn}")
+fi
+if [[ -n "${projector_num_heads}" ]]; then
+    convert_proj_args+=(--projector_num_heads "${projector_num_heads}")
+fi
+if [[ -n "${projector_head_dim}" ]]; then
+    convert_proj_args+=(--projector_head_dim "${projector_head_dim}")
+fi
+if [[ -n "${projector_extra_merge_size}" ]]; then
+    convert_proj_args+=(--projector_extra_merge_size "${projector_extra_merge_size}")
+fi
+if [[ -n "${processor_spatial_merge_size}" ]]; then
+    convert_proj_args+=(--processor_spatial_merge_size "${processor_spatial_merge_size}")
+fi
 
 echo
 echo "==> Step 2/4: Converting HF checkpoint to DCP"
@@ -496,7 +575,8 @@ echo "==> Step 2/4: Converting HF checkpoint to DCP"
     "${hf_dir}" \
     "${dcp_dir}" \
     --model_name "${model_name}" \
-    --model_flavor "${model_flavor}"
+    --model_flavor "${model_flavor}" \
+    "${convert_proj_args[@]}"
 
 train_args=(
     -m torchtitan.train
@@ -522,6 +602,7 @@ train_args=(
     --training.local-batch-size "${batch_size}"
     --dataloader.packing-buffer-size "${packing_buffer_size}"
     --dataloader.vit-patch-bucket-size "${vit_patch_bucket_size}"
+    --dataloader.spatial-merge-size "${dataloader_spatial_merge_size}"
     --dataloader.num-workers "${dataloader_num_workers}"
     --dataloader.prefetch-factor "${dataloader_prefetch_factor}"
     --dataloader.pixel-values-dtype "${dataloader_pixel_values_dtype}"
@@ -541,6 +622,33 @@ if [[ -n "${lr_total_steps}" ]]; then
 fi
 if [[ -n "${lm_head_lr}" ]]; then
     train_args+=(--module-lrs.lm-head "${lm_head_lr}")
+fi
+if [[ -n "${projector_kind}" ]]; then
+    train_args+=(--projector-kind "${projector_kind}")
+fi
+if [[ -n "${projector_norm}" ]]; then
+    train_args+=(--projector-norm "${projector_norm}")
+fi
+if [[ -n "${projector_ffn}" ]]; then
+    train_args+=(--projector-ffn "${projector_ffn}")
+fi
+if [[ -n "${projector_num_heads}" ]]; then
+    train_args+=(--projector-num-heads "${projector_num_heads}")
+fi
+if [[ -n "${projector_head_dim}" ]]; then
+    train_args+=(--projector-head-dim "${projector_head_dim}")
+fi
+if [[ -n "${projector_extra_merge_size}" ]]; then
+    train_args+=(--projector-extra-merge-size "${projector_extra_merge_size}")
+fi
+if [[ -n "${processor_spatial_merge_size}" ]]; then
+    train_args+=(--processor-spatial-merge-size "${processor_spatial_merge_size}")
+fi
+if [[ -n "${projector_q_bucket}" ]]; then
+    train_args+=(--projector-q-bucket "${projector_q_bucket}")
+fi
+if [[ -n "${projector_kv_bucket}" ]]; then
+    train_args+=(--projector-kv-bucket "${projector_kv_bucket}")
 fi
 if [[ "${tracking}" == "1" ]]; then
     # SwanLab mirrors W&B as a connectivity backup; enable them together.
@@ -681,7 +789,8 @@ echo "==> Step 4/4: Converting trained DCP checkpoint back to HF"
     --hf_assets_path "${hf_dir}" \
     --model_name "${model_name}" \
     --model_flavor "${model_flavor}" \
-    --export_dtype "${export_dtype}"
+    --export_dtype "${export_dtype}" \
+    "${convert_proj_args[@]}"
 
 echo
 echo "==> Copying HF remote-code/tokenizer/processor assets"

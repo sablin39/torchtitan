@@ -610,6 +610,12 @@ def build_projector_state_dict(
     num_deepstack: int,
     dtype: torch.dtype,
     seed: int | None,
+    kind: str = "mlp",
+    norm: str = "layernorm",
+    ffn: str = "relu",
+    num_heads: int | None = None,
+    head_dim: int | None = None,
+    extra_merge_size: int = 1,
 ) -> dict[str, torch.Tensor]:
     try:
         from .modeling_modrwkv import VisualAdapter
@@ -628,6 +634,12 @@ def build_projector_state_dict(
             hidden_dim=hidden_dim,
             num_deepstack=num_deepstack,
             use_conv=False,
+            kind=kind,
+            norm=norm,
+            ffn=ffn,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            extra_merge_size=extra_merge_size,
         )
     return {
         "model.proj." + key: value.detach().to(dtype=dtype).contiguous()
@@ -640,6 +652,13 @@ def build_multimodal_config(
     text_config: RWKV7Config,
     vision_config: Qwen3VLVisionConfig,
     projector_hidden_dim: int | None,
+    projector_kind: str = "mlp",
+    projector_norm: str = "layernorm",
+    projector_ffn: str = "relu",
+    projector_num_heads: int | None = None,
+    projector_head_dim: int | None = None,
+    projector_extra_merge_size: int = 1,
+    processor_spatial_merge_size: int | None = None,
 ):
     try:
         from .modeling_modrwkv import ModRWKVConfig, ModRWKVProjectorConfig
@@ -651,6 +670,12 @@ def build_multimodal_config(
         project_dim=text_config.hidden_size,
         hidden_dim=projector_hidden_dim,
         num_deepstack=len(getattr(vision_config, "deepstack_visual_indexes", [])),
+        kind=projector_kind,
+        norm=projector_norm,
+        ffn=projector_ffn,
+        num_heads=projector_num_heads,
+        head_dim=projector_head_dim,
+        extra_merge_size=projector_extra_merge_size,
     )
     config = ModRWKVConfig.from_text_vision_configs(
         text_config=text_config,
@@ -660,6 +685,7 @@ def build_multimodal_config(
         vision_start_token_id=DEFAULT_VISION_START_TOKEN_ID,
         vision_end_token_id=DEFAULT_VISION_END_TOKEN_ID,
         tie_word_embeddings=False,
+        processor_spatial_merge_size=processor_spatial_merge_size,
     )
     config.architectures = ["RWKV7VLForConditionalGeneration"]
     return config
@@ -682,6 +708,7 @@ def save_multimodal_processor(
     image_processor_source: str,
     max_pixels: int | None,
     fake_thinking: bool,
+    processor_spatial_merge_size: int | None = None,
 ) -> None:
     with _remote_code_package(include_processor=True) as remote_code:
         VLRwkvTokenizer = remote_code.RwkvTokenizer
@@ -709,6 +736,11 @@ def save_multimodal_processor(
             if max_pixels <= 0:
                 raise ValueError("--max-pixels must be positive when provided.")
             image_processor.size["longest_edge"] = int(max_pixels)
+        if processor_spatial_merge_size is not None:
+            # The processor uses ``merge_size`` to compute the number of
+            # ``<image_pad>`` tokens it inserts per image. Override it so a
+            # coarser projector merge keeps text/vision token counts aligned.
+            image_processor.merge_size = int(processor_spatial_merge_size)
 
         processor = ModRWKVProcessor(
             tokenizer=tokenizer,
@@ -858,6 +890,13 @@ def convert_multimodal(
     max_pixels: int | None = None,
     verify_model_load: bool = False,
     fake_thinking: bool = False,
+    projector_kind: str = "mlp",
+    projector_norm: str = "layernorm",
+    projector_ffn: str = "relu",
+    projector_num_heads: int | None = None,
+    projector_head_dim: int | None = None,
+    projector_extra_merge_size: int = 1,
+    processor_spatial_merge_size: int | None = None,
 ) -> None:
     output = os.path.realpath(output)
     text_weights = extract_text_weights(torch_load_weights(rwkv7))
@@ -877,6 +916,13 @@ def convert_multimodal(
         text_config=text_config,
         vision_config=vision_config,
         projector_hidden_dim=projector_hidden_dim,
+        projector_kind=projector_kind,
+        projector_norm=projector_norm,
+        projector_ffn=projector_ffn,
+        projector_num_heads=projector_num_heads,
+        projector_head_dim=projector_head_dim,
+        projector_extra_merge_size=projector_extra_merge_size,
+        processor_spatial_merge_size=processor_spatial_merge_size,
     )
     print(f"Creating RWKV-VL HF model with config:\n{config}")
 
@@ -896,6 +942,12 @@ def convert_multimodal(
         num_deepstack=len(getattr(vision_config, "deepstack_visual_indexes", [])),
         dtype=dtype,
         seed=projector_seed,
+        kind=projector_kind,
+        norm=projector_norm,
+        ffn=projector_ffn,
+        num_heads=projector_num_heads,
+        head_dim=projector_head_dim,
+        extra_merge_size=projector_extra_merge_size,
     )
 
     state_dict = {}
@@ -922,6 +974,7 @@ def convert_multimodal(
         image_processor_source=image_processor or vision_model,
         max_pixels=max_pixels,
         fake_thinking=fake_thinking,
+        processor_spatial_merge_size=processor_spatial_merge_size,
     )
     print(f"Saved RWKV-VL HF checkpoint to {output}")
     verify_multimodal_export(
@@ -999,6 +1052,51 @@ if __name__ == "__main__":
         action="store_true",
         help="Save a chat template that prefixes every assistant message with an empty <think> block.",
     )
+    parser.add_argument(
+        "--projector-kind",
+        type=str,
+        default="mlp",
+        choices=["mlp", "cross_attn"],
+        help="Visual projector variant.",
+    )
+    parser.add_argument(
+        "--projector-norm",
+        type=str,
+        default="layernorm",
+        choices=["layernorm", "rmsnorm"],
+        help="Norm used inside the visual projector.",
+    )
+    parser.add_argument(
+        "--projector-ffn",
+        type=str,
+        default="relu",
+        choices=["relu", "gelu", "swiglu"],
+        help="FFN activation used inside the visual projector.",
+    )
+    parser.add_argument(
+        "--projector-num-heads",
+        type=int,
+        default=None,
+        help="Number of attention heads for the cross_attn projector.",
+    )
+    parser.add_argument(
+        "--projector-head-dim",
+        type=int,
+        default=None,
+        help="Head dim for the cross_attn projector. Defaults to project_dim // num_heads.",
+    )
+    parser.add_argument(
+        "--projector-extra-merge-size",
+        type=int,
+        default=1,
+        help="Extra projector-side PatchMerger ratio (processor_merge / vision_merge).",
+    )
+    parser.add_argument(
+        "--processor-spatial-merge-size",
+        type=int,
+        default=None,
+        help="Spatial merge size used by the processor when inserting <image_pad> tokens. Defaults to vision encoder's spatial_merge_size.",
+    )
     args = parser.parse_args()
 
     if args.multimodal:
@@ -1017,6 +1115,13 @@ if __name__ == "__main__":
             max_pixels=args.max_pixels,
             verify_model_load=args.verify_model_load,
             fake_thinking=args.fake_thinking,
+            projector_kind=args.projector_kind,
+            projector_norm=args.projector_norm,
+            projector_ffn=args.projector_ffn,
+            projector_num_heads=args.projector_num_heads,
+            projector_head_dim=args.projector_head_dim,
+            projector_extra_merge_size=args.projector_extra_merge_size,
+            processor_spatial_merge_size=args.processor_spatial_merge_size,
         )
     else:
         convert(

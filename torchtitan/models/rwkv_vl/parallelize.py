@@ -174,13 +174,22 @@ def apply_fsdp(
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
-    _fully_shard_if_trainable(
-        model.proj,
-        module_name="proj",
-        skipped_frozen_modules=skipped_frozen_modules,
-        **fsdp_config,
-        reshard_after_forward=reshard_after_forward,
-    )
+    # The cross_attn projector is reused inside the LLM forward (gather Q +
+    # cross-attention at every DeepStack layer). Sharding it via FSDP leaves
+    # later attend() calls operating on stale/freed DTensors during backward,
+    # because attend() is invoked as a sub-module method rather than at the
+    # FSDP wrap boundary. The projector is small relative to the LLM, so
+    # skip FSDP and keep its params replicated when kind='cross_attn'.
+    if getattr(model.proj, "kind", "mlp") == "cross_attn":
+        skipped_frozen_modules.append("proj (cross_attn, replicated)")
+    else:
+        _fully_shard_if_trainable(
+            model.proj,
+            module_name="proj",
+            skipped_frozen_modules=skipped_frozen_modules,
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward,
+        )
     _fully_shard_if_trainable(
         model.llm.embeddings,
         module_name="llm.embeddings",

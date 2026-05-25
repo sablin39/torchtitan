@@ -58,6 +58,40 @@ class RWKVVLTrainerConfig(Trainer.Config):
     state dict shapes; it is applied to the model config before construction.
     """
 
+    projector_kind: str | None = None
+    """Override ``proj.kind`` (``mlp`` or ``cross_attn``)."""
+
+    projector_norm: str | None = None
+    """Override ``proj.norm`` (``layernorm`` or ``rmsnorm``)."""
+
+    projector_ffn: str | None = None
+    """Override ``proj.ffn`` (``relu``, ``gelu``, or ``swiglu``)."""
+
+    projector_num_heads: int | None = None
+    """Number of cross-attention heads (cross_attn projector only)."""
+
+    projector_head_dim: int | None = None
+    """Cross-attention head dim (cross_attn projector only)."""
+
+    projector_extra_merge_size: int | None = None
+    """Extra projector-side ``PatchMerger`` ratio (``processor_merge / vision_merge``).
+    Only meaningful with ``projector_kind='cross_attn'``."""
+
+    processor_spatial_merge_size: int | None = None
+    """Spatial merge size used by the processor when inserting ``<image_pad>`` tokens.
+    Must be a positive integer multiple of the vision encoder's spatial merge size."""
+
+    projector_q_bucket: int | None = None
+    """Static Q_LEN bucket for the cross-attn projector's FlexAttention call.
+    When set, Q is always padded to exactly this length, avoiding dynamic-shape
+    recompilation. Should be >= the largest expected ``<image_pad>`` count per
+    forward."""
+
+    projector_kv_bucket: int | None = None
+    """Static KV_LEN bucket for the cross-attn projector's FlexAttention call.
+    When set, K/V are always padded to exactly this length. Should be >= the
+    largest expected per-batch vision token count."""
+
 
 def _rwkv_vl_dataloader(dataset: str, **kwargs) -> MMDataLoader.Config:
     return MMDataLoader.Config(
