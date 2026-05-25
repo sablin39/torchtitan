@@ -173,24 +173,36 @@ class FlexAttention(Module):
         to be compatible with _ContextParallel.
     """
 
+    # Partial pin: block sizes consistently win across our shapes (forward
+    # BLOCK_M=BLOCK_N=64, backward BLOCK_M1=M2=N1=N2=32), so freezing them
+    # collapses the dominant axis of the autotune search and leaves only
+    # num_stages / num_warps to tune per-shape. Coordinate-descent tuning
+    # (iterative refine after autotune) is the most expensive piece and is
+    # kept off.
+    _DEFAULT_KERNEL_OPTIONS: ClassVar[dict] = {
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "BLOCK_M1": 32,
+        "BLOCK_M2": 32,
+        "BLOCK_N1": 32,
+        "BLOCK_N2": 32,
+    }
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
-        kernel_options: dict = field(default_factory=dict)
+        kernel_options: dict = field(
+            default_factory=lambda: dict(FlexAttention._DEFAULT_KERNEL_OPTIONS)
+        )
 
     inductor_configs: ClassVar[dict[str, bool]] = {
         "wrap_inductor_compiled_regions": True,
-        # Recommended workflow: run once with max_autotune=True to discover
-        # good kernel_options, then set kernel_options explicitly in the config
-        # and keep max_autotune disabled for faster compilation.
+        # Autotune is on so block sizes adapt to shape, but kernel_options
+        # above pin num_stages/num_warps to cut the search space. Coordinate
+        # descent is off because it's where most of the autotune time goes
+        # (iterative ±1 refinement after the initial sweep).
         "max_autotune": True,
-        # When enabled, after max_autotune selects the best kernel config,
-        # coordinate descent iteratively tunes individual parameters (block
-        # sizes, num_warps, num_stages) one at a time -- doubling/halving each
-        # and accepting changes that improve runtime by >0.1%. This can also
-        # run without max_autotune but starts from a weaker baseline config.
-        # See torch/_inductor/runtime/coordinate_descent_tuner.py.
-        "coordinate_descent_tuning": True,
+        "coordinate_descent_tuning": False,
         "triton.cudagraphs": False,
         # Allow Inductor autotuning to consider Triton tensor descriptors/TMA
         # on Hopper+ for compatible FlexAttention loads/stores.
