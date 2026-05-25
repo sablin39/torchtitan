@@ -27,10 +27,7 @@ from torchtitan.models.common.vision_features import (
     _find_vision_spans,
     apply_vision_slices,
 )
-from torchtitan.models.qwen3_vl.vision_encoder import (
-    PatchMerger,
-    Qwen3VLVisionEncoder,
-)
+from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
 from torchtitan.models.rwkv7.model import (
     _output_linear_init,
     _zero_,
@@ -352,6 +349,16 @@ def _build_ffn(
 
 
 class _VisualStreamProjector(Module):
+    """MLP-based visual stream projector.
+
+    When ``merge_size > 1`` the projector also performs the spatial merge:
+    inputs are pre-shuffle-normalized, ``merge_size**2`` adjacent tokens are
+    concatenated along the channel axis, then the MLP maps the merged
+    ``encoder_dim * merge_size**2`` channels to ``project_dim``. This is the
+    same structure as ``Qwen3VLVisionModel.PatchMerger`` and removes the
+    need for a separate ``extra_merger`` module on the projector main path.
+    """
+
     def __init__(
         self,
         *,
@@ -361,18 +368,41 @@ class _VisualStreamProjector(Module):
         norm_eps: float,
         norm: NormKind = "layernorm",
         ffn: FFNKind = "relu",
+        merge_size: int = 1,
     ):
         super().__init__()
+        if merge_size < 1:
+            raise ValueError(f"merge_size must be >= 1; got {merge_size}")
+        self.merge_size = merge_size
+        self.merge_unit = merge_size**2
+        self.encoder_dim = encoder_dim
+        in_dim = encoder_dim * self.merge_unit
+        # Pre-shuffle norm when merging (matches ``PatchMerger``'s pattern).
+        # When merge_size == 1 the in_norm is omitted entirely so the
+        # state_dict matches the original ``relu``/``layernorm`` projector
+        # bit-identically (back-compat).
+        self.in_norm = (
+            _build_norm(norm, encoder_dim, norm_eps) if merge_size > 1 else None
+        )
         self.pre_norm = _build_norm(norm, project_dim, norm_eps)
         self.mlp = _build_ffn(
             ffn,
-            in_dim=encoder_dim,
+            in_dim=in_dim,
             hidden_dim=hidden_dim,
             out_dim=project_dim,
             bias=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.merge_size > 1:
+            # x: ``(N, encoder_dim)``. Normalize per token, then reshape
+            # ``merge_unit`` adjacent tokens into a single merged token along
+            # the channel axis. ``N`` is required to be divisible by
+            # ``merge_unit`` — enforced upstream by the dataloader's
+            # ``vit_patch_bucket_unit = lcm(bucket, 128, spatial_merge**2)``.
+            n = x.shape[0]
+            x = self.in_norm(x)
+            x = x.reshape(n // self.merge_unit, self.encoder_dim * self.merge_unit)
         x = self.mlp(x)
         return x + self.pre_norm(x)
 
@@ -397,10 +427,8 @@ class _VisualStreamCrossAttnProjector(Module):
         project_dim: int,
         num_heads: int,
         head_dim: int,
-        hidden_dim: int,
         norm_eps: float,
         norm: NormKind = "layernorm",
-        ffn: FFNKind = "relu",
         kernel_options: dict | None = None,
     ):
         super().__init__()
@@ -417,14 +445,6 @@ class _VisualStreamCrossAttnProjector(Module):
         self.q_norm = _build_norm(norm, project_dim, norm_eps)
         self.o_proj = _projector_linear(
             num_heads * head_dim, project_dim, bias=False
-        )
-        self.ffn_norm = _build_norm(norm, project_dim, norm_eps)
-        self.ffn = _build_ffn(
-            ffn,
-            in_dim=project_dim,
-            hidden_dim=hidden_dim,
-            out_dim=project_dim,
-            bias=True,
         )
         self.kernel_options = dict(_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT)
         if kernel_options:
@@ -471,9 +491,10 @@ class _VisualStreamCrossAttnProjector(Module):
             q_bucket / kv_bucket: padded lengths used to build ``block_mask``.
 
         Returns:
-            ``(Q_real, project_dim)`` post-block update to ADD into the LLM
-            hidden state at the ``<image_pad>`` positions that produced
-            ``q_real`` (residual already applied internally).
+            ``(Q_real, project_dim)`` delta to ADD into the LLM hidden state
+            at the ``<image_pad>`` positions that produced ``q_real``. The
+            block is intentionally minimal — pre-norm Q, cross-attention,
+            output projection — with no post-attn FFN.
         """
         q_real_len = q_real.shape[0]
         kv_real_len = k_real.shape[0]
@@ -506,11 +527,7 @@ class _VisualStreamCrossAttnProjector(Module):
         )
         # ``attn`` is ``(1, heads, q_bucket, dim)``. Transpose, trim, flatten.
         attn = attn.transpose(1, 2)[0, :q_real_len].reshape(q_real_len, -1)
-        attn = self.o_proj(attn)
-
-        post_attn = q_real + attn
-        post_ffn = post_attn + self.ffn(self.ffn_norm(post_attn))
-        return post_ffn - q_real  # delta = (q' - q), caller adds to hidden state
+        return self.o_proj(attn)
 
 
 class VisualAdapter(Module):
@@ -573,7 +590,10 @@ class VisualAdapter(Module):
         self.num_deepstack = config.num_deepstack
         self.kind = config.kind
         self.extra_merge_size = config.extra_merge_size
-        self.extra_merger = self._build_extra_merger(config)
+        # Main stream MLP also handles the optional extra spatial merge.
+        # When extra_merge_size>1 the MLP's input dim becomes
+        # ``encoder_dim * extra_merge_size**2`` and ``merge_size`` tokens get
+        # concatenated channel-wise before the MLP (the PatchMerger pattern).
         self.main = _VisualStreamProjector(
             encoder_dim=config.encoder_dim,
             hidden_dim=self.hidden_dim,
@@ -581,31 +601,13 @@ class VisualAdapter(Module):
             norm_eps=config.norm_eps,
             norm=config.norm,
             ffn=config.ffn,
+            merge_size=config.extra_merge_size,
         )
         self.deepstack = ModuleList(
             [
                 self._build_deepstack_projector(config)
                 for _ in range(config.num_deepstack)
             ]
-        )
-
-    @staticmethod
-    def _build_extra_merger(config: "VisualAdapter.Config") -> Module | None:
-        """Build the optional ``PatchMerger`` that compresses the main vision
-        stream from vision-encoder length down to image_pad length.
-
-        Returns ``None`` when the merge ratio is 1 (no compression needed).
-        """
-        if config.extra_merge_size <= 1:
-            return None
-        merge = config.extra_merge_size
-        merged_hidden = config.encoder_dim * (merge**2)
-        return PatchMerger(
-            hidden_size=config.encoder_dim,
-            out_hidden_size=config.encoder_dim,
-            spatial_merge_size=merge,
-            fc1=_projector_linear_config(merged_hidden, merged_hidden, bias=True),
-            fc2=_projector_linear_config(merged_hidden, config.encoder_dim, bias=True),
         )
 
     @staticmethod
@@ -638,10 +640,8 @@ class VisualAdapter(Module):
                 project_dim=config.project_dim,
                 num_heads=config.num_heads,
                 head_dim=head_dim,
-                hidden_dim=hidden_dim,
                 norm_eps=config.norm_eps,
                 norm=config.norm,
-                ffn=config.ffn,
                 kernel_options=config.kernel_options,
             )
         raise ValueError(f"Unknown projector kind: {config.kind!r}")
@@ -666,13 +666,6 @@ class VisualAdapter(Module):
                 f"Expected {self.num_deepstack} DeepStack feature tensors, "
                 f"got {len(deepstack_features)}."
             )
-        if self.extra_merger is not None:
-            # PatchMerger expects (batch, seq_len, hidden); the flat path
-            # passes (total_tokens, hidden). Each image's token count is
-            # divisible by extra_merge_size**2 (enforced by the processor
-            # merge-size constraint), so a single unsqueeze/squeeze does
-            # the right reshape across image boundaries.
-            x = self.extra_merger(x.unsqueeze(0)).squeeze(0)
         projected_deepstack = [
             projector(feature)
             for projector, feature in zip(self.deepstack, deepstack_features)

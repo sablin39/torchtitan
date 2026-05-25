@@ -264,32 +264,16 @@ def _build_ffn(
     raise ValueError(f"Unknown ffn kind: {kind!r}; expected relu|gelu|swiglu")
 
 
-class _ExtraPatchMerger(nn.Module):
-    """HF mirror of ``Qwen3VLVisionModel.PatchMerger`` for the projector's
-    optional main-stream compression.
+class _VisualStreamProjector(nn.Module):
+    """HF mirror of the torchtitan MLP projector.
 
-    Pre-shuffle LayerNorm + spatial reshape (``merge_size**2`` adjacent
-    tokens concatenated along channels) + 2-layer MLP that projects back
-    to ``out_hidden_size``.
+    When ``merge_size > 1`` the projector also performs the spatial merge:
+    ``merge_size**2`` adjacent tokens are concatenated along channels and
+    fed through a 2-layer MLP that maps ``encoder_dim * merge_size**2``
+    channels to ``project_dim``. This subsumes the previous
+    ``_ExtraPatchMerger`` module.
     """
 
-    def __init__(self, hidden_size: int, out_hidden_size: int, merge_size: int):
-        super().__init__()
-        self.spatial_merge_size = merge_size
-        self.merged_hidden_size = hidden_size * (merge_size**2)
-        self.norm = nn.LayerNorm(hidden_size, eps=1e-6)
-        self.linear_fc1 = nn.Linear(self.merged_hidden_size, self.merged_hidden_size)
-        self.act_fn = nn.GELU(approximate="tanh")
-        self.linear_fc2 = nn.Linear(self.merged_hidden_size, out_hidden_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, _ = x.shape
-        x = self.norm(x)
-        x = x.view(batch, seq_len // (self.spatial_merge_size**2), self.merged_hidden_size)
-        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
-
-class _VisualStreamProjector(nn.Module):
     def __init__(
         self,
         encoder_dim: int,
@@ -297,23 +281,37 @@ class _VisualStreamProjector(nn.Module):
         hidden_dim: Optional[int] = None,
         norm: str = "layernorm",
         ffn: str = "relu",
+        merge_size: int = 1,
     ):
         super().__init__()
+        if merge_size < 1:
+            raise ValueError(f"merge_size must be >= 1; got {merge_size}")
         self.encoder_dim = encoder_dim
         self.project_dim = project_dim
         self.hidden_dim = hidden_dim or project_dim * 4
+        self.merge_size = merge_size
+        self.merge_unit = merge_size**2
 
+        in_dim = encoder_dim * self.merge_unit
+        self.in_norm = (
+            _build_norm(norm, encoder_dim) if merge_size > 1 else None
+        )
         self.pre_norm = _build_norm(norm, project_dim)
-        self.mlp = _build_ffn(ffn, encoder_dim, self.hidden_dim, project_dim)
+        self.mlp = _build_ffn(ffn, in_dim, self.hidden_dim, project_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.merge_size > 1:
+            n = x.shape[0]
+            x = self.in_norm(x)
+            x = x.reshape(n // self.merge_unit, self.encoder_dim * self.merge_unit)
         x = self.mlp(x)
         return x + self.pre_norm(x)
 
 
 class _VisualStreamCrossAttnProjector(nn.Module):
     """HF mirror of the torchtitan cross-attn projector. Uses plain SDPA at
-    inference time (no triton dependency).
+    inference time (no triton dependency). Minimal block: pre-norm Q,
+    cross-attention, output projection — no post-attn FFN.
     """
 
     def __init__(
@@ -322,9 +320,7 @@ class _VisualStreamCrossAttnProjector(nn.Module):
         project_dim: int,
         num_heads: int,
         head_dim: int,
-        hidden_dim: Optional[int] = None,
         norm: str = "layernorm",
-        ffn: str = "relu",
     ):
         super().__init__()
         if num_heads * head_dim != project_dim:
@@ -336,14 +332,11 @@ class _VisualStreamCrossAttnProjector(nn.Module):
         self.project_dim = project_dim
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.hidden_dim = hidden_dim or project_dim * 4
         self.kv_norm = _build_norm(norm, encoder_dim)
         self.k_proj = nn.Linear(encoder_dim, num_heads * head_dim, bias=False)
         self.v_proj = nn.Linear(encoder_dim, num_heads * head_dim, bias=False)
         self.q_norm = _build_norm(norm, project_dim)
         self.o_proj = nn.Linear(num_heads * head_dim, project_dim, bias=False)
-        self.ffn_norm = _build_norm(norm, project_dim)
-        self.ffn = _build_ffn(ffn, project_dim, self.hidden_dim, project_dim)
 
     def forward(
         self, x: torch.Tensor
@@ -379,9 +372,7 @@ class _VisualStreamCrossAttnProjector(nn.Module):
         mask4 = attn_mask[None, None, :, :]
         attn = F.scaled_dot_product_attention(q4, k4, v4, attn_mask=mask4)
         attn = attn.squeeze(0).transpose(0, 1).reshape(q_real.shape[0], -1)
-        attn = self.o_proj(attn)
-        post_attn = q_real + attn
-        return self.ffn(self.ffn_norm(post_attn)) + attn
+        return self.o_proj(attn)
 
 
 class VisualAdapter(nn.Module):
@@ -417,21 +408,16 @@ class VisualAdapter(nn.Module):
         self.kind = kind
         self.extra_merge_size = extra_merge_size
 
-        if extra_merge_size > 1:
-            self.extra_merger = _ExtraPatchMerger(
-                hidden_size=encoder_dim,
-                out_hidden_size=encoder_dim,
-                merge_size=extra_merge_size,
-            )
-        else:
-            self.extra_merger = None
-
+        # The main projector also performs the optional extra spatial merge
+        # via its own MLP (PatchMerger pattern). No separate ``extra_merger``
+        # module is needed on the main path.
         self.main = _VisualStreamProjector(
             encoder_dim=encoder_dim,
             project_dim=project_dim,
             hidden_dim=self.hidden_dim,
             norm=norm,
             ffn=ffn,
+            merge_size=extra_merge_size,
         )
         if kind == "mlp":
             self.deepstack = nn.ModuleList(
@@ -465,9 +451,7 @@ class VisualAdapter(nn.Module):
                         project_dim=project_dim,
                         num_heads=num_heads,
                         head_dim=resolved_head_dim,
-                        hidden_dim=self.hidden_dim,
                         norm=norm,
-                        ffn=ffn,
                     )
                     for _ in range(num_deepstack)
                 ]
@@ -487,10 +471,6 @@ class VisualAdapter(nn.Module):
                 f"Expected {self.num_deepstack} DeepStack feature tensors, "
                 f"got {len(deepstack_features)}."
             )
-        if self.extra_merger is not None:
-            # Flat (total_tokens, hidden) -> (1, total_tokens, hidden) for the
-            # PatchMerger view-reshape; squeeze back to flat.
-            x = self.extra_merger(x.unsqueeze(0)).squeeze(0)
         projected_deepstack = [
             projector(feature)
             for projector, feature in zip(self.deepstack, deepstack_features)
