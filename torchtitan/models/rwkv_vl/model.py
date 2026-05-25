@@ -50,33 +50,48 @@ FFNKind = Literal["relu", "gelu", "swiglu"]
 ProjectorKind = Literal["mlp", "cross_attn"]
 
 
-_DEFAULT_BUCKET_LADDER: tuple[int, ...] = (
-    64,
-    128,
-    256,
-    512,
-    1024,
-    2048,
-    4096,
-    8192,
-    16384,
-    32768,
-    65536,
-)
+# Projector cross-attn shapes are bucketed so ``_cross_attn_flex``
+# (compiled with ``dynamic=False``) sees at most O(log N_max) distinct
+# (Q_LEN, KV_LEN) pairs. With ``projector_extra_merge_size > 1`` the K/V
+# stream can be ``extra_merge_size**2`` larger than Q for the same image,
+# so we generate the ladder on the fly instead of maintaining a static one.
+_BUCKET_MIN = 64
+# Soft ceiling — values past this almost certainly indicate a config bug
+# (e.g. unbounded ``max_images_per_batch`` with a huge ``max_pixels``) and
+# a single FlexAttention kernel that large would also be a memory hazard.
+_BUCKET_MAX = 1 << 24  # 16,777,216
+
+
+def _next_pow2_bucket(n: int) -> int:
+    """Round ``n`` up to the next power of two, clamped to ``[_BUCKET_MIN, _BUCKET_MAX]``.
+
+    Raises ``ValueError`` past ``_BUCKET_MAX`` so a runaway config surfaces
+    before flex_attention attempts a multi-million-row compile.
+    """
+    if n <= _BUCKET_MIN:
+        return _BUCKET_MIN
+    if n > _BUCKET_MAX:
+        raise ValueError(
+            f"Value {n} exceeds the projector FlexAttention bucket ceiling "
+            f"{_BUCKET_MAX}; check max_pixels / max_images_per_batch / "
+            "projector_extra_merge_size or pin q_buckets/kv_buckets explicitly."
+        )
+    return 1 << (n - 1).bit_length()
 
 
 def _ceil_to_bucket(n: int, ladder: tuple[int, ...]) -> int:
     """Return the smallest ladder entry >= ``n``.
 
-    Raises ``ValueError`` if ``n`` exceeds the largest bucket — callers must
-    ensure ladder coverage matches the dataloader bucket size.
+    Only used when ``q_buckets`` / ``kv_buckets`` is explicitly pinned on the
+    projector config. Auto-bucketing uses :func:`_next_pow2_bucket`.
     """
     for b in ladder:
         if b >= n:
             return b
     raise ValueError(
-        f"Value {n} exceeds the largest FlexAttention bucket {ladder[-1]}; "
-        "increase the projector q_buckets/kv_buckets ladder."
+        f"Value {n} exceeds the largest configured FlexAttention bucket "
+        f"{ladder[-1]}; widen projector q_buckets/kv_buckets or leave them "
+        "unset to use auto power-of-two bucketing."
     )
 
 
@@ -1074,10 +1089,18 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         q_real_len = sum(end - start for start, end, _ in local_ranges)
         kv_real_len = int(num_kv_per_item.sum().item())
 
-        q_ladder = self.proj.config.q_buckets or _DEFAULT_BUCKET_LADDER
-        kv_ladder = self.proj.config.kv_buckets or _DEFAULT_BUCKET_LADDER
-        q_bucket = _ceil_to_bucket(q_real_len, q_ladder)
-        kv_bucket = _ceil_to_bucket(kv_real_len, kv_ladder)
+        q_ladder = self.proj.config.q_buckets
+        kv_ladder = self.proj.config.kv_buckets
+        q_bucket = (
+            _ceil_to_bucket(q_real_len, q_ladder)
+            if q_ladder
+            else _next_pow2_bucket(q_real_len)
+        )
+        kv_bucket = (
+            _ceil_to_bucket(kv_real_len, kv_ladder)
+            if kv_ladder
+            else _next_pow2_bucket(kv_real_len)
+        )
 
         # Per-row image_id labels, padded with -1 for masked rows.
         q_image_id = torch.full((q_bucket,), -1, dtype=torch.int32, device=device)
