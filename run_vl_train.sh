@@ -135,18 +135,13 @@ projector_ffn="relu"
 # num_heads * head_dim; leave head_dim empty to default to project_dim/num_heads.
 projector_num_heads="8"
 projector_head_dim=""
-# Extra projector-side PatchMerger ratio. = processor_spatial_merge_size /
-# vision_encoder.spatial_merge_size. ``1`` (default) disables it. Set > 1 to
-# let the processor produce fewer <image_pad> tokens than vision K/V tokens;
-# only supported with projector_kind=cross_attn.
-projector_extra_merge_size="1"
-# Spatial merge size used by the processor when counting <image_pad> tokens.
-# Defaults to the vision encoder's spatial_merge_size when empty; must be a
-# positive integer multiple of it.
-processor_spatial_merge_size="4"
-# Spatial merge size used by the dataloader collator. Should match
-# processor_spatial_merge_size; defaults to 2 to match today's flavors.
-dataloader_spatial_merge_size="2"
+# Extra projector-side PatchMerger ratio. ``1`` (default) keeps the existing
+# additive-DeepStack behavior. Set > 1 to compress the projector main stream
+# so the processor produces fewer <image_pad> tokens per image than vision
+# K/V tokens. The processor and dataloader merge sizes are derived
+# automatically as ``vision_encoder.spatial_merge_size * this``. Only
+# supported with projector_kind=cross_attn.
+projector_extra_merge_size="4"
 # Static FlexAttention buckets for the cross_attn projector (cross_attn only).
 # Each forward pads Q and K/V to exactly these sizes so the compiled FlexAttention
 # kernel sees a single static shape. Pick values >= the largest expected per-batch
@@ -538,9 +533,6 @@ fi
 if [[ -n "${projector_extra_merge_size}" ]]; then
     export_args+=(--projector-extra-merge-size "${projector_extra_merge_size}")
 fi
-if [[ -n "${processor_spatial_merge_size}" ]]; then
-    export_args+=(--processor-spatial-merge-size "${processor_spatial_merge_size}")
-fi
 
 echo
 echo "==> Step 1/4: Exporting RWKV-VL HF checkpoint"
@@ -564,9 +556,6 @@ if [[ -n "${projector_head_dim}" ]]; then
 fi
 if [[ -n "${projector_extra_merge_size}" ]]; then
     convert_proj_args+=(--projector_extra_merge_size "${projector_extra_merge_size}")
-fi
-if [[ -n "${processor_spatial_merge_size}" ]]; then
-    convert_proj_args+=(--processor_spatial_merge_size "${processor_spatial_merge_size}")
 fi
 
 echo
@@ -602,7 +591,6 @@ train_args=(
     --training.local-batch-size "${batch_size}"
     --dataloader.packing-buffer-size "${packing_buffer_size}"
     --dataloader.vit-patch-bucket-size "${vit_patch_bucket_size}"
-    --dataloader.spatial-merge-size "${dataloader_spatial_merge_size}"
     --dataloader.num-workers "${dataloader_num_workers}"
     --dataloader.prefetch-factor "${dataloader_prefetch_factor}"
     --dataloader.pixel-values-dtype "${dataloader_pixel_values_dtype}"
@@ -640,9 +628,6 @@ if [[ -n "${projector_head_dim}" ]]; then
 fi
 if [[ -n "${projector_extra_merge_size}" ]]; then
     train_args+=(--projector-extra-merge-size "${projector_extra_merge_size}")
-fi
-if [[ -n "${processor_spatial_merge_size}" ]]; then
-    train_args+=(--processor-spatial-merge-size "${processor_spatial_merge_size}")
 fi
 if [[ -n "${projector_q_bucket}" ]]; then
     train_args+=(--projector-q-bucket "${projector_q_bucket}")

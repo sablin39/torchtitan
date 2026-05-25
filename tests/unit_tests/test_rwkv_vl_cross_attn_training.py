@@ -113,6 +113,17 @@ def _make_model_config() -> RWKV7VLForConditionalGeneration.Config:
             kind="cross_attn",
             num_heads=4,
             extra_merge_size=4,  # processor_merge=8 / vision_merge=2
+            # head_dim=64 here is below what the default TMA kernels handle
+            # cleanly. Production cross_attn flavors (1.5B-v400M+) use
+            # head_dim>=128 and keep TMA on. Pin the BLOCK / stages / warps
+            # explicitly to skip autotune (which trips at small head_dim).
+            kernel_options={
+                "USE_TMA": False,
+                "fwd_BLOCK_M": 64,
+                "fwd_BLOCK_N": 64,
+                "fwd_num_stages": 3,
+                "fwd_num_warps": 4,
+            },
         ),
         lm_head=Linear.Config(
             in_features=hidden_size,

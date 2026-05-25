@@ -247,6 +247,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
             self.tokenizer.set_chat_template(CHAT_TEMPLATE_FAKE_THINKING)
 
+        # set the model args from training job configs. Done BEFORE the
+        # dataloader is built so a model's ``update_from_config`` can adjust
+        # dataloader config fields (e.g. RWKV-VL deriving the dataloader's
+        # spatial_merge_size from the projector's extra_merge_size).
+        model_config = model_spec.model
+        model_config.update_from_config(
+            trainer_config=config,
+        )
+        self.model_config = model_config
+
         # build dataloader
         self.dataloader = config.dataloader.build(
             dp_world_size=batch_degree,
@@ -255,14 +265,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             seq_len=config.training.seq_len,
             local_batch_size=config.training.local_batch_size,
         )
-
-        # build model (using meta init)
-        model_config = model_spec.model
-        # set the model args from training job configs
-        model_config.update_from_config(
-            trainer_config=config,
-        )
-        self.model_config = model_config
 
         logger.info(f"Building {model_spec.name} {model_spec.flavor}")
 

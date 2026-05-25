@@ -896,7 +896,6 @@ def convert_multimodal(
     projector_num_heads: int | None = None,
     projector_head_dim: int | None = None,
     projector_extra_merge_size: int = 1,
-    processor_spatial_merge_size: int | None = None,
 ) -> None:
     output = os.path.realpath(output)
     text_weights = extract_text_weights(torch_load_weights(rwkv7))
@@ -912,6 +911,11 @@ def convert_multimodal(
         ),
     )
     vision_config, vision_state = load_qwen_vision_package(vision_model, dtype=dtype)
+    # Derive the processor's spatial_merge_size from the projector's extra
+    # merge ratio + the vision encoder's spatial_merge_size. ``extra=1``
+    # keeps backward-compatible behavior (processor merge == vision merge).
+    vision_merge = getattr(vision_config, "spatial_merge_size", 2)
+    processor_spatial_merge_size = vision_merge * projector_extra_merge_size
     config = build_multimodal_config(
         text_config=text_config,
         vision_config=vision_config,
@@ -1089,13 +1093,10 @@ if __name__ == "__main__":
         "--projector-extra-merge-size",
         type=int,
         default=1,
-        help="Extra projector-side PatchMerger ratio (processor_merge / vision_merge).",
-    )
-    parser.add_argument(
-        "--processor-spatial-merge-size",
-        type=int,
-        default=None,
-        help="Spatial merge size used by the processor when inserting <image_pad> tokens. Defaults to vision encoder's spatial_merge_size.",
+        help=(
+            "Extra projector-side PatchMerger ratio. The processor's "
+            "spatial_merge_size is derived as vision_merge_size * this value."
+        ),
     )
     args = parser.parse_args()
 
@@ -1121,7 +1122,6 @@ if __name__ == "__main__":
             projector_num_heads=args.projector_num_heads,
             projector_head_dim=args.projector_head_dim,
             projector_extra_merge_size=args.projector_extra_merge_size,
-            processor_spatial_merge_size=args.processor_spatial_merge_size,
         )
     else:
         convert(

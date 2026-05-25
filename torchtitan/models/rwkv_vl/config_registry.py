@@ -74,12 +74,12 @@ class RWKVVLTrainerConfig(Trainer.Config):
     """Cross-attention head dim (cross_attn projector only)."""
 
     projector_extra_merge_size: int | None = None
-    """Extra projector-side ``PatchMerger`` ratio (``processor_merge / vision_merge``).
-    Only meaningful with ``projector_kind='cross_attn'``."""
-
-    processor_spatial_merge_size: int | None = None
-    """Spatial merge size used by the processor when inserting ``<image_pad>`` tokens.
-    Must be a positive integer multiple of the vision encoder's spatial merge size."""
+    """Extra projector-side ``PatchMerger`` ratio. The processor's spatial
+    merge size and the dataloader collator's merge size are both derived from
+    this and the vision encoder's ``spatial_merge_size``
+    (``processor_merge = vision_merge * projector_extra_merge_size``).
+    ``1`` (default) keeps the existing ``mlp``-projector behavior. Only
+    meaningful with ``projector_kind='cross_attn'``."""
 
     projector_q_bucket: int | None = None
     """Static Q_LEN bucket for the cross-attn projector's FlexAttention call.

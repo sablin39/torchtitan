@@ -26,6 +26,8 @@ def _apply_rwkv_vl_projector_overrides(model_config, args):
 
     Used by the HF↔DCP conversion scripts so that the torchtitan-side model
     construction matches the projector variant baked into the HF checkpoint.
+    The processor merge size is derived from ``projector_extra_merge_size``
+    and the vision encoder's ``spatial_merge_size`` so the two stay in sync.
     """
     proj_overrides = {}
     for src_attr, dst_attr in (
@@ -41,9 +43,12 @@ def _apply_rwkv_vl_projector_overrides(model_config, args):
             proj_overrides[dst_attr] = value
     if proj_overrides and hasattr(model_config, "proj"):
         model_config.proj = replace(model_config.proj, **proj_overrides)
-    pmerge = getattr(args, "processor_spatial_merge_size", None)
-    if pmerge is not None and hasattr(model_config, "processor_spatial_merge_size"):
-        model_config.processor_spatial_merge_size = int(pmerge)
+    if hasattr(model_config, "processor_spatial_merge_size") and hasattr(
+        model_config, "vision_encoder"
+    ):
+        vision_merge = model_config.vision_encoder.spatial_merge_size
+        extra = model_config.proj.extra_merge_size
+        model_config.processor_spatial_merge_size = vision_merge * extra
     return model_config
 
 
@@ -95,7 +100,6 @@ if __name__ == "__main__":
     parser.add_argument("--projector_num_heads", type=int, default=None)
     parser.add_argument("--projector_head_dim", type=int, default=None)
     parser.add_argument("--projector_extra_merge_size", type=int, default=None)
-    parser.add_argument("--processor_spatial_merge_size", type=int, default=None)
     args = parser.parse_args()
 
     convert_from_hf(

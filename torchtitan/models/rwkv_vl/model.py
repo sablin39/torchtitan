@@ -88,10 +88,37 @@ _compiled_create_block_mask = create_block_mask
 # KV_LEN) shapes don't poison the shared compile cache. ``dynamic=False``
 # requires the caller to pad Q/K/V to fixed bucket sizes
 # (``q_buckets`` / ``kv_buckets`` on the projector config) so each invocation
-# specialises against a single shape. Autotune is left at default (off) here
-# because turning it on broke the FlexAttention Triton subprocess in earlier
-# pipeline smokes — eager Triton kernels are still used inside the compile.
-_cross_attn_flex = torch.compile(flex_attention, dynamic=False)
+# specialises against a single shape. Inductor options mirror the vision
+# encoder's FlexAttention settings (max-autotune, coordinate descent
+# tuning, TMA descriptors) — safe here because the static buckets give a
+# single shape to specialise against.
+_cross_attn_flex = torch.compile(
+    flex_attention,
+    dynamic=False,
+    options={
+        "max_autotune": True,
+        "coordinate_descent_tuning": True,
+        "triton.cudagraphs": False,
+        "assume_aligned_inputs": True,
+    },
+)
+
+
+# Default per-call kernel options forwarded to ``flex_attention`` for the
+# cross-attn projector. The vision encoder pins these for ViT bucketing on
+# H800; we reuse the same starting point here. Users can override via the
+# projector config's ``kernel_options`` field (currently unset by default).
+_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT: dict[str, object] = {
+    "USE_TMA": True,
+    "ROWS_GUARANTEED_SAFE": False,
+    "IS_DIVISIBLE": True,
+    # Block sizes / stages / warps are left for Inductor's autotune to pick;
+    # the supported cross_attn production flavors use head_dim>=128 where
+    # autotune finds valid choices. Smaller smoke configs (head_dim=64) hit
+    # a Triton "Cannot broadcast" issue with TMA; those callers should
+    # override ``kernel_options={"USE_TMA": False, "fwd_BLOCK_M": 64, ...}``
+    # via the projector config.
+}
 
 
 def _build_norm(kind: NormKind, dim: int, eps: float) -> Module:
@@ -353,7 +380,9 @@ class _VisualStreamCrossAttnProjector(Module):
             out_dim=project_dim,
             bias=True,
         )
-        self.kernel_options = kernel_options or {}
+        self.kernel_options = dict(_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT)
+        if kernel_options:
+            self.kernel_options.update(kernel_options)
 
     def forward(
         self, x: torch.Tensor
@@ -471,6 +500,11 @@ class VisualAdapter(Module):
         # block_mask per shape).
         q_buckets: tuple[int, ...] | None = None
         kv_buckets: tuple[int, ...] | None = None
+        # Optional overrides for the per-call FlexAttention ``kernel_options``.
+        # Merged on top of ``_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT``. Pass
+        # ``{"USE_TMA": False}`` to disable TMA on small head_dim shapes that
+        # trip Triton autotune; pass empty dict to keep defaults.
+        kernel_options: dict[str, Any] | None = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -562,6 +596,7 @@ class VisualAdapter(Module):
                 norm_eps=config.norm_eps,
                 norm=config.norm,
                 ffn=config.ffn,
+                kernel_options=config.kernel_options,
             )
         raise ValueError(f"Unknown projector kind: {config.kind!r}")
 
@@ -644,8 +679,10 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             )
 
             # Optional projector overrides — let the trainer config override
-            # the flavor-baked defaults for projector kind / norm / ffn / heads /
-            # extra-merge, and override the processor-side spatial merge size.
+            # the flavor-baked defaults for projector kind / norm / ffn / heads.
+            # ``projector_extra_merge_size`` is the single user-facing knob for
+            # the merge-size decoupling: the processor merge size and the
+            # dataloader collator's merge size are both derived from it below.
             proj_overrides: dict[str, Any] = {}
             for src_name, dst_name in (
                 ("projector_kind", "kind"),
@@ -666,11 +703,21 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                 proj_overrides["kv_buckets"] = (int(kv_bucket),)
             if proj_overrides:
                 self.proj = replace(self.proj, **proj_overrides)
-            processor_merge_override = getattr(
-                trainer_config, "processor_spatial_merge_size", None
-            )
-            if processor_merge_override is not None:
-                self.processor_spatial_merge_size = int(processor_merge_override)
+
+            # Derive processor_spatial_merge_size and dataloader merge size
+            # from the projector's extra_merge_size + the vision encoder's
+            # spatial_merge_size. Both knobs must stay in lockstep — they
+            # govern how many ``<image_pad>`` tokens the processor inserts
+            # and how the dataloader collator pads patches.
+            vision_merge = self.vision_encoder.spatial_merge_size
+            extra = self.proj.extra_merge_size
+            derived_processor_merge = vision_merge * extra
+            self.processor_spatial_merge_size = derived_processor_merge
+            dataloader_cfg = getattr(trainer_config, "dataloader", None)
+            if dataloader_cfg is not None and hasattr(
+                dataloader_cfg, "spatial_merge_size"
+            ):
+                dataloader_cfg.spatial_merge_size = derived_processor_merge
 
             if parallelism.tensor_parallel_degree > 1:
                 raise NotImplementedError(
