@@ -29,26 +29,7 @@ DEFAULT_IMAGE_TOKEN_ID = 65532
 CHAT_TEMPLATE = (
     "{% for message in messages %}"
     "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
-    "{% if message['content'] is string %}"
-    "{{ message['content'] }}"
-    "{% else %}"
-    "{% for item in message['content'] %}"
-    "{% if item['type'] == 'image' or item['type'] == 'image_url' %}{{ '<image>' }}{% elif item['type'] == 'text' %}{{ item['text'] }}{% endif %}"
-    "{% endfor %}"
-    "{% endif %}"
-    "{{ '\\x17' }}"
-    "{% if not loop.last or add_generation_prompt %}{{ '\\n\\n' }}{% endif %}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}"
-    "{{ '\\x16Assistant:' }}"
-    "{% if thinking is defined and thinking %}{{ ' <think>' }}{% endif %}"
-    "{% endif %}"
-)
-
-CHAT_TEMPLATE_FAKE_THINKING = (
-    "{% for message in messages %}"
-    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
-    "{% if message['role'] == 'assistant' %}{{ '<think>\\n</think>\\n ' }}{% endif %}"
+    "{% if fake_thinking is defined and fake_thinking and message['role'] == 'assistant' %}{{ '<think>\\n</think>\\n ' }}{% endif %}"
     "{% if message['content'] is string %}"
     "{{ message['content'] }}"
     "{% else %}"
@@ -188,12 +169,14 @@ class RWKVTokenizerCore:
         add_bos_token: bool = False,
         add_eos_token: bool = False,
         chat_template: str | None = None,
+        fake_thinking: bool = False,
     ) -> None:
         self.vocab_file = vocab_file
         self.vocab_size = vocab_size
         self.special_tokens = special_tokens or RWKVSpecialTokens()
         self.default_add_bos = add_bos_token
         self.default_add_eos = add_eos_token
+        self.fake_thinking = bool(fake_thinking)
 
         self.idx2token, self.token2idx = load_rwkv_vocab(vocab_file)
         self.root = ByteTrie()
@@ -262,6 +245,7 @@ class RWKVTokenizerCore:
             "vision_start_token": self.vision_start_token,
             "vision_end_token": self.vision_end_token,
             "image_placeholder_token": self.image_placeholder_token,
+            "fake_thinking": self.fake_thinking,
         }
 
     def set_chat_template(self, template: str) -> None:

@@ -243,9 +243,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # build tokenizer
         self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
         if config.fake_thinking:
-            from torchtitan.models.rwkv7.tokenizer import CHAT_TEMPLATE_FAKE_THINKING
-
-            self.tokenizer.set_chat_template(CHAT_TEMPLATE_FAKE_THINKING)
+            if hasattr(type(self.tokenizer), "fake_thinking"):
+                self.tokenizer.fake_thinking = True
+            else:
+                logger.warning(
+                    "fake_thinking=True is only supported by tokenizers exposing a "
+                    "'fake_thinking' attribute; %s does not — ignoring.",
+                    type(self.tokenizer).__name__,
+                )
 
         # set the model args from training job configs. Done BEFORE the
         # dataloader is built so a model's ``update_from_config`` can adjust

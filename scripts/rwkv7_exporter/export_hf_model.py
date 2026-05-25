@@ -41,7 +41,6 @@ except ImportError:
     from configuration_rwkv7 import RWKV7Config
     from modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
 from torchtitan.models.rwkv7.tokenizer_core import (
-    CHAT_TEMPLATE_FAKE_THINKING,
     DEFAULT_BOS_TOKEN,
     DEFAULT_EOS_TOKEN,
     DEFAULT_IMAGE_TOKEN_ID,
@@ -714,9 +713,6 @@ def save_multimodal_processor(
         VLRwkvTokenizer = remote_code.RwkvTokenizer
         ModRWKVProcessor = remote_code.ModRWKVProcessor
         assert ModRWKVProcessor is not None
-        processor_chat_template_fake_thinking = (
-            remote_code.processor_module.CHAT_TEMPLATE_FAKE_THINKING
-        )
 
         VLRwkvTokenizer.register_for_auto_class("AutoTokenizer")
         ModRWKVProcessor.register_for_auto_class("AutoProcessor")
@@ -727,6 +723,7 @@ def save_multimodal_processor(
             eos_token="\x17",
             pad_token="\x17",
             unk_token="\x16",
+            fake_thinking=fake_thinking,
         )
         image_processor = AutoImageProcessor.from_pretrained(
             image_processor_source,
@@ -745,9 +742,7 @@ def save_multimodal_processor(
         processor = ModRWKVProcessor(
             tokenizer=tokenizer,
             image_processor=image_processor,
-            chat_template=(
-                processor_chat_template_fake_thinking if fake_thinking else None
-            ),
+            fake_thinking=fake_thinking,
         )
         processor.save_pretrained(output)
         save_tokenizer_core(output)
@@ -866,7 +861,7 @@ def convert(
             eos_token=DEFAULT_EOS_TOKEN,
             pad_token=DEFAULT_EOS_TOKEN,
             unk_token=DEFAULT_BOS_TOKEN,
-            chat_template=CHAT_TEMPLATE_FAKE_THINKING if fake_thinking else None,
+            fake_thinking=fake_thinking,
         )
         tokenizer.register_for_auto_class()
         tokenizer.save_pretrained(output)

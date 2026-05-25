@@ -10,7 +10,6 @@ from transformers.utils import logging
 try:
     from .tokenizer_core import (
         CHAT_TEMPLATE,
-        CHAT_TEMPLATE_FAKE_THINKING,
         DEFAULT_IMAGE_TOKEN,
         DEFAULT_VISION_END_TOKEN,
         DEFAULT_VISION_START_TOKEN,
@@ -20,7 +19,6 @@ try:
 except ImportError:
     from torchtitan.models.rwkv7.tokenizer_core import (
         CHAT_TEMPLATE,
-        CHAT_TEMPLATE_FAKE_THINKING,
         DEFAULT_IMAGE_TOKEN,
         DEFAULT_VISION_END_TOKEN,
         DEFAULT_VISION_START_TOKEN,
@@ -59,6 +57,7 @@ class RwkvTokenizer(PreTrainedTokenizer):
         pad_token="\x17",
         unk_token="\x16",
         chat_template=None,
+        fake_thinking: bool = False,
         **kwargs,
     ):
         if not os.path.isfile(vocab_file):
@@ -70,6 +69,7 @@ class RwkvTokenizer(PreTrainedTokenizer):
         unk_token = _token_content(unk_token)
 
         self.add_bos_token = bool(kwargs.pop("add_bos_token", False))
+        self.fake_thinking = bool(fake_thinking)
         self.core = RWKVTokenizerCore(
             vocab_file,
             special_tokens=RWKVSpecialTokens(
@@ -81,6 +81,7 @@ class RwkvTokenizer(PreTrainedTokenizer):
             add_bos_token=self.add_bos_token,
             add_eos_token=False,
             chat_template=CHAT_TEMPLATE if chat_template is None else chat_template,
+            fake_thinking=self.fake_thinking,
         )
         self.encoder = self.core.token2idx
         self.decoder = self.core.idx2token
@@ -111,6 +112,7 @@ class RwkvTokenizer(PreTrainedTokenizer):
             unk_token=unk_token,
             additional_special_tokens=additional_special_tokens,
             chat_template=self.chat_template,
+            fake_thinking=self.fake_thinking,
             **kwargs,
         )
 
@@ -201,6 +203,10 @@ class RwkvTokenizer(PreTrainedTokenizer):
         if token_ids_1 is None:
             return [1] + ([0] * len(token_ids_0))
         return [1] + ([0] * len(token_ids_0)) + [1] + ([0] * len(token_ids_1))
+
+    def apply_chat_template(self, conversation, *args, **kwargs):
+        kwargs.setdefault("fake_thinking", self.fake_thinking)
+        return super().apply_chat_template(conversation, *args, **kwargs)
 
     def expand_image_placeholders(
         self,
