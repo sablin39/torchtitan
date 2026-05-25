@@ -180,6 +180,7 @@ class FlexAttention(Module):
     # (iterative refine after autotune) is the most expensive piece and is
     # kept off.
     _DEFAULT_KERNEL_OPTIONS: ClassVar[dict] = {
+        "USE_TMA": True,
         "BLOCK_M": 64,
         "BLOCK_N": 64,
         "BLOCK_M1": 32,
@@ -201,7 +202,7 @@ class FlexAttention(Module):
         # above pin num_stages/num_warps to cut the search space. Coordinate
         # descent is off because it's where most of the autotune time goes
         # (iterative ±1 refinement after the initial sweep).
-        "max_autotune": True,
+        "max_autotune": False,
         "coordinate_descent_tuning": False,
         "triton.cudagraphs": False,
         # Allow Inductor autotuning to consider Triton tensor descriptors/TMA
