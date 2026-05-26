@@ -7,6 +7,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import TypeAlias
 
 import torch
@@ -28,6 +29,50 @@ def cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor
         reduction="sum",
         ignore_index=IGNORE_INDEX,
     )
+
+
+def cross_entropy_with_l2wrap_loss(
+    pred: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    l2_wrap_factor: float,
+) -> torch.Tensor:
+    """CE sum loss plus an L2Wrap penalty on the per-position max logit.
+
+    The penalty is ``0.5 * factor * sum_{i in supervised} max_v(pred[i, v])**2``.
+    Once BaseLoss.__call__ divides the returned sum by the global count of
+    supervised tokens (labels != IGNORE_INDEX), the gradient injected at each
+    supervised position's argmax becomes ``factor * max_logit / num_supervised``.
+    This matches RWKV's original L2Wrap regularizer, but normalized by the
+    count of supervised tokens rather than B*T — so the effective per-token
+    penalty does not silently shrink when many positions are masked (e.g. image
+    tokens in VL training).
+
+    Requires the full vocabulary dimension to be present locally on ``pred``;
+    do not use with loss-parallel TP that shards the vocab dim.
+    """
+    flat_pred = pred.flatten(0, 1).float()
+    flat_labels = labels.flatten(0, 1)
+    ce = torch.nn.functional.cross_entropy(
+        flat_pred,
+        flat_labels,
+        reduction="sum",
+        ignore_index=IGNORE_INDEX,
+    )
+    mask = (flat_labels != IGNORE_INDEX).to(flat_pred.dtype)
+    max_logits = flat_pred.amax(dim=-1)
+    penalty = 0.5 * l2_wrap_factor * (max_logits.square() * mask).sum()
+    return ce + penalty
+
+
+def _select_ce_fn(l2_wrap_factor: float) -> LossFunction:
+    if l2_wrap_factor < 0:
+        raise ValueError(
+            f"l2_wrap_factor must be non-negative, got {l2_wrap_factor}"
+        )
+    if l2_wrap_factor == 0:
+        return cross_entropy_loss
+    return partial(cross_entropy_with_l2wrap_loss, l2_wrap_factor=l2_wrap_factor)
 
 
 def mse_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -77,14 +122,21 @@ class BaseLoss(ABC, Configurable):
 
 
 class CrossEntropyLoss(BaseLoss):
-    """Cross-entropy loss with sum reduction for token-based normalization."""
+    """Cross-entropy loss with sum reduction for token-based normalization.
+
+    When ``l2_wrap_factor > 0``, adds the RWKV-style L2Wrap penalty on the
+    per-position max logit. See :func:`cross_entropy_with_l2wrap_loss`.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
-        pass
+        l2_wrap_factor: float = 0.0
+        """Strength of the L2Wrap penalty on the max logit. ``0`` disables it
+        (default, preserving exact CE numerics). RWKV's reference value is
+        ``1e-4``."""
 
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
-        self.fn: LossFunction = cross_entropy_loss
+        self.fn: LossFunction = _select_ce_fn(config.l2_wrap_factor)
         self._maybe_compile(compile_config)
 
 
@@ -230,13 +282,19 @@ class ChunkedCELoss(BaseLoss):
         num_chunks: int = 8
         """Number of chunks to split the sequence into."""
 
+        l2_wrap_factor: float = 0.0
+        """Strength of the L2Wrap penalty on the max logit. ``0`` disables it
+        (default, preserving exact CE numerics). RWKV's reference value is
+        ``1e-4``. The penalty is applied per chunk and aggregates correctly
+        with the chunked backward path."""
+
     def __init__(
         self,
         config: Config,
         *,
         compile_config: CompileConfig | None = None,
     ):
-        self.fn: LossFunction = cross_entropy_loss
+        self.fn: LossFunction = _select_ce_fn(config.l2_wrap_factor)
         self._maybe_compile(compile_config)
         self.num_chunks = config.num_chunks
         self.lm_head: nn.Module | None = None

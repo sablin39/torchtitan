@@ -13,6 +13,41 @@ fields set at config creation time.
 from collections.abc import Callable
 from typing import Literal
 
+from torchtitan.components.tokenizer import BaseTokenizer
+from torchtitan.tools.logging import logger
+
+
+def align_vocab_size_to_tokenizer(
+    *,
+    declared_vocab_size: int,
+    tokenizer: BaseTokenizer | None,
+    multiple: int = 128,
+) -> int:
+    """Return a vocab size that matches the tokenizer, rounded up.
+
+    If ``tokenizer`` is ``None``, returns ``declared_vocab_size`` unchanged.
+    Otherwise rounds the tokenizer's reported vocab size up to a multiple
+    of ``multiple`` (default 128, matching the matmul tile boundaries that
+    typical bf16 GEMM kernels prefer). The result is at least the original
+    declared value — never silently shrinks an existing model's vocab.
+
+    Logs a warning when the declared and aligned values disagree so the
+    swap is visible at trainer startup.
+    """
+    if tokenizer is None:
+        return declared_vocab_size
+    tok_vocab = tokenizer.get_vocab_size()
+    aligned = max(((tok_vocab + multiple - 1) // multiple) * multiple, declared_vocab_size)
+    if aligned != declared_vocab_size:
+        logger.info(
+            "Aligning vocab_size: declared=%d, tokenizer=%d, aligned (pad to multiple of %d)=%d",
+            declared_vocab_size,
+            tok_vocab,
+            multiple,
+            aligned,
+        )
+    return aligned
+
 from torchtitan.models.common.attention import (
     FlexAttention,
     FusedQKVLinear,

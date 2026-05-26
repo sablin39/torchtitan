@@ -28,8 +28,18 @@ def _load_c4_dataset(dataset_path: str, split: str):
     return load_dataset(dataset_path, name="en", split=split, streaming=True)
 
 
+def _load_fineweb_edu_dataset(dataset_path: str, split: str):
+    """Load the fineweb-edu dataset.
+
+    ``dataset_path`` is expected to point directly at the parquet shards
+    (e.g. ``/mnt/raid0_8t/fineweb-edu/sample/10BT``); no subset resolution
+    happens here.
+    """
+    return load_dataset(dataset_path, split=split, streaming=True)
+
+
 def _process_c4_text(sample: dict[str, Any]) -> str:
-    """Process C4 dataset sample text."""
+    """Process a sample carrying a ``text`` column (C4, fineweb-edu, ...)."""
     return sample["text"]
 
 
@@ -48,6 +58,11 @@ DATASETS = {
     "c4_validation": DatasetConfig(
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="validation"),
+        sample_processor=_process_c4_text,
+    ),
+    "fineweb-edu": DatasetConfig(
+        path="HuggingFaceFW/fineweb-edu",
+        loader=partial(_load_fineweb_edu_dataset, split="train"),
         sample_processor=_process_c4_text,
     ),
 }

@@ -799,6 +799,24 @@ class RWKV7ForCausalLM(BaseModel):
             training = trainer_config.training
             compile_config = getattr(trainer_config, "compile", None)
 
+            # Snap vocab_size to the paired tokenizer (rounded up for matmul
+            # alignment) so the model's embedding + lm_head match whatever
+            # tokenizer the trainer built.
+            from torchtitan.models.common.config_utils import (
+                align_vocab_size_to_tokenizer,
+            )
+
+            tokenizer = kwargs.get("tokenizer")
+            new_vocab = align_vocab_size_to_tokenizer(
+                declared_vocab_size=self.vocab_size, tokenizer=tokenizer
+            )
+            if new_vocab != self.vocab_size:
+                self.vocab_size = new_vocab
+                self.llm.vocab_size = new_vocab
+                self.llm.embeddings.num_embeddings = new_vocab
+                if self.lm_head is not None:
+                    self.lm_head.out_features = new_vocab
+
             if parallelism.tensor_parallel_degree > 1:
                 raise NotImplementedError(
                     "RWKV7 v1 does not support tensor parallelism"
@@ -939,6 +957,23 @@ def rwkv7_backbone_config(
     )
 
 
+def rwkv7_causal_lm_from_backbone(
+    backbone: RWKV7Backbone.Config,
+) -> RWKV7ForCausalLM.Config:
+    """Wrap an existing backbone config with a tied-shape lm_head."""
+    return RWKV7ForCausalLM.Config(
+        vocab_size=backbone.vocab_size,
+        hidden_size=backbone.hidden_size,
+        llm=backbone,
+        lm_head=Linear.Config(
+            in_features=backbone.hidden_size,
+            out_features=backbone.vocab_size,
+            bias=False,
+            param_init=_output_linear_init(backbone.hidden_size),
+        ),
+    )
+
+
 def rwkv7_causal_lm_config(
     *,
     vocab_size: int = 65536,
@@ -946,19 +981,11 @@ def rwkv7_causal_lm_config(
     skip_embedding_init: bool = False,
     **kwargs,
 ) -> RWKV7ForCausalLM.Config:
-    return RWKV7ForCausalLM.Config(
-        vocab_size=vocab_size,
-        hidden_size=hidden_size,
-        llm=rwkv7_backbone_config(
+    return rwkv7_causal_lm_from_backbone(
+        rwkv7_backbone_config(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             skip_embedding_init=skip_embedding_init,
             **kwargs,
-        ),
-        lm_head=Linear.Config(
-            in_features=hidden_size,
-            out_features=vocab_size,
-            bias=False,
-            param_init=_output_linear_init(hidden_size),
-        ),
+        )
     )

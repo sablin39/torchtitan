@@ -717,6 +717,30 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                 ),
             )
 
+            # Snap vocab_size to the paired tokenizer (rounded up for matmul
+            # alignment). image / vision_start / vision_end token ids are
+            # intentionally not auto-synced from the tokenizer here — the VL
+            # special-token IDs must be set explicitly per-flavor.
+            from torchtitan.models.common.config_utils import (
+                align_vocab_size_to_tokenizer,
+            )
+
+            tokenizer = kwargs.get("tokenizer")
+            new_vocab = align_vocab_size_to_tokenizer(
+                declared_vocab_size=self.vocab_size, tokenizer=tokenizer
+            )
+            if new_vocab != self.vocab_size:
+                self.vocab_size = new_vocab
+                self.llm = replace(
+                    self.llm,
+                    vocab_size=new_vocab,
+                    embeddings=replace(
+                        self.llm.embeddings, num_embeddings=new_vocab
+                    ),
+                )
+                if self.lm_head is not None:
+                    self.lm_head = replace(self.lm_head, out_features=new_vocab)
+
             # Optional projector overrides — let the trainer config override
             # the flavor-baked defaults for projector kind / norm / ffn / heads.
             # ``projector_extra_merge_size`` is the single user-facing knob for

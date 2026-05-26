@@ -124,7 +124,7 @@ def _rwkv_vl_chat_dataloader(**kwargs) -> MMChatDataLoader.Config:
 
 def rwkv_vl_debugmodel() -> Trainer.Config:
     return RWKVVLTrainerConfig(
-        loss=ChunkedCELoss.Config(),
+        loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
         hf_assets_path="./tests/assets/tokenizer",
         tokenizer=MultiModalTokenizer.Config(**_DEBUG_SPECIAL_TOKENS),
         model_spec=model_registry("debugmodel"),
@@ -147,7 +147,7 @@ def rwkv_vl_debugmodel() -> Trainer.Config:
 
 def rwkv_vl_debugmodel_chat() -> Trainer.Config:
     return RWKVVLTrainerConfig(
-        loss=ChunkedCELoss.Config(),
+        loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
         hf_assets_path="./tests/assets/tokenizer",
         tokenizer=RwkvVLMultiModalTokenizer.Config(),
         model_spec=model_registry("debugmodel"),
@@ -170,7 +170,7 @@ def rwkv_vl_debugmodel_chat() -> Trainer.Config:
 
 def _rwkv_vl_chat_config(model_flavor: str) -> Trainer.Config:
     return RWKVVLTrainerConfig(
-        loss=ChunkedCELoss.Config(),
+        loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
         hf_assets_path="./tests/assets/tokenizer",
         tokenizer=RwkvVLMultiModalTokenizer.Config(),
         model_spec=model_registry(model_flavor),
