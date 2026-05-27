@@ -10,7 +10,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,9 @@ import torch.nn.functional as F
 from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchtitan.models.common import Embedding, Linear
-from torchtitan.models.common.param_init import skip_param_init
+from torchtitan.models.common.moe import TokenChoiceTopKRouter
+from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
+from torchtitan.ops.scatter_add import deterministic_scatter_add
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict, Sequential
 from torchtitan.tools.logging import logger
@@ -90,6 +92,19 @@ def _linear(
 
 def _sqrelu(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
+
+
+def _channel_mix_x_k_curve(
+    *,
+    hidden_size: int,
+    layer_idx: int,
+    num_hidden_layers: int,
+    device: torch.device,
+) -> torch.Tensor:
+    ratio_1_to_almost0 = 1.0 - (layer_idx / num_hidden_layers)
+    ddd = torch.arange(hidden_size, device=device, dtype=torch.float32)
+    ddd = ddd / hidden_size
+    return 1.0 - torch.pow(ddd, ratio_1_to_almost0**4)
 
 
 def _reshape_heads(x: torch.Tensor, head_dim: int) -> torch.Tensor:
@@ -582,18 +597,21 @@ class RWKV7ChannelMix(Module):
         self.value = _linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def _init_self_parameters(self) -> None:
-        ratio_1_to_almost0 = 1.0 - (self.layer_idx / self.num_hidden_layers)
-        ddd = torch.arange(
-            self.hidden_size, device=self.x_k.device, dtype=torch.float32
-        )
-        ddd = ddd / self.hidden_size
         with torch.no_grad():
             _copy_tensor_(
                 self.x_k,
-                1.0 - torch.pow(ddd, ratio_1_to_almost0**4),
+                _channel_mix_x_k_curve(
+                    hidden_size=self.hidden_size,
+                    layer_idx=self.layer_idx,
+                    num_hidden_layers=self.num_hidden_layers,
+                    device=self.x_k.device,
+                ),
             )
             _orthogonal_(self.key.weight)
             self.value.weight.zero_()
+
+    def forward_with_delta(self, x: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        return self.value(_sqrelu(self.key(x.addcmul(delta, self.x_k))))
 
     def forward(
         self,
@@ -607,7 +625,273 @@ class RWKV7ChannelMix(Module):
             cp_context=cp_context,
             cu_seqlens=cu_seqlens,
         )
-        return self.value(_sqrelu(self.key(x.addcmul(delta, self.x_k))))
+        return self.forward_with_delta(x, delta)
+
+
+class RWKV7ChannelMixExperts(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        hidden_size: int
+        intermediate_size: int
+        num_experts: int
+        layer_idx: int
+        num_hidden_layers: int
+        hidden_act: str = "sqrelu"
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.num_experts = config.num_experts
+        self.layer_idx = config.layer_idx
+        self.num_hidden_layers = config.num_hidden_layers
+        if config.hidden_act != "sqrelu":
+            raise ValueError(
+                "RWKV7ChannelMixExperts currently supports hidden_act='sqrelu'"
+            )
+
+        self.x_k = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
+        self.key = nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_size, self.hidden_size)
+        )
+        self.value = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_size, self.intermediate_size)
+        )
+
+    def _init_self_parameters(self) -> None:
+        x_k_curve = _channel_mix_x_k_curve(
+            hidden_size=self.hidden_size,
+            layer_idx=self.layer_idx,
+            num_hidden_layers=self.num_hidden_layers,
+            device=self.x_k.device,
+        )
+        with torch.no_grad():
+            _copy_tensor_(self.x_k, x_k_curve.unsqueeze(0).expand_as(self.x_k))
+            for expert_idx in range(self.num_experts):
+                _orthogonal_(self.key[expert_idx])
+            self.value.zero_()
+
+    def _forward_grouped_mm(
+        self,
+        mixed: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        h = torch._grouped_mm(
+            mixed.bfloat16(), key.bfloat16().transpose(-2, -1), offs=offsets
+        )
+        h = _sqrelu(h)
+        return torch._grouped_mm(
+            h, value.bfloat16().transpose(-2, -1), offs=offsets
+        ).type_as(mixed)
+
+    def _forward_loop(
+        self,
+        mixed: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs: list[torch.Tensor] = []
+        start = 0
+        counts = num_tokens_per_expert.to(device="cpu", dtype=torch.long).tolist()
+        for expert_idx, count in enumerate(counts):
+            end = start + count
+            if count > 0:
+                hidden = _sqrelu(F.linear(mixed[start:end], key[expert_idx]))
+                outputs.append(F.linear(hidden, value[expert_idx]))
+            start = end
+        if not outputs:
+            return mixed.new_zeros(0, self.hidden_size)
+        return torch.cat(outputs, dim=0).type_as(mixed)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        delta: torch.Tensor,
+        top_scores: torch.Tensor,
+        selected_experts_indices: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.numel() == 0:
+            return torch.zeros_like(x)
+
+        flat_experts = selected_experts_indices.reshape(-1)
+        token_indices_experts_sorted = torch.argsort(flat_experts, stable=True)
+        expert_indices = flat_experts[token_indices_experts_sorted]
+        token_indices = token_indices_experts_sorted // selected_experts_indices.shape[1]
+        top_scores_sorted = top_scores.reshape(-1)[token_indices_experts_sorted]
+
+        if isinstance(self.x_k, DTensor):
+            x_k = self.x_k.to_local()
+            key = self.key.to_local()
+            value = self.value.to_local()
+        else:
+            x_k = self.x_k
+            key = self.key
+            value = self.value
+
+        mixed = x[token_indices].addcmul(delta[token_indices], x_k[expert_indices])
+        counts = num_tokens_per_expert.to(dtype=torch.int32)
+        if mixed.is_cuda:
+            routed_output = self._forward_grouped_mm(mixed, counts, key, value)
+        else:
+            routed_output = self._forward_loop(mixed, counts, key, value)
+
+        routed_output = (
+            routed_output.to(torch.float32) * top_scores_sorted.reshape(-1, 1)
+        ).to(x.dtype)
+
+        out = torch.zeros_like(x)
+        return deterministic_scatter_add(
+            out,
+            token_indices.reshape(-1, 1).expand(-1, self.hidden_size),
+            routed_output,
+        )
+
+
+class RWKV7MoEChannelMix(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        hidden_size: int
+        intermediate_size: int
+        layer_idx: int
+        num_hidden_layers: int
+        num_experts: int = 64
+        num_shared_experts: int = 2
+        top_k: int = 6
+        score_func: Literal["softmax", "sigmoid"] = "softmax"
+        route_norm: bool = False
+        route_scale: float = 1.0
+        num_expert_groups: int | None = None
+        num_limited_groups: int | None = None
+        load_balance_coeff: float | None = 1e-3
+        hidden_act: str = "sqrelu"
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.layer_idx = config.layer_idx
+        self.num_hidden_layers = config.num_hidden_layers
+        self.num_experts = config.num_experts
+        self.num_shared_experts = config.num_shared_experts
+        self.top_k = config.top_k
+        if config.hidden_act != "sqrelu":
+            raise ValueError("RWKV7MoEChannelMix currently supports hidden_act='sqrelu'")
+        if config.top_k > config.num_experts:
+            raise ValueError(
+                f"top_k ({config.top_k}) must be <= num_experts ({config.num_experts})"
+            )
+        if config.num_shared_experts < 0:
+            raise ValueError("num_shared_experts must be >= 0")
+
+        self.router = TokenChoiceTopKRouter.Config(
+            num_experts=config.num_experts,
+            num_expert_groups=config.num_expert_groups,
+            num_limited_groups=config.num_limited_groups,
+            top_k=config.top_k,
+            score_func=config.score_func,
+            route_norm=config.route_norm,
+            route_scale=config.route_scale,
+            gate=Linear.Config(
+                in_features=config.hidden_size,
+                out_features=config.num_experts,
+                bias=False,
+                param_init={
+                    "weight": partial(
+                        nn.init.trunc_normal_,
+                        std=depth_scaled_std(0.02, config.layer_idx),
+                    )
+                },
+            ),
+        ).build()
+        self.experts = RWKV7ChannelMixExperts.Config(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_experts=config.num_experts,
+            layer_idx=config.layer_idx,
+            num_hidden_layers=config.num_hidden_layers,
+            hidden_act=config.hidden_act,
+        ).build()
+        self.shared_experts = (
+            RWKV7ChannelMix.Config(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.num_shared_experts * config.intermediate_size,
+                layer_idx=config.layer_idx,
+                num_hidden_layers=config.num_hidden_layers,
+                hidden_act=config.hidden_act,
+            ).build()
+            if config.num_shared_experts > 0
+            else None
+        )
+
+        self.load_balance_coeff = config.load_balance_coeff
+        if self.load_balance_coeff is not None:
+            if self.load_balance_coeff <= 0.0:
+                raise ValueError("load_balance_coeff must be positive or None")
+            self.register_buffer(
+                "expert_bias",
+                torch.zeros(config.num_experts, dtype=torch.float32),
+                persistent=True,
+            )
+        else:
+            self.expert_bias = None
+        self.register_buffer(
+            "tokens_per_expert",
+            torch.zeros(config.num_experts, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        device = buffer_device or self.tokens_per_expert.device
+        if device.type == "meta":
+            return
+        self.tokens_per_expert = torch.zeros(
+            self.num_experts, dtype=torch.float32, device=device
+        )
+        if self.load_balance_coeff is not None:
+            self.expert_bias = torch.zeros(
+                self.num_experts, dtype=torch.float32, device=device
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        cp_context: Any | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size, seq_len, dim = x.shape
+        delta = _token_shift_eager(
+            x,
+            cp_context=cp_context,
+            cu_seqlens=cu_seqlens,
+        )
+        flat_x = x.reshape(-1, dim)
+        flat_delta = delta.reshape(-1, dim)
+
+        top_scores, selected_experts_indices, num_tokens_per_expert = self.router(
+            flat_x, self.expert_bias
+        )
+
+        with torch.no_grad():
+            self.tokens_per_expert.add_(num_tokens_per_expert)
+
+        out = self.experts(
+            flat_x,
+            flat_delta,
+            top_scores,
+            selected_experts_indices,
+            num_tokens_per_expert,
+        )
+        if self.shared_experts is not None:
+            out = out + self.shared_experts.forward_with_delta(flat_x, flat_delta)
+        return out.reshape(batch_size, seq_len, dim)
 
 
 class RWKV7Block(Module):
@@ -628,6 +912,17 @@ class RWKV7Block(Module):
         norm_bias: bool = True
         hidden_act: str = "sqrelu"
         chunk_size: int = 64
+        moe_channel_mix_enabled: bool = False
+        moe_channel_mix_intermediate_size: int | None = None
+        moe_channel_mix_num_experts: int | None = None
+        moe_channel_mix_num_shared_experts: int = 0
+        moe_channel_mix_top_k: int = 1
+        moe_channel_mix_score_func: Literal["softmax", "sigmoid"] = "softmax"
+        moe_channel_mix_route_norm: bool = False
+        moe_channel_mix_route_scale: float = 1.0
+        moe_channel_mix_num_expert_groups: int | None = None
+        moe_channel_mix_num_limited_groups: int | None = None
+        moe_channel_mix_load_balance_coeff: float | None = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -659,13 +954,44 @@ class RWKV7Block(Module):
             elementwise_affine=True,
             bias=config.norm_bias,
         )
-        self.ffn = RWKV7ChannelMix.Config(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            layer_idx=config.layer_idx,
-            num_hidden_layers=config.num_hidden_layers,
-            hidden_act=config.hidden_act,
-        ).build()
+        self.moe_enabled = config.moe_channel_mix_enabled
+        if self.moe_enabled:
+            if config.moe_channel_mix_intermediate_size is None:
+                raise ValueError(
+                    "moe_channel_mix_intermediate_size is required for MoE ChannelMix"
+                )
+            if config.moe_channel_mix_num_experts is None:
+                raise ValueError(
+                    "moe_channel_mix_num_experts is required for MoE ChannelMix"
+                )
+            self.ffn = RWKV7MoEChannelMix.Config(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_channel_mix_intermediate_size,
+                layer_idx=config.layer_idx,
+                num_hidden_layers=config.num_hidden_layers,
+                num_experts=config.moe_channel_mix_num_experts,
+                num_shared_experts=config.moe_channel_mix_num_shared_experts,
+                top_k=config.moe_channel_mix_top_k,
+                score_func=config.moe_channel_mix_score_func,
+                route_norm=config.moe_channel_mix_route_norm,
+                route_scale=config.moe_channel_mix_route_scale,
+                num_expert_groups=config.moe_channel_mix_num_expert_groups,
+                num_limited_groups=config.moe_channel_mix_num_limited_groups,
+                load_balance_coeff=config.moe_channel_mix_load_balance_coeff,
+                hidden_act=config.hidden_act,
+            ).build()
+        else:
+            self.ffn = RWKV7ChannelMix.Config(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                layer_idx=config.layer_idx,
+                num_hidden_layers=config.num_hidden_layers,
+                hidden_act=config.hidden_act,
+            ).build()
+
+    @property
+    def moe(self) -> RWKV7MoEChannelMix | None:
+        return self.ffn if self.moe_enabled else None
 
     def forward(
         self,
@@ -708,6 +1034,18 @@ class RWKV7Backbone(Module):
         gate_low_rank_dim: int = 128
         v_low_rank_dim: int = 32
         chunk_size: int = 64
+        moe_channel_mix_start_layer: int | None = None
+        moe_channel_mix_layer_freq: int = 1
+        moe_channel_mix_intermediate_size: int | None = None
+        moe_channel_mix_num_experts: int | None = None
+        moe_channel_mix_num_shared_experts: int = 0
+        moe_channel_mix_top_k: int = 1
+        moe_channel_mix_score_func: Literal["softmax", "sigmoid"] = "softmax"
+        moe_channel_mix_route_norm: bool = False
+        moe_channel_mix_route_scale: float = 1.0
+        moe_channel_mix_num_expert_groups: int | None = None
+        moe_channel_mix_num_limited_groups: int | None = None
+        moe_channel_mix_load_balance_coeff: float | None = None
         embeddings: Embedding.Config | None = None
 
     def __init__(self, config: Config):
@@ -730,7 +1068,38 @@ class RWKV7Backbone(Module):
             bias=config.norm_bias,
         )
         value_dims = config.value_dim or [config.hidden_size] * config.num_hidden_layers
+        moe_channel_mix_enabled = config.moe_channel_mix_start_layer is not None
+        if moe_channel_mix_enabled:
+            if config.moe_channel_mix_start_layer is None:
+                raise ValueError("moe_channel_mix_start_layer must be set")
+            if not (0 <= config.moe_channel_mix_start_layer < config.num_hidden_layers):
+                raise ValueError(
+                    "moe_channel_mix_start_layer must select an existing layer"
+                )
+            if config.moe_channel_mix_layer_freq <= 0:
+                raise ValueError("moe_channel_mix_layer_freq must be > 0")
+            if config.moe_channel_mix_intermediate_size is None:
+                raise ValueError(
+                    "moe_channel_mix_intermediate_size is required when MoE is enabled"
+                )
+            if config.moe_channel_mix_num_experts is None:
+                raise ValueError(
+                    "moe_channel_mix_num_experts is required when MoE is enabled"
+                )
+            if config.moe_channel_mix_top_k > config.moe_channel_mix_num_experts:
+                raise ValueError(
+                    "moe_channel_mix_top_k must be <= moe_channel_mix_num_experts"
+                )
         for layer_idx in range(config.num_hidden_layers):
+            layer_uses_moe = (
+                moe_channel_mix_enabled
+                and layer_idx >= config.moe_channel_mix_start_layer
+                and (
+                    (layer_idx - config.moe_channel_mix_start_layer)
+                    % config.moe_channel_mix_layer_freq
+                    == 0
+                )
+            )
             self.layers[str(layer_idx)] = RWKV7Block.Config(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -747,6 +1116,29 @@ class RWKV7Backbone(Module):
                 norm_bias=config.norm_bias,
                 hidden_act=config.hidden_act,
                 chunk_size=config.chunk_size,
+                moe_channel_mix_enabled=layer_uses_moe,
+                moe_channel_mix_intermediate_size=(
+                    config.moe_channel_mix_intermediate_size if layer_uses_moe else None
+                ),
+                moe_channel_mix_num_experts=(
+                    config.moe_channel_mix_num_experts if layer_uses_moe else None
+                ),
+                moe_channel_mix_num_shared_experts=(
+                    config.moe_channel_mix_num_shared_experts
+                ),
+                moe_channel_mix_top_k=config.moe_channel_mix_top_k,
+                moe_channel_mix_score_func=config.moe_channel_mix_score_func,
+                moe_channel_mix_route_norm=config.moe_channel_mix_route_norm,
+                moe_channel_mix_route_scale=config.moe_channel_mix_route_scale,
+                moe_channel_mix_num_expert_groups=(
+                    config.moe_channel_mix_num_expert_groups
+                ),
+                moe_channel_mix_num_limited_groups=(
+                    config.moe_channel_mix_num_limited_groups
+                ),
+                moe_channel_mix_load_balance_coeff=(
+                    config.moe_channel_mix_load_balance_coeff
+                ),
             ).build()
         self.norm = LayerNorm(
             config.hidden_size,
@@ -824,6 +1216,10 @@ class RWKV7ForCausalLM(BaseModel):
             if parallelism.pipeline_parallel_degree > 1:
                 raise NotImplementedError(
                     "RWKV7 v1 does not support pipeline parallelism"
+                )
+            if parallelism.expert_parallel_degree > 1:
+                raise NotImplementedError(
+                    "RWKV7 v1 does not support expert parallelism"
                 )
 
             if parallelism.context_parallel_degree > 1:
@@ -928,6 +1324,18 @@ def rwkv7_backbone_config(
     gate_low_rank_dim: int = 128,
     v_low_rank_dim: int = 32,
     chunk_size: int = 64,
+    moe_channel_mix_start_layer: int | None = None,
+    moe_channel_mix_layer_freq: int = 1,
+    moe_channel_mix_intermediate_size: int | None = None,
+    moe_channel_mix_num_experts: int | None = None,
+    moe_channel_mix_num_shared_experts: int = 0,
+    moe_channel_mix_top_k: int = 1,
+    moe_channel_mix_score_func: Literal["softmax", "sigmoid"] = "softmax",
+    moe_channel_mix_route_norm: bool = False,
+    moe_channel_mix_route_scale: float = 1.0,
+    moe_channel_mix_num_expert_groups: int | None = None,
+    moe_channel_mix_num_limited_groups: int | None = None,
+    moe_channel_mix_load_balance_coeff: float | None = None,
     skip_embedding_init: bool = False,
 ) -> RWKV7Backbone.Config:
     embedding_init = {
@@ -949,6 +1357,18 @@ def rwkv7_backbone_config(
         gate_low_rank_dim=gate_low_rank_dim,
         v_low_rank_dim=v_low_rank_dim,
         chunk_size=chunk_size,
+        moe_channel_mix_start_layer=moe_channel_mix_start_layer,
+        moe_channel_mix_layer_freq=moe_channel_mix_layer_freq,
+        moe_channel_mix_intermediate_size=moe_channel_mix_intermediate_size,
+        moe_channel_mix_num_experts=moe_channel_mix_num_experts,
+        moe_channel_mix_num_shared_experts=moe_channel_mix_num_shared_experts,
+        moe_channel_mix_top_k=moe_channel_mix_top_k,
+        moe_channel_mix_score_func=moe_channel_mix_score_func,
+        moe_channel_mix_route_norm=moe_channel_mix_route_norm,
+        moe_channel_mix_route_scale=moe_channel_mix_route_scale,
+        moe_channel_mix_num_expert_groups=moe_channel_mix_num_expert_groups,
+        moe_channel_mix_num_limited_groups=moe_channel_mix_num_limited_groups,
+        moe_channel_mix_load_balance_coeff=moe_channel_mix_load_balance_coeff,
         embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=hidden_size,

@@ -10,7 +10,7 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.config import ActivationCheckpointConfig, TrainingConfig
+from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig, TrainingConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.trainer import Trainer
 
@@ -46,7 +46,7 @@ def rwkv7_debugmodel() -> Trainer.Config:
 # Pair RWKV7 LM training with the Qwen3-VL HF tokenizer assets. The model's
 # embedding / lm_head vocab is snapped to this tokenizer automatically at
 # trainer-build time (see ``align_vocab_size_to_tokenizer``).
-_QWEN3_VL_TOKENIZER_PATH = "./assets/hf/Qwen3-VL-tokeizer"
+_QWEN3_VL_TOKENIZER_PATH = "./assets/hf/Qwen3-VL-2B-Instruct"
 
 
 def _rwkv7_lm_config(
@@ -108,6 +108,44 @@ def rwkv7_1_5b() -> Trainer.Config:
 
 def rwkv7_2_9b() -> Trainer.Config:
     return _rwkv7_lm_config("2.9B", lr=4e-4)
+
+
+def rwkv7_moe_3b() -> Trainer.Config:
+    return Trainer.Config(
+        loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
+        hf_assets_path=_QWEN3_VL_TOKENIZER_PATH,
+        tokenizer=HuggingFaceTokenizer.Config(),
+        model_spec=model_registry("3B-MoE"),
+        optimizer=OptimizersContainer.Config(
+            name="AdamW", lr=3e-4, beta1=0.9, beta2=0.99, eps=1e-18, weight_decay=0.1
+        ),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2000, decay_type="linear", min_lr_factor=1.0
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=4096,
+            steps=10000,
+            dtype="bfloat16",
+            mixed_precision_param="bfloat16",
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="fineweb-edu",
+            dataset_path="/mnt/raid0_8t/fineweb-edu/sample/10BT/",
+        ),
+        parallelism=ParallelismConfig(
+            tensor_parallel_degree=1,
+            pipeline_parallel_degree=1,
+            expert_parallel_degree=1,
+            context_parallel_degree=1,
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        checkpoint=CheckpointManager.Config(interval=1000, 
+                                            last_save_model_only=False,
+                                            export_dtype="bfloat16",
+                                            keep_latest_k=0),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+    )
 
 
 def rwkv7_7_2b() -> Trainer.Config:
