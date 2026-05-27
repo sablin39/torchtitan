@@ -215,7 +215,7 @@ def _resolve_root_lrs(module_lrs: Any, default_lr: float) -> dict[str, float]:
         value = getattr(module_lrs, name)
         resolved[name] = default_lr if value is None else float(value)
 
-    if getattr(module_lrs, "lm_head") is None:
+    if module_lrs.lm_head is None:
         resolved["lm_head"] = resolved["llm"]
 
     return _validate_root_lrs(resolved)
@@ -704,7 +704,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             parallelism = trainer_config.parallelism
             training = trainer_config.training
             compile_config = getattr(trainer_config, "compile", None)
-            module_lrs = getattr(trainer_config, "module_lrs")
+            module_lrs = trainer_config.module_lrs
             self.root_lrs = _resolve_root_lrs(module_lrs, trainer_config.optimizer.lr)
             _configure_optimizer_param_groups(
                 trainer_config.optimizer,

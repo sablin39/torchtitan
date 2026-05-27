@@ -37,8 +37,10 @@ logger = logging.getLogger(__name__)
 
 CHAT_TEMPLATE = (
     "{% for message in messages %}"
-    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
-    "{% if fake_thinking is defined and fake_thinking and message['role'] == 'assistant' %}{{ '<think>\\n</think>\\n ' }}{% endif %}"
+    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' "
+    "else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
+    "{% if fake_thinking is defined and fake_thinking and message['role'] == 'assistant' %}"
+    "{{ '<think>\\n</think>\\n ' }}{% endif %}"
     "{% if message['content'] is string %}"
     "{{ message['content'] }}"
     "{% else %}"

@@ -36,10 +36,10 @@ if str(REPO_ROOT) not in sys.path:
 
 try:
     from .configuration_rwkv7 import RWKV7Config
-    from .modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
+    from .modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model  # noqa: F401
 except ImportError:
     from configuration_rwkv7 import RWKV7Config
-    from modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
+    from modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model  # noqa: F401
 from torchtitan.models.rwkv7.tokenizer_core import (
     DEFAULT_BOS_TOKEN,
     DEFAULT_EOS_TOKEN,

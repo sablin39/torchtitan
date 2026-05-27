@@ -1,4 +1,8 @@
 # coding=utf-8
+# flake8: noqa
+# This file follows HuggingFace remote-code conventions and is shipped with
+# the exported checkpoint; keep typing.Optional/List/Tuple to match the HF
+# style users see when loading from_pretrained.
 """HF remote-code tokenizer wrapper for RWKV/RWKV-VL exports."""
 
 import os

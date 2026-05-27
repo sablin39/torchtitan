@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+# flake8: noqa
+# HF remote-code module shipped alongside the exported checkpoint; keep the
+# typing.Optional/Union/Dict/Tuple style that HuggingFace users expect.
 """RWKV-VL HF remote-code model used by the exporter.
 
 This file intentionally lives beside the exporter so the generated checkpoint

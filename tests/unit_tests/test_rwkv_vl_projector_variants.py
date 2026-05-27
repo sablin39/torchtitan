@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import gc
 import unittest
-from dataclasses import replace
 from functools import partial
 
 import torch
