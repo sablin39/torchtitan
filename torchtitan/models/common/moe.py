@@ -188,7 +188,7 @@ class TokenChoiceTopKRouter(Module):
 
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x (torch.Tensor): Input tensor with shape ``(bs*slen, dim)``.
@@ -196,13 +196,15 @@ class TokenChoiceTopKRouter(Module):
                 Used for load balancing. Defaults to None.
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
                 - top_scores (torch.Tensor):
                     Routing scores for selected experts with shape ``(bs*slen, top_k)``.
                 - selected_experts_indices (torch.Tensor):
                     Expert indices selected for each token with shape ``(bs*slen, top_k)``.
                 - num_tokens_per_expert (torch.Tensor):
                     Number of tokens assigned to each expert with shape ``(num_experts,)``.
+                - mean_token_entropy (torch.Tensor):
+                    Mean token-wise router entropy (scalar).
         """
         # scores shape (bs*slen, num_experts)
         # Compute gate in float32 to help stability of expert load balancing.
@@ -238,6 +240,16 @@ class TokenChoiceTopKRouter(Module):
                 top_scores,
             ) = self._debug_force_load_balance_routing(scores)
 
+        # Compute token-wise router entropy from the full score distribution.
+        # For sigmoid we normalize to a valid probability distribution.
+        eps = 1e-10
+        if self.score_func == "sigmoid":
+            p = scores / (scores.sum(dim=-1, keepdim=True) + eps)
+        else:
+            p = scores
+        token_entropy = -(p * torch.log(p + eps)).sum(dim=-1)
+        mean_token_entropy = token_entropy.mean()
+
         if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
@@ -251,7 +263,7 @@ class TokenChoiceTopKRouter(Module):
             max=self.num_experts,
         )
 
-        return top_scores, selected_experts_indices, num_tokens_per_expert
+        return top_scores, selected_experts_indices, num_tokens_per_expert, mean_token_entropy
 
 
 class MoE(Module):
@@ -351,6 +363,7 @@ class MoE(Module):
             top_scores,
             selected_experts_indices,
             num_tokens_per_expert,
+            _mean_token_entropy,
         ) = self.router(x, self.expert_bias)
 
         # tokens_per_expert will be used to update the expert bias for load balancing.

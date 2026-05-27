@@ -846,6 +846,12 @@ class RWKV7MoEChannelMix(Module):
             torch.zeros(config.num_experts, dtype=torch.float32),
             persistent=False,
         )
+        for name in ("_token_entropy_sum", "_token_entropy_count", "_load_entropy_sum", "_load_entropy_count"):
+            self.register_buffer(
+                name,
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=False,
+            )
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         device = buffer_device or self.tokens_per_expert.device
@@ -858,6 +864,10 @@ class RWKV7MoEChannelMix(Module):
             self.expert_bias = torch.zeros(
                 self.num_experts, dtype=torch.float32, device=device
             )
+        self._token_entropy_sum.zero_()
+        self._token_entropy_count.zero_()
+        self._load_entropy_sum.zero_()
+        self._load_entropy_count.zero_()
 
     def forward(
         self,
@@ -875,12 +885,29 @@ class RWKV7MoEChannelMix(Module):
         flat_x = x.reshape(-1, dim)
         flat_delta = delta.reshape(-1, dim)
 
-        top_scores, selected_experts_indices, num_tokens_per_expert = self.router(
+        top_scores, selected_experts_indices, num_tokens_per_expert, mean_token_entropy = self.router(
             flat_x, self.expert_bias
         )
 
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
+
+            # Batch expert-load entropy (normalized by max entropy)
+            counts = num_tokens_per_expert.float()
+            total = counts.sum()
+            if total > 0:
+                probs = counts / total
+                eps = 1e-10
+                load_entropy = -(probs * torch.log(probs + eps)).sum()
+                max_entropy = math.log(self.num_experts)
+                normalized_load_entropy = (load_entropy / max_entropy).item()
+            else:
+                normalized_load_entropy = 0.0
+
+            self._token_entropy_sum.add_(float(mean_token_entropy))
+            self._token_entropy_count.add_(1)
+            self._load_entropy_sum.add_(float(normalized_load_entropy))
+            self._load_entropy_count.add_(1)
 
         out = self.experts(
             flat_x,

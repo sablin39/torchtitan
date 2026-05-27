@@ -795,6 +795,41 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 )
         self.data_metric_count += 1
 
+    def _collect_moe_metrics(self) -> dict[str, Any]:
+        token_entropy: dict[str, float] = {}
+        load_entropy: dict[str, float] = {}
+        for model_part in self.model_parts:
+            for layers_fqn in ("layers", "llm.layers"):
+                try:
+                    layers = model_part.get_submodule(layers_fqn)
+                except AttributeError:
+                    continue
+                if not isinstance(layers, torch.nn.ModuleDict):
+                    continue
+                for name, block in layers.items():
+                    if not getattr(block, "moe_enabled", False):
+                        continue
+                    moe = getattr(block, "moe", None)
+                    if moe is None or not hasattr(moe, "_token_entropy_sum"):
+                        continue
+                    if moe._token_entropy_count.item() > 0:
+                        te = (moe._token_entropy_sum / moe._token_entropy_count).item()
+                        token_entropy[name] = te
+                        moe._token_entropy_sum.zero_()
+                        moe._token_entropy_count.zero_()
+                    if moe._load_entropy_count.item() > 0:
+                        le = (moe._load_entropy_sum / moe._load_entropy_count).item()
+                        load_entropy[name] = le
+                        moe._load_entropy_sum.zero_()
+                        moe._load_entropy_count.zero_()
+                break
+        result: dict[str, Any] = {}
+        if token_entropy:
+            result["moe/token_entropy"] = token_entropy
+        if load_entropy:
+            result["moe/load_entropy"] = load_entropy
+        return result
+
     def _consume_data_metrics(self) -> dict[str, float]:
         if self.data_metric_count == 0:
             return {}
@@ -989,6 +1024,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "lr": lr,
         }
         extra_metrics.update(self._consume_data_metrics())
+        extra_metrics.update(self._collect_moe_metrics())
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
