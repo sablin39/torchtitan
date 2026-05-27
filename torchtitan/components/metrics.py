@@ -161,6 +161,9 @@ class WandBLogger(BaseLogger):
         self.wandb = wandb
         self.tag = tag
 
+        # Buffer for wandb.plot.line_series: key -> {"steps": [], "values": {layer: []}}
+        self._series_history: dict[str, dict[str, Any]] = {}
+
         # Create logging directory
         os.makedirs(log_dir, exist_ok=True)
 
@@ -194,6 +197,25 @@ class WandBLogger(BaseLogger):
         for k, v in metrics.items():
             key = k if self.tag is None else f"{self.tag}/{k}"
             if isinstance(v, dict):
+                # For flat dicts-of-scalars (e.g. per-layer metrics) build a
+                # wandb line_series chart so all layers appear in one plot.
+                is_flat = all(not isinstance(sv, dict) for sv in v.values())
+                if is_flat and len(v) > 0:
+                    if key not in self._series_history:
+                        self._series_history[key] = {"steps": [], "values": {}}
+                    hist = self._series_history[key]
+                    hist["steps"].append(step)
+                    for sk, sv in v.items():
+                        hist["values"].setdefault(sk, []).append(float(sv))
+                    chart = self.wandb.plot.line_series(
+                        xs=hist["steps"],
+                        ys=list(hist["values"].values()),
+                        keys=list(hist["values"].keys()),
+                        title=key,
+                        xname="step",
+                    )
+                    wandb_metrics[key] = chart
+                # Also emit flattened scalars so SwanLab / raw scalar panels work.
                 for sub_key, sub_val in _flatten(v, key):
                     wandb_metrics[sub_key] = sub_val
             else:
