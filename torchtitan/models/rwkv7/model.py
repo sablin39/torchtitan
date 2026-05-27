@@ -107,6 +107,62 @@ def _channel_mix_x_k_curve(
     return 1.0 - torch.pow(ddd, ratio_1_to_almost0**4)
 
 
+def get_rwkv7_moe_nparams_and_flops(
+    model: nn.Module,
+    n_layers: int,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    moe_top_k: int,
+    moe_num_experts: int,
+) -> tuple[int, int]:
+    """Calculate nparams and nflops for RWKV7 MoE models.
+
+    Accounts for sparse (expert) parameters so that FLOPs reflect only the
+    active experts per token rather than the full parameter count.
+    """
+    nparams_embedding = 0
+    nparams_router = 0
+    nparams_shared_experts = 0
+    nparams_experts = 0
+    nparams_dense = 0
+
+    for name, p in model.named_parameters():
+        if "embedding" in name:
+            nparams_embedding += p.numel()
+            nparams_dense += p.numel()
+        elif ".shared_experts." in name:
+            nparams_shared_experts += p.numel()
+        elif ".router." in name:
+            nparams_router += p.numel()
+        elif ".experts." in name:
+            nparams_experts += p.numel()
+        else:
+            nparams_dense += p.numel()
+
+    nparams_sparse = nparams_router + nparams_shared_experts + nparams_experts
+    nparams = nparams_dense + nparams_sparse
+
+    nparams_sparse_active = (
+        nparams_router
+        + nparams_shared_experts
+        + nparams_experts * moe_top_k // moe_num_experts
+    )
+    nparams_active = nparams_dense + nparams_sparse_active
+
+    logger.info(
+        f"RWKV7 MoE parameter count: dense {nparams_dense:,}, "
+        f"sparse {nparams_sparse:,}, active {nparams_active:,}"
+    )
+
+    # For RWKV7 we keep the simple 6 * active_params convention used by the
+    # dense variant; the attention FLOPs are implicitly covered by the
+    # parameter-based estimate.
+    num_flops_per_token = 6 * nparams_active
+
+    return nparams, num_flops_per_token
+
+
 def _reshape_heads(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     batch, seq_len, width = x.shape
     return x.view(batch, seq_len, width // head_dim, head_dim)
@@ -1273,6 +1329,16 @@ class RWKV7ForCausalLM(BaseModel):
                     )
 
         def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
+            if self.llm.moe_channel_mix_start_layer is not None:
+                return get_rwkv7_moe_nparams_and_flops(
+                    model,
+                    n_layers=self.llm.num_hidden_layers,
+                    num_heads=self.llm.num_heads,
+                    head_dim=self.llm.head_dim,
+                    seq_len=seq_len,
+                    moe_top_k=self.llm.moe_channel_mix_top_k,
+                    moe_num_experts=self.llm.moe_channel_mix_num_experts,
+                )
             nparams = sum(p.numel() for p in model.parameters())
             return nparams, 6 * nparams
 
