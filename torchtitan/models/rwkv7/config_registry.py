@@ -120,18 +120,19 @@ def rwkv7_moe_3b() -> Trainer.Config:
             name="AdamW", lr=3e-4, beta1=0.9, beta2=0.99, eps=1e-18, weight_decay=0.1
         ),
         lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=2000, decay_type="linear", min_lr_factor=1.0
+            warmup_steps=2000, decay_type="linear", min_lr_factor=1.0 # WSM strategy
         ),
         training=TrainingConfig(
-            local_batch_size=1,
+            local_batch_size=2,
             seq_len=4096,
-            steps=10000,
+            steps=1e10,
             dtype="bfloat16",
             mixed_precision_param="bfloat16",
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
             dataset="fineweb-edu",
             dataset_path="/mnt/raid0_8t/fineweb-edu/sample/10BT/",
+            infinite=False
         ),
         parallelism=ParallelismConfig(
             tensor_parallel_degree=1,
