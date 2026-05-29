@@ -796,8 +796,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.data_metric_count += 1
 
     def _collect_moe_metrics(self) -> dict[str, Any]:
-        token_entropy: dict[str, float] = {}
-        load_entropy: dict[str, float] = {}
+        metrics_by_name: dict[str, dict[str, float]] = {}
         for model_part in self.model_parts:
             for layers_fqn in ("layers", "llm.layers"):
                 try:
@@ -810,25 +809,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     if not getattr(block, "moe_enabled", False):
                         continue
                     moe = getattr(block, "moe", None)
-                    if moe is None or not hasattr(moe, "_token_entropy_sum"):
+                    consume_router_metrics = getattr(
+                        moe, "consume_router_metrics", None
+                    )
+                    if not callable(consume_router_metrics):
                         continue
-                    if moe._token_entropy_count.item() > 0:
-                        te = (moe._token_entropy_sum / moe._token_entropy_count).item()
-                        token_entropy[name] = te
-                        moe._token_entropy_sum.zero_()
-                        moe._token_entropy_count.zero_()
-                    if moe._load_entropy_count.item() > 0:
-                        le = (moe._load_entropy_sum / moe._load_entropy_count).item()
-                        load_entropy[name] = le
-                        moe._load_entropy_sum.zero_()
-                        moe._load_entropy_count.zero_()
+                    for metric_name, value in consume_router_metrics().items():
+                        if isinstance(value, torch.Tensor):
+                            value = value.item()
+                        if isinstance(value, (int, float)):
+                            metrics_by_name.setdefault(
+                                f"moe/{metric_name}", {}
+                            )[name] = float(value)
                 break
-        result: dict[str, Any] = {}
-        if token_entropy:
-            result["moe/token_entropy"] = token_entropy
-        if load_entropy:
-            result["moe/load_entropy"] = load_entropy
-        return result
+        return metrics_by_name
 
     def _consume_data_metrics(self) -> dict[str, float]:
         if self.data_metric_count == 0:
