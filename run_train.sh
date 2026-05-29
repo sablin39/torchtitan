@@ -33,6 +33,24 @@ COMM_MODE=${COMM_MODE:-""}
 
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 
+# Default to a timestamped run directory unless the caller already passed one.
+has_dump_folder=false
+for arg in "$@"; do
+    case "$arg" in
+        --dump_folder|--dump_folder=*)
+            has_dump_folder=true
+            break
+            ;;
+    esac
+done
+
+if [ "$has_dump_folder" = false ]; then
+    timestamp=$(date -u +%Y%m%d_%H%M%S)
+    default_dump_folder="outputs/${CONFIG}_${timestamp}"
+    mkdir -p "$default_dump_folder"
+    set -- --dump_folder "$default_dump_folder" "$@"
+fi
+
 if [ -n "$COMM_MODE" ]; then
     # Communication mode specified: validate configuration or run in debug mode
     echo "Running with comm_mode=${COMM_MODE}"
