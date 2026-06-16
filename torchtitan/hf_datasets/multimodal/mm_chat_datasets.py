@@ -6,9 +6,10 @@
 
 """Multimodal chat SFT dataset and dataloader."""
 
+import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
-import math
 from typing import Any
 
 import torch
@@ -16,14 +17,14 @@ from datasets import Dataset, DatasetDict, load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import get_worker_info, IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.hf_datasets.multimodal.processor_core import (
+    process_images as process_rwkv_vl_images,
     RWKVVLImageProcessorConfig,
     RWKVVLProcessedImages,
-    process_images as process_rwkv_vl_images,
 )
 from torchtitan.hf_datasets.multimodal.utils.packing import MMSamplePacker
 from torchtitan.hf_datasets.multimodal.utils.text import pad_batch_dim, pad_seq_len
@@ -34,9 +35,15 @@ ROLE_TABLE = {
     "user": "user",
     "assistant": "assistant",
     "system": "system",
+    "tool": "tool",
+    "function": "tool",
+    "tool_response": "tool",
+    "tool_call": "tool_call",
     "human": "user",
     "gpt": "assistant",
 }
+
+EMPTY_THINK_PREFIX = "<think>\n</think>\n "
 
 
 _PIXEL_VALUE_DTYPES = {
@@ -82,6 +89,10 @@ def _num_grid_patches(grid_thw: torch.Tensor | None) -> int:
 def _flatten_images(images: Any) -> list[Any]:
     if images is None:
         return []
+    if isinstance(images, dict) and (
+        images.get("bytes") is not None or images.get("path") is not None
+    ):
+        return [images]
     if isinstance(images, (str, bytes)) or hasattr(images, "convert"):
         return [images]
     if isinstance(images, list | tuple):
@@ -97,6 +108,8 @@ def normalize_mm_chat_images(images: Any) -> list[Any]:
 
 
 def _normalize_content(content: Any) -> Any:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -122,7 +135,107 @@ def _normalize_content(content: Any) -> Any:
     return normalized
 
 
+def _text_content_to_string(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+
+    text_parts = []
+    for item in content:
+        if isinstance(item, str):
+            text_parts.append(item)
+            continue
+        if not isinstance(item, dict) or item.get("type") != "text":
+            return None
+        text_parts.append(str(item.get("text", "")))
+    return "".join(text_parts)
+
+
+def _split_think_content(content: str) -> tuple[str | None, str]:
+    start = content.find("<think>")
+    end = content.find("</think>", start + len("<think>")) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return None, content
+    reasoning = content[start + len("<think>") : end]
+    answer = content[end + len("</think>") :]
+    return reasoning.strip("\n "), answer.lstrip()
+
+
+def _ensure_think_content(
+    content: Any,
+    *,
+    reasoning: Any | None = None,
+) -> Any:
+    text = _text_content_to_string(content)
+    if text is None:
+        return content
+
+    existing_reasoning, existing_answer = _split_think_content(text)
+    if reasoning not in (None, ""):
+        reasoning_text = str(reasoning).strip("\n ")
+        answer_text = (
+            existing_answer.strip() if existing_reasoning is not None else text.strip()
+        )
+        return f"<think>\n{reasoning_text}\n</think>\n {answer_text}"
+
+    if existing_reasoning is not None:
+        reasoning_text = existing_reasoning.strip("\n ")
+        answer_text = existing_answer.strip()
+        if reasoning_text:
+            return f"<think>\n{reasoning_text}\n</think>\n {answer_text}"
+        return EMPTY_THINK_PREFIX + answer_text
+
+    return EMPTY_THINK_PREFIX + text.strip()
+
+
+def _parse_json_maybe(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def _normalize_tool_call(raw_tool_call: Any) -> dict[str, Any]:
+    tool_call = _parse_json_maybe(raw_tool_call)
+    if not isinstance(tool_call, dict):
+        tool_call = {"name": "", "arguments": tool_call}
+
+    function = tool_call.get("function")
+    if isinstance(function, dict):
+        name = function.get("name", tool_call.get("name", ""))
+        arguments = function.get("arguments", tool_call.get("arguments", {}))
+    else:
+        name = tool_call.get("name", "")
+        arguments = tool_call.get("arguments", {})
+    arguments = _parse_json_maybe(arguments)
+    return {
+        "type": "function",
+        "function": {
+            "name": "" if name is None else str(name),
+            "arguments": arguments,
+        },
+    }
+
+
+def _normalize_tools(raw_tools: Any) -> list[dict[str, Any]]:
+    tools = _parse_json_maybe(raw_tools)
+    if not tools:
+        return []
+    if isinstance(tools, dict):
+        tools = [tools]
+    if not isinstance(tools, list):
+        return []
+    return [tool for tool in tools if isinstance(tool, dict)]
+
+
 def normalize_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
+    raw_messages = _parse_json_maybe(raw_messages)
     if not raw_messages:
         raise ValueError("MM chat sample has no messages")
     first = raw_messages[0]
@@ -140,16 +253,48 @@ def normalize_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
 
     messages = []
     for message in raw_messages:
-        role = message.get("role", message.get("from"))
+        raw_role = message.get("role", message.get("from"))
+        role = raw_role
         if role is None:
             raise ValueError("MM chat message is missing role/from")
+        role = ROLE_TABLE.get(str(role), str(role))
         content = message.get("content", message.get("value", ""))
-        messages.append(
-            {
-                "role": ROLE_TABLE.get(str(role), str(role)),
-                "content": _normalize_content(content),
-            }
-        )
+        if role == "tool_call":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [_normalize_tool_call(content)],
+                }
+            )
+            continue
+
+        normalized_message = {
+            "role": role,
+            "content": _normalize_content(content),
+        }
+        if role == "assistant":
+            normalized_message["content"] = _ensure_think_content(
+                normalized_message["content"],
+                reasoning=message.get("reasoning_content"),
+            )
+        if "name" in message:
+            normalized_message["name"] = message["name"]
+        if "tool_call_id" in message:
+            normalized_message["tool_call_id"] = message["tool_call_id"]
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None and message.get("function_call") is not None:
+            tool_calls = [message["function_call"]]
+        if tool_calls is not None:
+            if isinstance(tool_calls, str):
+                tool_calls = _parse_json_maybe(tool_calls)
+            if isinstance(tool_calls, dict):
+                tool_calls = [tool_calls]
+            if isinstance(tool_calls, list):
+                normalized_message["tool_calls"] = [
+                    _normalize_tool_call(tool_call) for tool_call in tool_calls
+                ]
+        messages.append(normalized_message)
     return messages
 
 
@@ -160,7 +305,11 @@ def _count_image_markers(messages: list[dict[str, Any]], image_placeholder: str)
         if isinstance(content, str):
             count += content.count(image_placeholder)
             continue
+        if content is None:
+            continue
         for item in content:
+            if not isinstance(item, dict):
+                continue
             if item.get("type") in {"image", "image_url"}:
                 count += 1
             elif item.get("type") == "text":
@@ -190,9 +339,7 @@ def _prepend_missing_image_markers(
 
 def normalize_mm_chat_sample(sample: dict[str, Any]) -> dict[str, Any]:
     raw_messages = (
-        sample.get("messages")
-        or sample.get("conversations")
-        or sample.get("texts")
+        sample.get("messages") or sample.get("conversations") or sample.get("texts")
     )
     if raw_messages is None:
         raise ValueError(
@@ -201,12 +348,13 @@ def normalize_mm_chat_sample(sample: dict[str, Any]) -> dict[str, Any]:
 
     images = normalize_mm_chat_images(sample.get("images", sample.get("image", [])))
     messages = normalize_mm_chat_messages(raw_messages)
+    tools = _normalize_tools(sample.get("tools", sample.get("available_tools", [])))
     existing_markers = _count_image_markers(messages, "<image>")
     _prepend_missing_image_markers(
         messages,
         num_missing=max(len(images) - existing_markers, 0),
     )
-    return {"messages": messages, "images": images}
+    return {"messages": messages, "images": images, "tools": tools}
 
 
 def validate_mm_chat_messages(messages: list[dict[str, Any]]) -> None:
@@ -254,8 +402,15 @@ def build_image_token_counts_by_message(
     for message in messages:
         counts = []
         content = message["content"]
-        items = [{"type": "text", "text": content}] if isinstance(content, str) else content
+        if isinstance(content, str):
+            items = [{"type": "text", "text": content}]
+        elif content is None:
+            items = []
+        else:
+            items = content
         for item in items:
+            if not isinstance(item, dict):
+                continue
             if item.get("type") in {"image", "image_url"}:
                 if image_idx >= len(image_token_counts):
                     continue
@@ -350,35 +505,36 @@ class MMChatDataset(IterableDataset, Stateful):
         processed_sample = self._sample_processor(sample)
         messages = processed_sample["messages"]
         images = processed_sample["images"]
+        tools = processed_sample.get("tools", [])
         validate_mm_chat_messages(messages)
-        if not images:
-            return None
-
-        processed_images = process_mm_chat_images(
-            images,
-            patch_size=self.patch_size,
-            temporal_patch_size=self.temporal_patch_size,
-            spatial_merge_size=self.spatial_merge_size,
-            min_pixels=self.min_pixels,
-            max_pixels=self.max_pixels,
-            image_mean=self.image_mean,
-            image_std=self.image_std,
-            max_aspect_ratio=self.max_aspect_ratio,
-        )
-        image_counts_by_message = build_image_token_counts_by_message(
-            messages,
-            processed_images.image_token_counts,
-            image_placeholder_token=self._tokenizer.image_placeholder_token,
-        )
+        processed_images = None
+        if images:
+            processed_images = process_mm_chat_images(
+                images,
+                patch_size=self.patch_size,
+                temporal_patch_size=self.temporal_patch_size,
+                spatial_merge_size=self.spatial_merge_size,
+                min_pixels=self.min_pixels,
+                max_pixels=self.max_pixels,
+                image_mean=self.image_mean,
+                image_std=self.image_std,
+                max_aspect_ratio=self.max_aspect_ratio,
+            )
+            image_counts_by_message = build_image_token_counts_by_message(
+                messages,
+                processed_images.image_token_counts,
+                image_placeholder_token=self._tokenizer.image_placeholder_token,
+            )
+        else:
+            image_counts_by_message = [[] for _ in messages]
 
         full_text = self._tokenizer.render_mm_chat(
             messages,
             image_counts_by_message,
             add_generation_prompt=False,
+            tools=tools,
         )
-        full_tokens = self._tokenizer.encode(
-            full_text, add_bos=True, add_eos=False
-        )
+        full_tokens = self._tokenizer.encode(full_text, add_bos=True, add_eos=False)
         if full_tokens[-1] != self._tokenizer.eos_id:
             full_tokens.append(self._tokenizer.eos_id)
         if len(full_tokens) - 1 > self.seq_len:
@@ -390,6 +546,7 @@ class MMChatDataset(IterableDataset, Stateful):
             messages,
             image_counts_by_message,
             add_bos=True,
+            tools=tools,
         )
         for start, end in spans:
             label_start = max(start - 1, 0)
@@ -397,9 +554,9 @@ class MMChatDataset(IterableDataset, Stateful):
             source_end = min(end, len(full_tokens))
             if source_start >= source_end:
                 continue
-            labels[label_start : label_start + source_end - source_start] = (
-                torch.tensor(full_tokens[source_start:source_end], dtype=torch.long)
-            )
+            labels[
+                label_start : label_start + source_end - source_start
+            ] = torch.tensor(full_tokens[source_start:source_end], dtype=torch.long)
 
         vision_ids = [
             self._tokenizer.vision_start_id,
@@ -409,16 +566,21 @@ class MMChatDataset(IterableDataset, Stateful):
         for token_id in vision_ids:
             labels = torch.where(labels == token_id, IGNORE_INDEX, labels)
 
-        flat_patches = processed_images.flat_patches
-        if self.pixel_values_dtype is not None and flat_patches.is_floating_point():
-            flat_patches = flat_patches.to(self.pixel_values_dtype)
+        if processed_images is None:
+            flat_patches = None
+            grid_thw = None
+        else:
+            flat_patches = processed_images.flat_patches
+            if self.pixel_values_dtype is not None and flat_patches.is_floating_point():
+                flat_patches = flat_patches.to(self.pixel_values_dtype)
+            grid_thw = processed_images.grid_thw
 
         return {
             "input_ids": input_ids,
             "labels": labels,
             "positions": torch.arange(input_ids.numel(), dtype=torch.long),
             "pixel_values": flat_patches,
-            "grid_thw": processed_images.grid_thw,
+            "grid_thw": grid_thw,
             "num_packed_samples": 1,
         }
 

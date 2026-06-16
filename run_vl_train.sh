@@ -51,10 +51,6 @@ dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/tqa(cauldron,llava_format)"
 # vision_model="/home/molin/models/Qwen3-VL-2B-Instruct"
 # model_flavor="1.5B-v400M"
 # train_config="rwkv_vl_1_5b_v400m_chat"
-# Defaults below recover the 2026-05-09 FineVisionMax run from the offline
-# W&B config in outputs/rwkv_vl_train_20260509_065318_latest_dcp_wandb*.
-fake_thinking="1"
-
 split="train"
 ngpu="4"
 # Size of each context-parallel group. For context_parallel_degree=2, ngpu=4
@@ -312,8 +308,7 @@ require_bool() {
 }
 
 for bool_name in \
-    debugging \
-    fake_thinking; do
+    debugging; do
     require_bool "${bool_name}"
 done
 
@@ -512,9 +507,6 @@ fi
 if [[ -n "${max_position_embeddings}" ]]; then
     export_args+=(--max-position-embeddings "${max_position_embeddings}")
 fi
-if [[ "${fake_thinking}" == "1" ]]; then
-    export_args+=(--fake-thinking)
-fi
 if [[ -n "${projector_kind}" ]]; then
     export_args+=(--projector-kind "${projector_kind}")
 fi
@@ -642,9 +634,6 @@ if [[ "${tracking}" == "1" ]]; then
 fi
 if [[ "${nvml_metrics}" == "1" ]]; then
     train_args+=(--metrics.enable-nvml-metrics)
-fi
-if [[ "${fake_thinking}" == "1" ]]; then
-    train_args+=(--fake-thinking)
 fi
 if [[ -n "${min_pixels}" ]]; then
     train_args+=(--dataloader.min-pixels "${min_pixels}")

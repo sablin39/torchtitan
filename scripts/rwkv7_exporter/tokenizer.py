@@ -1,8 +1,13 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # coding=utf-8
 """HF remote-code tokenizer wrapper for RWKV/RWKV-VL exports."""
 
 import os
-from typing import List, Optional, Tuple
 
 from transformers import AddedToken, PreTrainedTokenizer
 from transformers.utils import logging
@@ -57,7 +62,6 @@ class RwkvTokenizer(PreTrainedTokenizer):
         pad_token="\x17",
         unk_token="\x16",
         chat_template=None,
-        fake_thinking: bool = False,
         **kwargs,
     ):
         if not os.path.isfile(vocab_file):
@@ -69,7 +73,6 @@ class RwkvTokenizer(PreTrainedTokenizer):
         unk_token = _token_content(unk_token)
 
         self.add_bos_token = bool(kwargs.pop("add_bos_token", False))
-        self.fake_thinking = bool(fake_thinking)
         self.core = RWKVTokenizerCore(
             vocab_file,
             special_tokens=RWKVSpecialTokens(
@@ -81,7 +84,6 @@ class RwkvTokenizer(PreTrainedTokenizer):
             add_bos_token=self.add_bos_token,
             add_eos_token=False,
             chat_template=CHAT_TEMPLATE if chat_template is None else chat_template,
-            fake_thinking=self.fake_thinking,
         )
         self.encoder = self.core.token2idx
         self.decoder = self.core.idx2token
@@ -112,7 +114,6 @@ class RwkvTokenizer(PreTrainedTokenizer):
             unk_token=unk_token,
             additional_special_tokens=additional_special_tokens,
             chat_template=self.chat_template,
-            fake_thinking=self.fake_thinking,
             **kwargs,
         )
 
@@ -160,8 +161,8 @@ class RwkvTokenizer(PreTrainedTokenizer):
     def save_vocabulary(
         self,
         save_directory: str,
-        filename_prefix: Optional[str] = None,
-    ) -> Tuple[str]:
+        filename_prefix: str | None = None,
+    ) -> tuple[str]:
         if os.path.isdir(save_directory):
             vocab_file = os.path.join(
                 save_directory,
@@ -184,10 +185,10 @@ class RwkvTokenizer(PreTrainedTokenizer):
 
     def get_special_tokens_mask(
         self,
-        token_ids_0: List[int],
-        token_ids_1: Optional[List[int]] = None,
+        token_ids_0: list[int],
+        token_ids_1: list[int] | None = None,
         already_has_special_tokens: bool = False,
-    ) -> List[int]:
+    ) -> list[int]:
         if already_has_special_tokens:
             return super().get_special_tokens_mask(
                 token_ids_0=token_ids_0,
@@ -204,10 +205,6 @@ class RwkvTokenizer(PreTrainedTokenizer):
             return [1] + ([0] * len(token_ids_0))
         return [1] + ([0] * len(token_ids_0)) + [1] + ([0] * len(token_ids_1))
 
-    def apply_chat_template(self, conversation, *args, **kwargs):
-        kwargs.setdefault("fake_thinking", self.fake_thinking)
-        return super().apply_chat_template(conversation, *args, **kwargs)
-
     def expand_image_placeholders(
         self,
         rendered_text: str,
@@ -221,11 +218,13 @@ class RwkvTokenizer(PreTrainedTokenizer):
         image_token_counts_by_message: list[list[int]],
         *,
         add_generation_prompt: bool = False,
+        tools: list[dict] | None = None,
     ) -> str:
         return self.core.render_mm_chat(
             messages,
             image_token_counts_by_message,
             add_generation_prompt=add_generation_prompt,
+            tools=tools,
         )
 
     def assistant_token_spans(
@@ -234,9 +233,11 @@ class RwkvTokenizer(PreTrainedTokenizer):
         image_token_counts_by_message: list[list[int]],
         *,
         add_bos: bool = True,
+        tools: list[dict] | None = None,
     ) -> list[tuple[int, int]]:
         return self.core.assistant_token_spans(
             messages,
             image_token_counts_by_message,
             add_bos=add_bos,
+            tools=tools,
         )

@@ -36,10 +36,10 @@ if str(REPO_ROOT) not in sys.path:
 
 try:
     from .configuration_rwkv7 import RWKV7Config
-    from .modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
+    from .modeling_rwkv7 import RWKV7ForCausalLM
 except ImportError:
     from configuration_rwkv7 import RWKV7Config
-    from modeling_rwkv7 import RWKV7ForCausalLM, RWKV7Model
+    from modeling_rwkv7 import RWKV7ForCausalLM
 from torchtitan.models.rwkv7.tokenizer_core import (
     DEFAULT_BOS_TOKEN,
     DEFAULT_EOS_TOKEN,
@@ -706,7 +706,6 @@ def save_multimodal_processor(
     output: str,
     image_processor_source: str,
     max_pixels: int | None,
-    fake_thinking: bool,
     processor_spatial_merge_size: int | None = None,
 ) -> None:
     with _remote_code_package(include_processor=True) as remote_code:
@@ -723,7 +722,6 @@ def save_multimodal_processor(
             eos_token="\x17",
             pad_token="\x17",
             unk_token="\x16",
-            fake_thinking=fake_thinking,
         )
         image_processor = AutoImageProcessor.from_pretrained(
             image_processor_source,
@@ -742,7 +740,6 @@ def save_multimodal_processor(
         processor = ModRWKVProcessor(
             tokenizer=tokenizer,
             image_processor=image_processor,
-            fake_thinking=fake_thinking,
         )
         processor.save_pretrained(output)
         save_tokenizer_core(output)
@@ -817,7 +814,6 @@ def convert(
     max_position_embeddings: int | None = None,
     max_shard_size: str = DEFAULT_MAX_SHARD_SIZE,
     verify_model_load: bool = True,
-    fake_thinking: bool = False,
 ):
     output = os.path.realpath(output)
     text_weights = extract_text_weights(torch_load_weights(rwkv7))
@@ -861,7 +857,6 @@ def convert(
             eos_token=DEFAULT_EOS_TOKEN,
             pad_token=DEFAULT_EOS_TOKEN,
             unk_token=DEFAULT_BOS_TOKEN,
-            fake_thinking=fake_thinking,
         )
         tokenizer.register_for_auto_class()
         tokenizer.save_pretrained(output)
@@ -884,7 +879,6 @@ def convert_multimodal(
     image_processor: str | None = None,
     max_pixels: int | None = None,
     verify_model_load: bool = False,
-    fake_thinking: bool = False,
     projector_kind: str = "mlp",
     projector_norm: str = "layernorm",
     projector_ffn: str = "relu",
@@ -972,7 +966,6 @@ def convert_multimodal(
         output=output,
         image_processor_source=image_processor or vision_model,
         max_pixels=max_pixels,
-        fake_thinking=fake_thinking,
         processor_spatial_merge_size=processor_spatial_merge_size,
     )
     print(f"Saved RWKV-VL HF checkpoint to {output}")
@@ -1047,11 +1040,6 @@ if __name__ == "__main__":
         help="After saving, load the full exported model through AutoModel. This can require substantial RAM.",
     )
     parser.add_argument(
-        "--fake-thinking",
-        action="store_true",
-        help="Save a chat template that prefixes every assistant message with an empty <think> block.",
-    )
-    parser.add_argument(
         "--projector-kind",
         type=str,
         default="mlp",
@@ -1110,7 +1098,6 @@ if __name__ == "__main__":
             image_processor=args.image_processor,
             max_pixels=args.max_pixels,
             verify_model_load=args.verify_model_load,
-            fake_thinking=args.fake_thinking,
             projector_kind=args.projector_kind,
             projector_norm=args.projector_norm,
             projector_ffn=args.projector_ffn,
@@ -1126,5 +1113,4 @@ if __name__ == "__main__":
             max_position_embeddings=args.max_position_embeddings,
             max_shard_size=args.max_shard_size,
             verify_model_load=args.verify_model_load,
-            fake_thinking=args.fake_thinking,
         )

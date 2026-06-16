@@ -71,12 +71,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         (fqn to file mapping), the config.json file, generation_config.json, and tokenizer files.
         """
 
-        fake_thinking: bool = False
-        """
-        Replace the tokenizer chat template with the RWKV fake-thinking template,
-        which prefixes assistant messages with an empty <think> block.
-        """
-
         dump_folder: str = "./outputs"
         """Folder to dump job outputs"""
 
@@ -242,15 +236,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
         # build tokenizer
         self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
-        if config.fake_thinking:
-            if hasattr(type(self.tokenizer), "fake_thinking"):
-                self.tokenizer.fake_thinking = True
-            else:
-                logger.warning(
-                    "fake_thinking=True is only supported by tokenizers exposing a "
-                    "'fake_thinking' attribute; %s does not — ignoring.",
-                    type(self.tokenizer).__name__,
-                )
 
         # set the model args from training job configs. Done BEFORE the
         # dataloader is built so a model's ``update_from_config`` can adjust
@@ -790,9 +775,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             if isinstance(value, torch.Tensor):
                 value = value.item()
             if isinstance(value, (int, float)):
-                self.data_metric_sums[key] = (
-                    self.data_metric_sums.get(key, 0.0) + float(value)
-                )
+                self.data_metric_sums[key] = self.data_metric_sums.get(
+                    key, 0.0
+                ) + float(value)
         self.data_metric_count += 1
 
     def _consume_data_metrics(self) -> dict[str, float]:

@@ -16,10 +16,11 @@ possible.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from io import BytesIO
 import logging
 import math
+
+from dataclasses import dataclass
+from io import BytesIO
 from typing import Any
 
 import einops as E
@@ -35,35 +36,105 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-CHAT_TEMPLATE = (
-    "{% for message in messages %}"
-    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
-    "{% if fake_thinking is defined and fake_thinking and message['role'] == 'assistant' %}{{ '<think>\\n</think>\\n ' }}{% endif %}"
-    "{% if message['content'] is string %}"
-    "{{ message['content'] }}"
-    "{% else %}"
-    "{% set ns = namespace(explicit_image_tags=0, image_items=0, text_parts=[]) %}"
-    "{% for item in message['content'] %}"
-    "{% if item['type'] == 'text' %}"
-    "{% set ns.text_parts = ns.text_parts + [item['text']] %}"
-    "{% set ns.explicit_image_tags = ns.explicit_image_tags + item['text'].count('<image>') %}"
-    "{% elif item['type'] in ['image', 'image_url'] %}"
-    "{% set ns.image_items = ns.image_items + 1 %}"
-    "{% endif %}"
-    "{% endfor %}"
-    "{% for _ in range([ns.image_items - ns.explicit_image_tags, 0] | max) %}"
-    "{{ '<image>' }}"
-    "{% endfor %}"
-    "{{ ns.text_parts | join('') }}"
-    "{% endif %}"
-    "{{ '\\x17' }}"
-    "{% if not loop.last or add_generation_prompt %}{{ '\\n\\n' }}{% endif %}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}"
-    "{{ '\\x16Assistant:' }}"
-    "{% if thinking is defined and thinking %}{{ ' <think>' }}{% endif %}"
-    "{% endif %}"
-)
+CHAT_TEMPLATE = r"""
+{%- macro render_tools_block(tools) -%}
+{{ '# Tools\n\nYou may call one or more functions to assist with the user query.\n\n' }}
+{{ 'You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n' }}
+{%- for tool in tools -%}
+{{ tool | tojson }}{%- if not loop.last -%}{{ '\n' }}{%- endif -%}
+{%- endfor -%}
+{{ '\n</tools>\n\nFor each function call, return a json object with function name and arguments ' }}
+{{ 'within <tool_call></tool_call> XML tags:\n<tool_call>\n' }}
+{{ '{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>' }}
+{%- endmacro -%}
+{%- macro render_content(content) -%}
+{%- if content is string -%}
+{{ content }}
+{%- elif content is none -%}
+{%- else -%}
+{%- set ns = namespace(explicit_image_tags=0, image_items=0, text_parts=[]) -%}
+{%- for item in content -%}
+{%- if item['type'] == 'text' -%}
+{%- set text = item.get('text', '') -%}
+{%- set ns.text_parts = ns.text_parts + [text] -%}
+{%- set ns.explicit_image_tags = ns.explicit_image_tags + text.count('<image>') -%}
+{%- elif item['type'] == 'image' or item['type'] == 'image_url' -%}
+{%- set ns.image_items = ns.image_items + 1 -%}
+{%- endif -%}
+{%- endfor -%}
+{%- for _ in range([ns.image_items - ns.explicit_image_tags, 0] | max) -%}
+{{ '<image>' }}
+{%- endfor -%}
+{{ ns.text_parts | join('') }}
+{%- endif -%}
+{%- endmacro -%}
+{%- macro render_tool_call(tool_call) -%}
+{%- set fn = tool_call.get('function', tool_call) -%}
+{%- set call = {'name': fn.get('name', ''), 'arguments': fn.get('arguments', {})} -%}
+{{ '<tool_call>\n' }}{{ call | tojson }}{{ '\n</tool_call>' }}
+{%- endmacro -%}
+{%- macro render_tool_response(message) -%}
+{{ '<tool_response>\n' }}
+{%- if message['content'] is string -%}
+{{ message['content'] }}
+{%- elif message['content'] is none -%}
+{%- else -%}
+{{ message['content'] | tojson }}
+{%- endif -%}
+{{ '\n</tool_response>' }}
+{%- endmacro -%}
+{%- set ns = namespace(tool_prompt_exists=false) -%}
+{%- if messages|length > 0 and messages[0]['role'] == 'system' and messages[0]['content'] is string -%}
+{%- set first_system_content = messages[0]['content'] -%}
+{%- if '# Tools' in first_system_content and '<tools>' in first_system_content and '<tool_call>' in first_system_content -%}
+{%- set ns.tool_prompt_exists = true -%}
+{%- endif -%}
+{%- endif -%}
+{%- set has_tools = tools is defined and tools and not ns.tool_prompt_exists -%}
+{%- if has_tools and (messages|length == 0 or messages[0]['role'] != 'system') -%}
+{{ '\x16System: ' }}{{ render_tools_block(tools) }}{{ '\x17' }}
+{%- if messages|length > 0 or add_generation_prompt -%}{{ '\n\n' }}{%- endif -%}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'tool' -%}
+{%- if loop.first or messages[loop.index0 - 1]['role'] != 'tool' -%}
+{{ '\x16User: ' }}
+{%- endif -%}
+{{ render_tool_response(message) }}
+{%- if loop.last or messages[loop.index0 + 1]['role'] != 'tool' -%}
+{{ '\x17' }}
+{%- if not loop.last or add_generation_prompt -%}{{ '\n\n' }}{%- endif -%}
+{%- else -%}
+{{ '\n' }}
+{%- endif -%}
+{%- else -%}
+{%- if message['role'] == 'assistant' -%}
+{%- set role_name = 'Assistant' -%}
+{%- elif message['role'] == 'system' -%}
+{%- set role_name = 'System' -%}
+{%- else -%}
+{%- set role_name = 'User' -%}
+{%- endif -%}
+{{ '\x16' + role_name + ': ' }}{{ render_content(message['content']) }}
+{%- if message['role'] == 'system' and loop.first and has_tools -%}
+{%- if message['content'] -%}{{ '\n\n' }}{%- endif -%}
+{{ render_tools_block(tools) }}
+{%- endif -%}
+{%- if message['role'] == 'assistant' and message.get('tool_calls') -%}
+{%- if message['content'] -%}{{ '\n' }}{%- endif -%}
+{%- for tool_call in message['tool_calls'] -%}
+{{ render_tool_call(tool_call) }}{%- if not loop.last -%}{{ '\n' }}{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{ '\x17' }}
+{%- if not loop.last or add_generation_prompt -%}{{ '\n\n' }}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{ '\x16Assistant:' }}
+{%- if thinking is defined and thinking -%}{{ ' <think>' }}{%- endif -%}
+{%- endif -%}
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +238,9 @@ def count_token_occurrences(
     input_ids: list[list[int]],
     token_id: int,
 ) -> list[int]:
-    return [sum(1 for token in sample_ids if token == token_id) for sample_ids in input_ids]
+    return [
+        sum(1 for token in sample_ids if token == token_id) for sample_ids in input_ids
+    ]
 
 
 def validate_image_token_alignment(
@@ -188,7 +261,10 @@ def validate_image_token_alignment(
             "Image token count does not match image_grid_thw-derived token count: "
             f"expected {expected_image_tokens}, got {actual_image_tokens}."
         )
-    if actual_vision_starts != expected_num_images or actual_vision_ends != expected_num_images:
+    if (
+        actual_vision_starts != expected_num_images
+        or actual_vision_ends != expected_num_images
+    ):
         raise ValueError(
             "Vision boundary token count does not match the number of image placeholders: "
             f"expected {expected_num_images}, got starts={actual_vision_starts}, "
@@ -198,6 +274,13 @@ def validate_image_token_alignment(
 
 def _decode_image(image: str | bytes | Image.Image) -> torch.Tensor:
     """Decode an image to a ``(C, H, W)`` uint8 RGB tensor."""
+    if isinstance(image, dict):
+        if image.get("bytes") is not None:
+            image = image["bytes"]
+        elif image.get("path") is not None:
+            image = image["path"]
+        else:
+            raise ValueError("Image dict must contain 'bytes' or 'path'.")
     if isinstance(image, str) and image.startswith("http"):
         response = requests.get(image, timeout=10)
         response.raise_for_status()
@@ -533,8 +616,7 @@ def make_image_config_from_processor(
     if hasattr(override_size, "to_dict"):
         override_size = override_size.to_dict()
     patch_size = int(
-        overrides.pop("patch_size", None)
-        or getattr(image_processor, "patch_size", 16)
+        overrides.pop("patch_size", None) or getattr(image_processor, "patch_size", 16)
     )
     temporal_patch_size = int(
         overrides.pop("temporal_patch_size", None)

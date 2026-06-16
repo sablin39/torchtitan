@@ -42,7 +42,6 @@ class RwkvTokenizer(BaseTokenizer):
         vision_end_token: str = DEFAULT_VISION_END_TOKEN
         add_bos_token: bool = False
         add_eos_token: bool = False
-        fake_thinking: bool = False
 
     def __init__(
         self,
@@ -87,7 +86,6 @@ class RwkvTokenizer(BaseTokenizer):
             special_tokens=special_tokens,
             add_bos_token=add_bos,
             add_eos_token=add_eos,
-            fake_thinking=self.config.fake_thinking,
         )
 
         jinja_path = os.path.join(tokenizer_path, self.CHAT_TEMPLATE_FILE)
@@ -121,14 +119,6 @@ class RwkvTokenizer(BaseTokenizer):
 
     def set_chat_template(self, template: str) -> None:
         self.core.set_chat_template(template)
-
-    @property
-    def fake_thinking(self) -> bool:
-        return self.core.fake_thinking
-
-    @fake_thinking.setter
-    def fake_thinking(self, value: bool) -> None:
-        self.core.fake_thinking = bool(value)
 
     def _template_kwargs(self) -> dict[str, Any]:
         return self.core.template_kwargs()

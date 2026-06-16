@@ -59,11 +59,13 @@ class RwkvVLMultiModalTokenizer(RwkvTokenizer):
         image_token_counts_by_message: list[list[int]],
         *,
         add_generation_prompt: bool = False,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         return self.core.render_mm_chat(
             messages,
             image_token_counts_by_message,
             add_generation_prompt=add_generation_prompt,
+            tools=tools,
         )
 
     def assistant_token_spans(
@@ -72,9 +74,11 @@ class RwkvVLMultiModalTokenizer(RwkvTokenizer):
         image_token_counts_by_message: list[list[int]],
         *,
         add_bos: bool = True,
+        tools: list[dict[str, Any]] | None = None,
     ) -> list[tuple[int, int]]:
         return self.core.assistant_token_spans(
             messages,
             image_token_counts_by_message,
             add_bos=add_bos,
+            tools=tools,
         )

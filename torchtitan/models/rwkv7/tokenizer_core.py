@@ -26,25 +26,105 @@ DEFAULT_VISION_START_TOKEN_ID = 65530
 DEFAULT_VISION_END_TOKEN_ID = 65531
 DEFAULT_IMAGE_TOKEN_ID = 65532
 
-CHAT_TEMPLATE = (
-    "{% for message in messages %}"
-    "{{ '\\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
-    "{% if fake_thinking is defined and fake_thinking and message['role'] == 'assistant' %}{{ '<think>\\n</think>\\n ' }}{% endif %}"
-    "{% if message['content'] is string %}"
-    "{{ message['content'] }}"
-    "{% else %}"
-    "{% for item in message['content'] %}"
-    "{% if item['type'] == 'image' or item['type'] == 'image_url' %}{{ '<image>' }}{% elif item['type'] == 'text' %}{{ item['text'] }}{% endif %}"
-    "{% endfor %}"
-    "{% endif %}"
-    "{{ '\\x17' }}"
-    "{% if not loop.last or add_generation_prompt %}{{ '\\n\\n' }}{% endif %}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}"
-    "{{ '\\x16Assistant:' }}"
-    "{% if thinking is defined and thinking %}{{ ' <think>' }}{% endif %}"
-    "{% endif %}"
-)
+CHAT_TEMPLATE = r"""
+{%- macro render_tools_block(tools) -%}
+{{ '# Tools\n\nYou may call one or more functions to assist with the user query.\n\n' }}
+{{ 'You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n' }}
+{%- for tool in tools -%}
+{{ tool | tojson }}{%- if not loop.last -%}{{ '\n' }}{%- endif -%}
+{%- endfor -%}
+{{ '\n</tools>\n\nFor each function call, return a json object with function name and arguments ' }}
+{{ 'within <tool_call></tool_call> XML tags:\n<tool_call>\n' }}
+{{ '{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>' }}
+{%- endmacro -%}
+{%- macro render_content(content) -%}
+{%- if content is string -%}
+{{ content }}
+{%- elif content is none -%}
+{%- else -%}
+{%- set ns = namespace(explicit_image_tags=0, image_items=0, text_parts=[]) -%}
+{%- for item in content -%}
+{%- if item['type'] == 'text' -%}
+{%- set text = item.get('text', '') -%}
+{%- set ns.text_parts = ns.text_parts + [text] -%}
+{%- set ns.explicit_image_tags = ns.explicit_image_tags + text.count('<image>') -%}
+{%- elif item['type'] == 'image' or item['type'] == 'image_url' -%}
+{%- set ns.image_items = ns.image_items + 1 -%}
+{%- endif -%}
+{%- endfor -%}
+{%- for _ in range([ns.image_items - ns.explicit_image_tags, 0] | max) -%}
+{{ '<image>' }}
+{%- endfor -%}
+{{ ns.text_parts | join('') }}
+{%- endif -%}
+{%- endmacro -%}
+{%- macro render_tool_call(tool_call) -%}
+{%- set fn = tool_call.get('function', tool_call) -%}
+{%- set call = {'name': fn.get('name', ''), 'arguments': fn.get('arguments', {})} -%}
+{{ '<tool_call>\n' }}{{ call | tojson }}{{ '\n</tool_call>' }}
+{%- endmacro -%}
+{%- macro render_tool_response(message) -%}
+{{ '<tool_response>\n' }}
+{%- if message['content'] is string -%}
+{{ message['content'] }}
+{%- elif message['content'] is none -%}
+{%- else -%}
+{{ message['content'] | tojson }}
+{%- endif -%}
+{{ '\n</tool_response>' }}
+{%- endmacro -%}
+{%- set ns = namespace(tool_prompt_exists=false) -%}
+{%- if messages|length > 0 and messages[0]['role'] == 'system' and messages[0]['content'] is string -%}
+{%- set first_system_content = messages[0]['content'] -%}
+{%- if '# Tools' in first_system_content and '<tools>' in first_system_content and '<tool_call>' in first_system_content -%}
+{%- set ns.tool_prompt_exists = true -%}
+{%- endif -%}
+{%- endif -%}
+{%- set has_tools = tools is defined and tools and not ns.tool_prompt_exists -%}
+{%- if has_tools and (messages|length == 0 or messages[0]['role'] != 'system') -%}
+{{ '\x16System: ' }}{{ render_tools_block(tools) }}{{ '\x17' }}
+{%- if messages|length > 0 or add_generation_prompt -%}{{ '\n\n' }}{%- endif -%}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'tool' -%}
+{%- if loop.first or messages[loop.index0 - 1]['role'] != 'tool' -%}
+{{ '\x16User: ' }}
+{%- endif -%}
+{{ render_tool_response(message) }}
+{%- if loop.last or messages[loop.index0 + 1]['role'] != 'tool' -%}
+{{ '\x17' }}
+{%- if not loop.last or add_generation_prompt -%}{{ '\n\n' }}{%- endif -%}
+{%- else -%}
+{{ '\n' }}
+{%- endif -%}
+{%- else -%}
+{%- if message['role'] == 'assistant' -%}
+{%- set role_name = 'Assistant' -%}
+{%- elif message['role'] == 'system' -%}
+{%- set role_name = 'System' -%}
+{%- else -%}
+{%- set role_name = 'User' -%}
+{%- endif -%}
+{{ '\x16' + role_name + ': ' }}{{ render_content(message['content']) }}
+{%- if message['role'] == 'system' and loop.first and has_tools -%}
+{%- if message['content'] -%}{{ '\n\n' }}{%- endif -%}
+{{ render_tools_block(tools) }}
+{%- endif -%}
+{%- if message['role'] == 'assistant' and message.get('tool_calls') -%}
+{%- if message['content'] -%}{{ '\n' }}{%- endif -%}
+{%- for tool_call in message['tool_calls'] -%}
+{{ render_tool_call(tool_call) }}{%- if not loop.last -%}{{ '\n' }}{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{ '\x17' }}
+{%- if not loop.last or add_generation_prompt -%}{{ '\n\n' }}{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{ '\x16Assistant:' }}
+{%- if thinking is defined and thinking -%}{{ ' <think>' }}{%- endif -%}
+{%- endif -%}
+"""
 
 SPECIAL_TOKEN_TEXT_TO_ID = {
     DEFAULT_VISION_START_TOKEN: DEFAULT_VISION_START_TOKEN_ID,
@@ -169,15 +249,12 @@ class RWKVTokenizerCore:
         add_bos_token: bool = False,
         add_eos_token: bool = False,
         chat_template: str | None = None,
-        fake_thinking: bool = False,
     ) -> None:
         self.vocab_file = vocab_file
         self.vocab_size = vocab_size
         self.special_tokens = special_tokens or RWKVSpecialTokens()
         self.default_add_bos = add_bos_token
         self.default_add_eos = add_eos_token
-        self.fake_thinking = bool(fake_thinking)
-
         self.idx2token, self.token2idx = load_rwkv_vocab(vocab_file)
         self.root = ByteTrie()
         for token, token_id in self.token2idx.items():
@@ -245,7 +322,6 @@ class RWKVTokenizerCore:
             "vision_start_token": self.vision_start_token,
             "vision_end_token": self.vision_end_token,
             "image_placeholder_token": self.image_placeholder_token,
-            "fake_thinking": self.fake_thinking,
         }
 
     def set_chat_template(self, template: str) -> None:
@@ -386,6 +462,7 @@ class RWKVTokenizerCore:
         image_token_counts_by_message: list[list[int]],
         *,
         add_generation_prompt: bool = False,
+        tools: list[dict[str, Any]] | None = None,
     ) -> str:
         if len(messages) != len(image_token_counts_by_message):
             raise ValueError(
@@ -396,6 +473,7 @@ class RWKVTokenizerCore:
         rendered = self.render_chat_template(
             messages,
             add_generation_prompt=add_generation_prompt,
+            tools=tools or [],
         ).rstrip("\n")
         image_token_counts = [
             count
@@ -410,6 +488,7 @@ class RWKVTokenizerCore:
         image_token_counts_by_message: list[list[int]],
         *,
         add_bos: bool = True,
+        tools: list[dict[str, Any]] | None = None,
     ) -> list[tuple[int, int]]:
         spans = []
         for idx, message in enumerate(messages):
@@ -419,11 +498,13 @@ class RWKVTokenizerCore:
                 messages[:idx],
                 image_token_counts_by_message[:idx],
                 add_generation_prompt=True,
+                tools=tools,
             )
             end_text = self.render_mm_chat(
                 messages[: idx + 1],
                 image_token_counts_by_message[: idx + 1],
                 add_generation_prompt=False,
+                tools=tools,
             )
             start = len(self.encode(start_text, add_bos=add_bos, add_eos=False))
             end = len(self.encode(end_text, add_bos=add_bos, add_eos=False))

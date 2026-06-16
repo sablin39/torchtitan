@@ -6,22 +6,21 @@
 
 import importlib
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 from datasets import Dataset
 from PIL import Image
-from transformers import BaseImageProcessor
+from scripts.rwkv7_exporter.export_hf_model import (
+    save_processor_core,
+    save_tokenizer_core,
+)
 
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.hf_datasets.multimodal.processor_core import (
-    RWKVVLImageProcessorConfig,
-    process_images as process_rwkv_vl_images,
-)
 from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
     build_image_token_counts_by_message,
     MMChatCollator,
@@ -29,32 +28,14 @@ from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
     normalize_mm_chat_sample,
     process_mm_chat_images,
 )
+from torchtitan.hf_datasets.multimodal.processor_core import (
+    CHAT_TEMPLATE,
+    process_images as process_rwkv_vl_images,
+    RWKVVLImageProcessorConfig,
+)
 from torchtitan.models.rwkv_vl import _vl_vision_encoder_config
 from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
-from scripts.rwkv7_exporter.export_hf_model import (
-    save_processor_core,
-    save_tokenizer_core,
-)
-
-
-CHAT_TEMPLATE = (
-    "{% for message in messages %}"
-    "{{ '\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
-    "{% if message['content'] is string %}"
-    "{{ message['content'] }}"
-    "{% else %}"
-    "{% for item in message['content'] %}"
-    "{% if item['type'] == 'image' %}{{ '<image>' }}{% elif item['type'] == 'text' %}{{ item['text'] }}{% endif %}"
-    "{% endfor %}"
-    "{% endif %}"
-    "{{ '\x17' }}"
-    "{% if not loop.last or add_generation_prompt %}{{ '\n\n' }}{% endif %}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}"
-    "{{ '\x16Assistant:' }}"
-    "{% if thinking is defined and thinking %}{{ ' <think>' }}{% endif %}"
-    "{% endif %}"
-)
+from transformers import BaseImageProcessor
 
 
 DATASET_KWARGS = {
@@ -165,9 +146,16 @@ def _load_exported_remote_code(tmpdir: str):
             sys.modules.pop(module_name, None)
         tokenizer_module = importlib.import_module(f"{package_name}.tokenizer")
         processor_module = importlib.import_module(f"{package_name}.processor")
-        tokenizer_core_module = importlib.import_module(f"{package_name}.tokenizer_core")
-        processor_core_module = importlib.import_module(f"{package_name}.processor_core")
-        assert tokenizer_module.RWKVTokenizerCore is tokenizer_core_module.RWKVTokenizerCore
+        tokenizer_core_module = importlib.import_module(
+            f"{package_name}.tokenizer_core"
+        )
+        processor_core_module = importlib.import_module(
+            f"{package_name}.processor_core"
+        )
+        assert (
+            tokenizer_module.RWKVTokenizerCore
+            is tokenizer_core_module.RWKVTokenizerCore
+        )
         assert processor_module.process_images is processor_core_module.process_images
         return tokenizer_module.RwkvTokenizer, processor_module.ModRWKVProcessor
     finally:
@@ -247,6 +235,103 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             )
             self.assertIn("\x17\n\n\x16Assistant: answer\x17", full)
             self.assertTrue(full.startswith(no_thinking_prompt))
+            self.assertFalse(hasattr(tok, "fake_thinking"))
+
+    def test_empty_thinking_data_matches_old_fake_thinking_text(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            messages = [
+                {"role": "user", "content": "problem"},
+                {
+                    "role": "assistant",
+                    "content": "<think>\n</think>\n answer",
+                },
+            ]
+            rendered = tok.render_mm_chat(messages, [[], []])
+            self.assertIn("\x16Assistant: <think>\n</think>\n answer\x17", rendered)
+            self.assertNotIn("Assistant:  <think>", rendered)
+
+    def test_qwen_tools_tool_calls_and_tool_responses_render(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "description": "Search docs.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+            messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Find it"},
+                {
+                    "role": "assistant",
+                    "content": "I will check.",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "search",
+                                "arguments": {"query": "rwkv"},
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "result one"},
+                {"role": "tool", "content": "result two"},
+                {"role": "assistant", "content": "Done."},
+            ]
+            rendered = tok.render_mm_chat(messages, [[] for _ in messages], tools=tools)
+            self.assertEqual(rendered.count("# Tools"), 1)
+            self.assertIn("<tools>\n", rendered)
+            self.assertIn('"name": "search"', rendered)
+            self.assertIn("<tool_call>\n", rendered)
+            self.assertIn(
+                '{"name": "search", "arguments": {"query": "rwkv"}}', rendered
+            )
+            self.assertIn(
+                "\x16User: <tool_response>\nresult one\n</tool_response>\n"
+                "<tool_response>\nresult two\n</tool_response>\x17",
+                rendered,
+            )
+
+            supervised = "".join(
+                tok.decode(tok.encode(rendered, add_bos=True)[start:end])
+                for start, end in tok.assistant_token_spans(
+                    messages,
+                    [[] for _ in messages],
+                    tools=tools,
+                )
+            )
+            self.assertIn("<tool_call>", supervised)
+            self.assertIn('"query": "rwkv"', supervised)
+            self.assertIn("Done.", supervised)
+            self.assertNotIn("<tool_response>", supervised)
+            self.assertNotIn("result one", supervised)
+
+    def test_existing_qwen_tool_preamble_is_not_duplicated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            tools = [
+                {
+                    "type": "function",
+                    "function": {"name": "search", "description": "", "parameters": {}},
+                }
+            ]
+            messages = [
+                {
+                    "role": "system",
+                    "content": "# Tools\n<tools>old</tools>\n<tool_call>x</tool_call>",
+                },
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok"},
+            ]
+            rendered = tok.render_mm_chat(messages, [[], [], []], tools=tools)
+            self.assertEqual(rendered.count("# Tools"), 1)
+            self.assertNotIn("You may call one or more functions", rendered)
 
     def test_torchtitan_and_hf_exporter_tokenizers_align(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -509,17 +594,17 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             self.assertEqual(ids.count(tok.vision_end_id), 2)
 
             first_start = rendered.find(tok.vision_start_token)
-            first_end = (
-                rendered.find(tok.vision_end_token, first_start)
-                + len(tok.vision_end_token)
+            first_end = rendered.find(tok.vision_end_token, first_start) + len(
+                tok.vision_end_token
             )
             second_start = rendered.find(tok.vision_start_token, first_end)
-            second_end = (
-                rendered.find(tok.vision_end_token, second_start)
-                + len(tok.vision_end_token)
+            second_end = rendered.find(tok.vision_end_token, second_start) + len(
+                tok.vision_end_token
             )
             self.assertEqual(rendered[first_start:first_end].count(tok.image_token), 1)
-            self.assertEqual(rendered[second_start:second_end].count(tok.image_token), 2)
+            self.assertEqual(
+                rendered[second_start:second_end].count(tok.image_token), 2
+            )
 
     def test_assistant_token_spans_cover_only_assistant_turns(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -575,6 +660,139 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertEqual(normalized["messages"][0]["role"], "user")
             self.assertEqual(normalized["messages"][1]["role"], "assistant")
             self.assertEqual(len(normalized["images"]), 1)
+            self.assertEqual(normalized["tools"], [])
+
+    def test_normalize_mm_chat_sample_preserves_tools_and_tool_calls(self):
+        sample = {
+            "messages": [
+                {"role": "user", "content": "Question"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "function_call": {
+                        "name": "search",
+                        "arguments": '{"query": "rwkv"}',
+                    },
+                },
+                {"role": "function", "name": "search", "content": "result"},
+                {"role": "assistant", "content": "Answer"},
+            ],
+            "images": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "description": "Search.",
+                        "parameters": {},
+                    },
+                }
+            ],
+        }
+        normalized = normalize_mm_chat_sample(sample)
+        self.assertEqual(normalized["images"], [])
+        self.assertEqual(normalized["tools"][0]["function"]["name"], "search")
+        self.assertEqual(normalized["messages"][1]["role"], "assistant")
+        self.assertEqual(
+            normalized["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            {"query": "rwkv"},
+        )
+        self.assertEqual(normalized["messages"][2]["role"], "tool")
+
+    def test_normalize_mm_chat_sample_renders_nemotron_reasoning_for_training(self):
+        sample = {
+            "messages": [
+                {"role": "system", "content": "Policy."},
+                {"role": "user", "content": "Question"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Need to inspect the policy.",
+                    "content": "Answer.",
+                },
+                {"role": "user", "content": "Short?"},
+                {"role": "assistant", "content": "Yes."},
+            ],
+            "images": [],
+            "tools": [],
+        }
+        normalized = normalize_mm_chat_sample(sample)
+        self.assertEqual(
+            normalized["messages"][2]["content"],
+            "<think>\nNeed to inspect the policy.\n</think>\n Answer.",
+        )
+        self.assertEqual(
+            normalized["messages"][4]["content"],
+            "<think>\n</think>\n Yes.",
+        )
+        self.assertNotIn("reasoning_content", normalized["messages"][2])
+
+    def test_mm_chat_dataset_loads_nemotron_style_text_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            sample = {
+                "messages": [
+                    {"role": "system", "content": "Policy."},
+                    {"role": "user", "content": "Verify me"},
+                    {
+                        "role": "assistant",
+                        "reasoning_content": "Need a verification lookup.",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "verify",
+                                    "arguments": '{"user_id": "u1"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": '{"ok": true}',
+                    },
+                    {
+                        "role": "assistant",
+                        "reasoning_content": "Tool confirmed the user.",
+                        "content": "Verified.",
+                    },
+                ],
+                "images": [],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "verify",
+                            "description": "Verify a user.",
+                            "parameters": {},
+                        },
+                    }
+                ],
+            }
+            processed = next(iter(_make_mm_chat_dataset(tok, [sample], seq_len=2048)))
+            self.assertIsNone(processed["pixel_values"])
+            self.assertIsNone(processed["grid_thw"])
+            input_text = tok.decode(processed["input_ids"].tolist())
+            supervised = tok.decode(
+                processed["labels"][processed["labels"] != IGNORE_INDEX].tolist()
+            )
+            self.assertIn("<tools>", input_text)
+            self.assertIn(
+                "<think>\nNeed a verification lookup.\n</think>\n ",
+                supervised,
+            )
+            self.assertIn("<tool_call>", supervised)
+            self.assertIn('"user_id": "u1"', supervised)
+            self.assertIn(
+                '<tool_response>\n{"ok": true}\n</tool_response>',
+                input_text,
+            )
+            self.assertNotIn("<tool_response>", supervised)
+            self.assertIn(
+                "<think>\nTool confirmed the user.\n</think>\n Verified.",
+                supervised,
+            )
 
     def test_mm_chat_dataset_counts_image_tokens(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -645,6 +863,140 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertNotIn(tok.image_token, supervised)
             self.assertNotIn(tok.vision_start_token, supervised)
             self.assertNotIn(tok.vision_end_token, supervised)
+
+    def test_mm_chat_dataset_accepts_text_only_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            sample = {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {
+                        "role": "assistant",
+                        "content": "<think>\n</think>\n Answer",
+                    },
+                ],
+                "images": [],
+                "tools": [],
+            }
+            processed = next(iter(_make_mm_chat_dataset(tok, [sample])))
+            self.assertIsNone(processed["pixel_values"])
+            self.assertIsNone(processed["grid_thw"])
+            supervised = tok.decode(
+                processed["labels"][processed["labels"] != IGNORE_INDEX].tolist()
+            )
+            self.assertIn("<think>\n</think>\n Answer", supervised)
+
+            collator = MMChatCollator(
+                batch_size=1,
+                seq_len=512,
+                max_images_per_batch=8,
+                patch_size=16,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+                tokenizer=tok,
+            )
+            input_dict, labels = collator([processed])
+            self.assertIsNone(input_dict["pixel_values"])
+            self.assertIsNone(input_dict["grid_thw"])
+            self.assertGreater(input_dict["input_token_mask"].sum().item(), 0)
+            self.assertGreater((labels != IGNORE_INDEX).sum().item(), 0)
+
+    def test_mm_chat_dataset_masks_tool_responses_but_supervises_calls(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            sample = {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "search",
+                                    "arguments": {"q": "x"},
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "content": "tool result"},
+                    {"role": "assistant", "content": "final"},
+                ],
+                "images": [],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "description": "Search.",
+                            "parameters": {},
+                        },
+                    }
+                ],
+            }
+            processed = next(iter(_make_mm_chat_dataset(tok, [sample], seq_len=2048)))
+            input_text = tok.decode(processed["input_ids"].tolist())
+            supervised = tok.decode(
+                processed["labels"][processed["labels"] != IGNORE_INDEX].tolist()
+            )
+            self.assertIn("<tools>", input_text)
+            self.assertIn("<tool_response>\ntool result\n</tool_response>", input_text)
+            self.assertIn("<tool_call>", supervised)
+            self.assertIn('"q": "x"', supervised)
+            self.assertIn("final", supervised)
+            self.assertNotIn("tool result", supervised)
+
+    def test_mm_chat_collator_handles_mixed_text_and_image_batch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            text_sample = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Question"}],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "<think>\n</think>\n Answer",
+                            }
+                        ],
+                    },
+                ],
+                "images": [],
+                "tools": [],
+            }
+            samples = list(
+                _make_mm_chat_dataset(
+                    tok,
+                    [text_sample, _two_image_sample()],
+                    seq_len=1024,
+                )
+            )
+            self.assertEqual(len(samples), 2)
+            self.assertIsNone(samples[0]["pixel_values"])
+            self.assertIsInstance(samples[1]["pixel_values"], torch.Tensor)
+
+            collator = MMChatCollator(
+                batch_size=2,
+                seq_len=1024,
+                max_images_per_batch=8,
+                patch_size=16,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+                tokenizer=tok,
+            )
+            input_dict, labels = collator(samples)
+            self.assertIsNotNone(input_dict["pixel_values"])
+            self.assertIsNotNone(input_dict["grid_thw"])
+            self.assertEqual(input_dict["grid_thw"].shape[0], 2)
+            self.assertGreater(input_dict["input_token_mask"][0].sum().item(), 0)
+            self.assertGreater(input_dict["input_token_mask"][1].sum().item(), 0)
+            self.assertGreater((labels[0] != IGNORE_INDEX).sum().item(), 0)
+            self.assertGreater((labels[1] != IGNORE_INDEX).sum().item(), 0)
 
     def test_mm_chat_dataset_masks_system_turns(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -742,7 +1094,9 @@ class TestMMChatDataset(unittest.TestCase):
             )
             input_dict, labels = collator([sample])
             n = sample["input_ids"].numel()
-            self.assertTrue(torch.equal(input_dict["input"][0, :n], sample["input_ids"]))
+            self.assertTrue(
+                torch.equal(input_dict["input"][0, :n], sample["input_ids"])
+            )
             self.assertTrue(torch.equal(labels[0, :n], sample["labels"]))
             self.assertIn("pixel_values", input_dict)
             self.assertIn("grid_thw", input_dict)
@@ -789,7 +1143,9 @@ class TestMMChatDataset(unittest.TestCase):
                     torch.zeros_like(input_dict["pixel_values"][real_patches:]),
                 )
             )
-            self.assertEqual(input_dict["pixel_values"].dtype, sample["pixel_values"].dtype)
+            self.assertEqual(
+                input_dict["pixel_values"].dtype, sample["pixel_values"].dtype
+            )
             self.assertEqual(input_dict["data_stats"]["num_vit_patches"], real_patches)
             self.assertEqual(
                 input_dict["data_stats"]["num_vit_patches_bucketed"],
@@ -877,15 +1233,14 @@ class TestQwen3VLVisionBucketing(unittest.TestCase):
                 merged.detach(),
                 [feature.detach() for feature in deepstack],
                 pixel_values.grad.detach().clone(),
-                {
-                    name: params[name].grad.detach().clone()
-                    for name in param_names
-                },
+                {name: params[name].grad.detach().clone() for name in param_names},
             )
 
         def run_padded_reference(pixel_values: torch.Tensor):
             encoder.zero_grad(set_to_none=True)
-            padded = pixel_values.new_zeros((grid_thw.shape[0], bucket_patches, patch_dim))
+            padded = pixel_values.new_zeros(
+                (grid_thw.shape[0], bucket_patches, patch_dim)
+            )
             offset = 0
             for item_idx, patches in enumerate(num_patch.tolist()):
                 padded[item_idx, :patches] = pixel_values[offset : offset + patches]
@@ -911,10 +1266,7 @@ class TestQwen3VLVisionBucketing(unittest.TestCase):
                 torch.cat(valid_merged, dim=0).detach(),
                 [torch.cat(chunks, dim=0).detach() for chunks in valid_deepstack],
                 torch.cat(valid_grad, dim=0).detach(),
-                {
-                    name: params[name].grad.detach().clone()
-                    for name in param_names
-                },
+                {name: params[name].grad.detach().clone() for name in param_names},
             )
 
         unbucketed = run_padded_reference(pixels)

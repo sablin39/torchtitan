@@ -10,6 +10,9 @@ dist/*
 
 # data
 data
+!scripts/text_preprocess/
+!scripts/text_preprocess/*.py
+eval_results/
 out
 wandb
 

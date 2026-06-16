@@ -64,7 +64,6 @@ class ModRWKVProcessor(ProcessorMixin):
         chat_template=None,
         auto_insert_image_tags: bool = True,
         total_pixels_budget: bool = True,
-        fake_thinking: bool = False,
     ):
         chat_template = CHAT_TEMPLATE if chat_template is None else chat_template
         super().__init__(
@@ -74,7 +73,6 @@ class ModRWKVProcessor(ProcessorMixin):
         )
         self.auto_insert_image_tags = auto_insert_image_tags
         self.total_pixels_budget = total_pixels_budget
-        self.fake_thinking = bool(fake_thinking)
         self.image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
         self.vision_start_token = getattr(
             tokenizer, "vision_start_token", "<|vision_start|>"
@@ -102,7 +100,6 @@ class ModRWKVProcessor(ProcessorMixin):
         if not self.auto_insert_image_tags:
             output["auto_insert_image_tags"] = False
         output["total_pixels_budget"] = self.total_pixels_budget
-        output["fake_thinking"] = self.fake_thinking
         return output
 
     def _process_images(self, images, batch_size, images_kwargs):
@@ -299,7 +296,6 @@ class ModRWKVProcessor(ProcessorMixin):
 
     def apply_chat_template(self, conversation, chat_template=None, **kwargs):
         kwargs.setdefault("return_dict", True)
-        kwargs.setdefault("fake_thinking", self.fake_thinking)
         return super().apply_chat_template(
             conversation,
             chat_template=chat_template,

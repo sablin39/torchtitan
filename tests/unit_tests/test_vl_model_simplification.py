@@ -24,6 +24,7 @@ from scripts.rwkv7_exporter.export_hf_model import (
     save_processor_core,
     save_tokenizer_core,
 )
+from torchtitan.hf_datasets.multimodal.processor_core import CHAT_TEMPLATE
 from torchtitan.models.qwen3_vl.model import Qwen3VLModel
 from torchtitan.models.rwkv7.model import RWKV7Backbone
 from torchtitan.models.rwkv_vl import _vl_vision_encoder_config
@@ -35,26 +36,6 @@ from transformers import BaseImageProcessor
 assert torch.cuda.is_available(), "CUDA is required for VL simplification tests"
 torch.cuda.set_device(0)
 DEVICE = torch.device("cuda:0")
-
-
-CHAT_TEMPLATE = (
-    "{% for message in messages %}"
-    "{{ '\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
-    "{% if message['content'] is string %}"
-    "{{ message['content'] }}"
-    "{% else %}"
-    "{% for item in message['content'] %}"
-    "{% if item['type'] == 'image' or item['type'] == 'image_url' %}{{ '<image>' }}{% elif item['type'] == 'text' %}{{ item['text'] }}{% endif %}"
-    "{% endfor %}"
-    "{% endif %}"
-    "{{ '\x17' }}"
-    "{% if not loop.last or add_generation_prompt %}{{ '\n\n' }}{% endif %}"
-    "{% endfor %}"
-    "{% if add_generation_prompt %}"
-    "{{ '\x16Assistant:' }}"
-    "{% if thinking is defined and thinking %}{{ ' <think>' }}{% endif %}"
-    "{% endif %}"
-)
 
 
 def _write_tiny_rwkv_vocab(path: str) -> None:
