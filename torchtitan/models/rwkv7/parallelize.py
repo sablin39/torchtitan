@@ -7,7 +7,6 @@
 from typing import Any
 
 import torch
-import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 
@@ -52,8 +51,7 @@ def parallelize_rwkv7(
         if compile_config.enable and "model" in compile_config.components:
             logger.warning(
                 "RWKV7 CP with torch.compile is experimental. TorchTitan will "
-                "compile RWKV blocks with fullgraph=False so FLA custom kernels "
-                "and CP communication can graph-break if needed."
+                "leave RWKV/FLA blocks eager."
             )
         total_tokens = training.local_batch_size * training.seq_len
         if total_tokens % parallel_dims.cp != 0:
@@ -71,18 +69,16 @@ def parallelize_rwkv7(
         apply_ac(
             model.llm,
             ac_config,
-            model_compile_enabled=model_compile_enabled,
+            model_compile_enabled=False,
             base_folder=dump_folder,
         )
 
     if model_compile_enabled:
-        apply_rwkv_compile(model.llm, compile_config)
+        logger.info("Leaving RWKV7 model eager; skipping torch.compile for RWKV blocks")
 
     if parallel_dims.fsdp_enabled or parallel_dims.dp_replicate_enabled:
         names = (
-            ["dp_replicate", "fsdp"]
-            if parallel_dims.dp_replicate_enabled
-            else ["fsdp"]
+            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
         )
         dp_mesh = parallel_dims.get_mesh(names)
         apply_fsdp(
@@ -101,16 +97,6 @@ def parallelize_rwkv7(
     else:
         logger.info("Running RWKV7 without data-parallel wrapping")
     return model
-
-
-def apply_rwkv_compile(model: nn.Module, compile_config: CompileConfig) -> None:
-    torch._dynamo.config.capture_scalar_outputs = True
-    torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = (
-        True  # pyrefly: ignore [bad-assignment]
-    )
-    for block in model.layers.values():
-        block.compile(backend=compile_config.backend, fullgraph=False)
-    logger.info("Compiled each RWKV7Block with torch.compile(fullgraph=False)")
 
 
 def apply_fsdp(
