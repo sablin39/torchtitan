@@ -31,19 +31,8 @@ from torchtitan.hf_datasets.multimodal.utils.text import pad_batch_dim, pad_seq_
 from torchtitan.tools.logging import logger
 
 
-ROLE_TABLE = {
-    "user": "user",
-    "assistant": "assistant",
-    "system": "system",
-    "tool": "tool",
-    "function": "tool",
-    "tool_response": "tool",
-    "tool_call": "tool_call",
-    "human": "user",
-    "gpt": "assistant",
-}
-
 EMPTY_THINK_PREFIX = "<think>\n</think>\n "
+NEMOTRON_ROLES = {"system", "user", "assistant", "tool"}
 
 
 _PIXEL_VALUE_DTYPES = {
@@ -201,73 +190,95 @@ def _parse_json_maybe(value: Any) -> Any:
         return value
 
 
-def _normalize_tool_call(raw_tool_call: Any) -> dict[str, Any]:
-    tool_call = _parse_json_maybe(raw_tool_call)
-    if not isinstance(tool_call, dict):
-        tool_call = {"name": "", "arguments": tool_call}
-
-    function = tool_call.get("function")
-    if isinstance(function, dict):
-        name = function.get("name", tool_call.get("name", ""))
-        arguments = function.get("arguments", tool_call.get("arguments", {}))
-    else:
-        name = tool_call.get("name", "")
-        arguments = tool_call.get("arguments", {})
-    arguments = _parse_json_maybe(arguments)
-    return {
-        "type": "function",
-        "function": {
-            "name": "" if name is None else str(name),
-            "arguments": arguments,
-        },
-    }
-
-
-def _normalize_tools(raw_tools: Any) -> list[dict[str, Any]]:
+def _load_nemotron_tools(raw_tools: Any) -> list[dict[str, Any]]:
     tools = _parse_json_maybe(raw_tools)
     if not tools:
         return []
-    if isinstance(tools, dict):
-        tools = [tools]
     if not isinstance(tools, list):
-        return []
-    return [tool for tool in tools if isinstance(tool, dict)]
+        raise TypeError(f"Nemotron tools must be a list, got {type(tools).__name__}")
+    for idx, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise TypeError(
+                f"Nemotron tool {idx} must be a dict, got {type(tool).__name__}"
+            )
+    return tools
+
+
+def _load_nemotron_tool_calls(raw_tool_calls: Any, *, message_idx: int) -> list[dict]:
+    tool_calls = _parse_json_maybe(raw_tool_calls)
+    if not isinstance(tool_calls, list):
+        raise TypeError(
+            f"Nemotron assistant message {message_idx} tool_calls must be a list, "
+            f"got {type(tool_calls).__name__}"
+        )
+    for tool_idx, tool_call in enumerate(tool_calls):
+        if not isinstance(tool_call, dict):
+            raise TypeError(
+                f"Nemotron assistant message {message_idx} tool_call {tool_idx} "
+                f"must be a dict, got {type(tool_call).__name__}"
+            )
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            raise ValueError(
+                f"Nemotron assistant message {message_idx} tool_call {tool_idx} "
+                "is missing a function object"
+            )
+        if function.get("name") is None:
+            raise ValueError(
+                f"Nemotron assistant message {message_idx} tool_call {tool_idx} "
+                "is missing function.name"
+            )
+        if "arguments" not in function:
+            raise ValueError(
+                f"Nemotron assistant message {message_idx} tool_call {tool_idx} "
+                "is missing function.arguments"
+            )
+    return tool_calls
 
 
 def normalize_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
     raw_messages = _parse_json_maybe(raw_messages)
     if not raw_messages:
         raise ValueError("MM chat sample has no messages")
-    first = raw_messages[0]
-    if not isinstance(first, dict):
+    if not isinstance(raw_messages, list):
         raise TypeError(
-            f"Expected each chat turn to be a dict, got {type(first).__name__}"
+            f"Nemotron messages must be a list, got {type(raw_messages).__name__}"
         )
 
-    if "user" in first and "assistant" in first:
-        flattened = []
-        for message in raw_messages:
-            flattened.append({"role": "user", "content": message["user"]})
-            flattened.append({"role": "assistant", "content": message["assistant"]})
-        raw_messages = flattened
-
     messages = []
-    for message in raw_messages:
-        raw_role = message.get("role", message.get("from"))
+    for message_idx, message in enumerate(raw_messages):
+        if not isinstance(message, dict):
+            raise TypeError(
+                f"Nemotron message {message_idx} must be a dict, "
+                f"got {type(message).__name__}"
+            )
+        if "from" in message:
+            raise ValueError(
+                f"Nemotron message {message_idx} uses source field 'from'; "
+                "run source preprocessing first"
+            )
+        if "value" in message:
+            raise ValueError(
+                f"Nemotron message {message_idx} uses source field 'value'; "
+                "run source preprocessing first"
+            )
+        if "function_call" in message:
+            raise ValueError(
+                f"Nemotron message {message_idx} uses raw function_call; "
+                "run source preprocessing first"
+            )
+
+        raw_role = message.get("role")
         role = raw_role
         if role is None:
-            raise ValueError("MM chat message is missing role/from")
-        role = ROLE_TABLE.get(str(role), str(role))
-        content = message.get("content", message.get("value", ""))
-        if role == "tool_call":
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [_normalize_tool_call(content)],
-                }
+            raise ValueError(f"Nemotron message {message_idx} is missing role")
+        role = str(role)
+        if role not in NEMOTRON_ROLES:
+            raise ValueError(
+                f"Nemotron message {message_idx} has unsupported role {role!r}; "
+                "run source preprocessing first"
             )
-            continue
+        content = message.get("content", "")
 
         normalized_message = {
             "role": role,
@@ -283,17 +294,15 @@ def normalize_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
         if "tool_call_id" in message:
             normalized_message["tool_call_id"] = message["tool_call_id"]
         tool_calls = message.get("tool_calls")
-        if tool_calls is None and message.get("function_call") is not None:
-            tool_calls = [message["function_call"]]
         if tool_calls is not None:
-            if isinstance(tool_calls, str):
-                tool_calls = _parse_json_maybe(tool_calls)
-            if isinstance(tool_calls, dict):
-                tool_calls = [tool_calls]
-            if isinstance(tool_calls, list):
-                normalized_message["tool_calls"] = [
-                    _normalize_tool_call(tool_call) for tool_call in tool_calls
-                ]
+            if role != "assistant":
+                raise ValueError(
+                    f"Nemotron message {message_idx} has tool_calls on role {role!r}"
+                )
+            normalized_message["tool_calls"] = _load_nemotron_tool_calls(
+                tool_calls,
+                message_idx=message_idx,
+            )
         messages.append(normalized_message)
     return messages
 
@@ -338,17 +347,17 @@ def _prepend_missing_image_markers(
 
 
 def normalize_mm_chat_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    raw_messages = (
-        sample.get("messages") or sample.get("conversations") or sample.get("texts")
-    )
+    raw_messages = sample.get("messages")
     if raw_messages is None:
-        raise ValueError(
-            "MM chat sample must contain messages, conversations, or texts"
-        )
+        raise ValueError("Nemotron MM chat sample must contain messages")
 
-    images = normalize_mm_chat_images(sample.get("images", sample.get("image", [])))
+    if "image" in sample:
+        raise ValueError("Nemotron MM chat sample must use images, not image")
+    images = normalize_mm_chat_images(sample.get("images", []))
     messages = normalize_mm_chat_messages(raw_messages)
-    tools = _normalize_tools(sample.get("tools", sample.get("available_tools", [])))
+    if "available_tools" in sample:
+        raise ValueError("Nemotron MM chat sample must use tools, not available_tools")
+    tools = _load_nemotron_tools(sample.get("tools", []))
     existing_markers = _count_image_markers(messages, "<image>")
     _prepend_missing_image_markers(
         messages,

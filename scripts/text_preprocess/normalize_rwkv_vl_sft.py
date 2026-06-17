@@ -41,6 +41,11 @@ QWEN_TOOL_XML_OPEN = "<tools>"
 QWEN_TOOL_XML_CLOSE = "</tools>"
 QWEN_TOOL_CALL_XML_OPEN = "<tool_call>"
 QWEN_TOOL_CALL_XML_CLOSE = "</tool_call>"
+QWEN_TOOL_CALL_BLOCK_RE = re.compile(
+    rf"{re.escape(QWEN_TOOL_CALL_XML_OPEN)}\s*(.*?)\s*"
+    rf"{re.escape(QWEN_TOOL_CALL_XML_CLOSE)}",
+    flags=re.DOTALL,
+)
 QWEN_TOOL_PREAMBLE_RE = re.compile(
     r"(?:^|\n)\s*# Tools\s*\n\n"
     r"You may call one or more functions to assist with the user query\.\s*\n\n"
@@ -252,21 +257,49 @@ def normalize_tool_call(
     if isinstance(function, dict):
         name = function.get("name", parsed.get("name", ""))
         arguments = function.get("arguments", parsed.get("arguments", {}))
+        call_id = function.get(
+            "call_id",
+            function.get("id", parsed.get("call_id", parsed.get("id"))),
+        )
     else:
         name = parsed.get("name", parsed.get("tool_name", ""))
         arguments = parsed.get("arguments", parsed.get("args", {}))
+        call_id = parsed.get("call_id", parsed.get("id", parsed.get("tool_call_id")))
     arguments = parse_json_maybe(
         arguments,
         warnings=warnings,
         context=f"{context}.arguments",
     )
-    return {
+    normalized = {
         "type": "function",
         "function": {
             "name": "" if name is None else str(name),
             "arguments": arguments,
         },
     }
+    if call_id not in (None, ""):
+        normalized["id"] = str(call_id)
+    return normalized
+
+
+def extract_qwen_tool_call_blocks(
+    content: str,
+    *,
+    warnings: list[str],
+    context: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    tool_calls = [
+        normalize_tool_call(
+            match.group(1),
+            warnings=warnings,
+            context=f"{context}.tool_call:{idx}",
+        )
+        for idx, match in enumerate(QWEN_TOOL_CALL_BLOCK_RE.finditer(content))
+    ]
+    if not tool_calls:
+        return content, []
+    content_without_calls = QWEN_TOOL_CALL_BLOCK_RE.sub("", content).strip()
+    return content_without_calls, tool_calls
 
 
 def maybe_strip_system_tool_prompt(
@@ -305,6 +338,35 @@ def normalize_chat_messages(
 
     messages: list[dict[str, Any]] = []
     pending_tool_calls: list[dict[str, Any]] = []
+    pending_tool_response_ids: list[str] = []
+
+    def record_tool_response_ids(tool_calls: list[dict[str, Any]]) -> None:
+        pending_tool_response_ids.extend(
+            str(tool_call["id"]) for tool_call in tool_calls if tool_call.get("id")
+        )
+
+    def attach_or_append_assistant_tool_calls(
+        tool_calls: list[dict[str, Any]],
+    ) -> None:
+        if messages and messages[-1].get("role") == "assistant":
+            messages[-1].setdefault("tool_calls", []).extend(tool_calls)
+        else:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": tool_calls,
+                }
+            )
+        record_tool_response_ids(tool_calls)
+
+    def is_standalone_tool_call_message(message: dict[str, Any]) -> bool:
+        return (
+            bool(message.get("tool_calls"))
+            and message.get("content") in ("", None, [])
+            and "reasoning_content" not in message
+        )
+
     for idx, raw_message in enumerate(parsed):
         if not isinstance(raw_message, dict):
             warnings.append(f"message_dropped:{idx}:not_dict")
@@ -331,13 +393,7 @@ def normalize_chat_messages(
             continue
 
         if pending_tool_calls and role != "tool_call":
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": pending_tool_calls,
-                }
-            )
+            attach_or_append_assistant_tool_calls(pending_tool_calls)
             pending_tool_calls = []
 
         if role == "assistant":
@@ -345,6 +401,13 @@ def normalize_chat_messages(
                 content,
                 raw_message.get("reasoning_content"),
             )
+            embedded_tool_calls = []
+            if isinstance(content, str):
+                content, embedded_tool_calls = extract_qwen_tool_call_blocks(
+                    content,
+                    warnings=warnings,
+                    context=f"message:{idx}.content",
+                )
             normalized: dict[str, Any] = {
                 "role": "assistant",
                 "content": content,
@@ -374,7 +437,15 @@ def normalize_chat_messages(
                     ]
                 else:
                     warnings.append(f"tool_calls_dropped:{idx}:not_list")
-            messages.append(normalized)
+            if embedded_tool_calls:
+                normalized["tool_calls"] = (
+                    normalized.get("tool_calls", []) + embedded_tool_calls
+                )
+            if is_standalone_tool_call_message(normalized):
+                attach_or_append_assistant_tool_calls(normalized["tool_calls"])
+            else:
+                messages.append(normalized)
+                record_tool_response_ids(normalized.get("tool_calls", []))
             continue
 
         if role == "tool":
@@ -383,6 +454,8 @@ def normalize_chat_messages(
                 normalized_tool["name"] = str(raw_message["name"])
             if raw_message.get("tool_call_id") is not None:
                 normalized_tool["tool_call_id"] = str(raw_message["tool_call_id"])
+            elif pending_tool_response_ids:
+                normalized_tool["tool_call_id"] = pending_tool_response_ids.pop(0)
             messages.append(normalized_tool)
             continue
 
@@ -393,13 +466,7 @@ def normalize_chat_messages(
         warnings.append(f"message_role_dropped:{idx}:{role}")
 
     if pending_tool_calls:
-        messages.append(
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": pending_tool_calls,
-            }
-        )
+        attach_or_append_assistant_tool_calls(pending_tool_calls)
     if not messages:
         raise ValueError("source row produced no normalized messages")
     return messages
@@ -524,15 +591,19 @@ def adapt_honey(
     )
 
 
-def adapt_toucan_oss_qwen3(
+def adapt_toucan_tool_split(
     row: dict[str, Any],
     *,
     idx: int,
     image_root: str | None,
+    source_type: str,
 ) -> dict[str, Any]:
     del image_root
     warnings: list[str] = []
-    tools = normalize_tools(row.get("available_tools", []), warnings=warnings)
+    tools = normalize_tools(
+        row.get("available_tools", row.get("tools", [])),
+        warnings=warnings,
+    )
     messages = normalize_chat_messages(
         row.get("messages"),
         warnings=warnings,
@@ -540,12 +611,54 @@ def adapt_toucan_oss_qwen3(
     maybe_strip_system_tool_prompt(messages, tools, warnings)
     return base_row(
         row,
-        source_type="toucan_oss_qwen3",
+        source_type=source_type,
         idx=idx,
         messages=messages,
         images=[],
         tools=tools,
         warnings=warnings,
+    )
+
+
+def adapt_toucan_qwen3(
+    row: dict[str, Any],
+    *,
+    idx: int,
+    image_root: str | None,
+) -> dict[str, Any]:
+    return adapt_toucan_tool_split(
+        row,
+        idx=idx,
+        image_root=image_root,
+        source_type="toucan_qwen3",
+    )
+
+
+def adapt_toucan_oss(
+    row: dict[str, Any],
+    *,
+    idx: int,
+    image_root: str | None,
+) -> dict[str, Any]:
+    return adapt_toucan_tool_split(
+        row,
+        idx=idx,
+        image_root=image_root,
+        source_type="toucan_oss",
+    )
+
+
+def adapt_toucan_oss_qwen3(
+    row: dict[str, Any],
+    *,
+    idx: int,
+    image_root: str | None,
+) -> dict[str, Any]:
+    return adapt_toucan_tool_split(
+        row,
+        idx=idx,
+        image_root=image_root,
+        source_type="toucan_oss_qwen3",
     )
 
 
@@ -602,6 +715,8 @@ def adapt_nemotron(
 ADAPTERS = {
     "llava_onevision": adapt_llava_onevision,
     "honey": adapt_honey,
+    "toucan_qwen3": adapt_toucan_qwen3,
+    "toucan_oss": adapt_toucan_oss,
     "toucan_oss_qwen3": adapt_toucan_oss_qwen3,
     "toucan_sft": adapt_toucan_sft,
     "nemotron": adapt_nemotron,

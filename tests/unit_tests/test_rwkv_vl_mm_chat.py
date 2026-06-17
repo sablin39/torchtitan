@@ -631,9 +631,9 @@ class TestRwkvVLTokenizer(unittest.TestCase):
 
 
 class TestMMChatDataset(unittest.TestCase):
-    def test_normalize_mm_chat_sample_accepts_common_schemas(self):
+    def test_normalize_mm_chat_sample_requires_nemotron_schema(self):
         image = Image.new("RGB", (32, 32), color="red")
-        cases = [
+        raw_cases = [
             {
                 "conversations": [
                     {"from": "human", "value": "Question"},
@@ -643,38 +643,76 @@ class TestMMChatDataset(unittest.TestCase):
             },
             {
                 "messages": [
+                    {"from": "human", "value": "Question"},
+                    {"from": "gpt", "value": "Answer"},
+                ],
+                "images": [image],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "function_call": {
+                            "name": "search",
+                            "arguments": '{"query": "rwkv"}',
+                        },
+                    },
+                ],
+                "images": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "tool_call", "content": '{"name": "search"}'},
+                ],
+                "images": [],
+            },
+            {
+                "messages": [
                     {"role": "user", "content": "Question"},
                     {"role": "assistant", "content": "Answer"},
                 ],
                 "image": image,
             },
             {
-                "texts": [
-                    {"user": "Question", "assistant": "Answer"},
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer"},
                 ],
-                "images": [image],
+                "images": [],
+                "available_tools": [],
             },
         ]
-        for sample in cases:
-            normalized = normalize_mm_chat_sample(sample)
-            self.assertEqual(normalized["messages"][0]["role"], "user")
-            self.assertEqual(normalized["messages"][1]["role"], "assistant")
-            self.assertEqual(len(normalized["images"]), 1)
-            self.assertEqual(normalized["tools"], [])
+        for sample in raw_cases:
+            with self.assertRaises((TypeError, ValueError)):
+                normalize_mm_chat_sample(sample)
 
-    def test_normalize_mm_chat_sample_preserves_tools_and_tool_calls(self):
+    def test_normalize_mm_chat_sample_preserves_normalized_tools_and_tool_calls(self):
         sample = {
             "messages": [
                 {"role": "user", "content": "Question"},
                 {
                     "role": "assistant",
                     "content": "",
-                    "function_call": {
-                        "name": "search",
-                        "arguments": '{"query": "rwkv"}',
-                    },
+                    "tool_calls": [
+                        {
+                            "id": "call-search",
+                            "type": "function",
+                            "function": {
+                                "name": "search",
+                                "arguments": {"query": "rwkv"},
+                            },
+                        }
+                    ],
                 },
-                {"role": "function", "name": "search", "content": "result"},
+                {
+                    "role": "tool",
+                    "name": "search",
+                    "tool_call_id": "call-search",
+                    "content": "result",
+                },
                 {"role": "assistant", "content": "Answer"},
             ],
             "images": [],
@@ -697,7 +735,12 @@ class TestMMChatDataset(unittest.TestCase):
             normalized["messages"][1]["tool_calls"][0]["function"]["arguments"],
             {"query": "rwkv"},
         )
+        self.assertEqual(
+            normalized["messages"][1]["tool_calls"][0]["id"],
+            "call-search",
+        )
         self.assertEqual(normalized["messages"][2]["role"], "tool")
+        self.assertEqual(normalized["messages"][2]["tool_call_id"], "call-search")
 
     def test_normalize_mm_chat_sample_renders_nemotron_reasoning_for_training(self):
         sample = {
@@ -742,7 +785,7 @@ class TestMMChatDataset(unittest.TestCase):
                                 "type": "function",
                                 "function": {
                                     "name": "verify",
-                                    "arguments": '{"user_id": "u1"}',
+                                    "arguments": {"user_id": "u1"},
                                 },
                             }
                         ],
