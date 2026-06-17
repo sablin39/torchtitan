@@ -159,6 +159,12 @@ class WandBLogger(BaseLogger):
         # Create logging directory
         os.makedirs(log_dir, exist_ok=True)
 
+        wandb_init_kwargs = {}
+        if sync_swanlab and (
+            not swanlab_wandb_run or os.getenv("WANDB_MODE", "").lower() == "disabled"
+        ):
+            wandb_init_kwargs["mode"] = "offline"
+
         self.wandb.init(
             entity=os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
@@ -172,6 +178,7 @@ class WandBLogger(BaseLogger):
             fork_from=os.getenv("WANDB_FORK_FROM", None),
             dir=log_dir,
             config=config_dict,
+            **wandb_init_kwargs,
         )
         logger.info("WandB logging enabled")
 
