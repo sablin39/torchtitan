@@ -255,6 +255,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             tokenizer=self.tokenizer,
             seq_len=config.training.seq_len,
             local_batch_size=config.training.local_batch_size,
+            seed=config.debug.seed,
         )
 
         logger.info(f"Building {model_spec.name} {model_spec.flavor}")

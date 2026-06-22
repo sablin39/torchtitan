@@ -8,6 +8,7 @@
 
 import json
 import math
+import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,6 +31,18 @@ from torchtitan.hf_datasets.multimodal.utils.packing import MMSamplePacker
 from torchtitan.hf_datasets.multimodal.utils.text import pad_batch_dim, pad_seq_len
 from torchtitan.tools.logging import logger
 
+
+ROLE_TABLE = {
+    "user": "user",
+    "assistant": "assistant",
+    "system": "system",
+    "tool": "tool",
+    "function": "tool",
+    "tool_response": "tool",
+    "tool_call": "tool_call",
+    "human": "user",
+    "gpt": "assistant",
+}
 
 EMPTY_THINK_PREFIX = "<think>\n</think>\n "
 NEMOTRON_ROLES = {"system", "user", "assistant", "tool"}
@@ -190,6 +203,41 @@ def _parse_json_maybe(value: Any) -> Any:
         return value
 
 
+def _normalize_tool_call(raw_tool_call: Any) -> dict[str, Any]:
+    tool_call = _parse_json_maybe(raw_tool_call)
+    if not isinstance(tool_call, dict):
+        tool_call = {"name": "", "arguments": tool_call}
+
+    function = tool_call.get("function")
+    if isinstance(function, dict):
+        name = function.get("name", tool_call.get("name", ""))
+        arguments = function.get("arguments", tool_call.get("arguments", {}))
+    else:
+        name = tool_call.get("name", "")
+        arguments = tool_call.get("arguments", {})
+    normalized = {
+        "type": tool_call.get("type", "function"),
+        "function": {
+            "name": "" if name is None else str(name),
+            "arguments": _parse_json_maybe(arguments),
+        },
+    }
+    if "id" in tool_call:
+        normalized["id"] = tool_call["id"]
+    return normalized
+
+
+def _normalize_tools(raw_tools: Any) -> list[dict[str, Any]]:
+    tools = _parse_json_maybe(raw_tools)
+    if not tools:
+        return []
+    if isinstance(tools, dict):
+        tools = [tools]
+    if not isinstance(tools, list):
+        return []
+    return [tool for tool in tools if isinstance(tool, dict)]
+
+
 def _load_nemotron_tools(raw_tools: Any) -> list[dict[str, Any]]:
     tools = _parse_json_maybe(raw_tools)
     if not tools:
@@ -236,7 +284,7 @@ def _load_nemotron_tool_calls(raw_tool_calls: Any, *, message_idx: int) -> list[
     return tool_calls
 
 
-def normalize_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
+def normalize_nemotron_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
     raw_messages = _parse_json_maybe(raw_messages)
     if not raw_messages:
         raise ValueError("MM chat sample has no messages")
@@ -307,6 +355,84 @@ def normalize_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
     return messages
 
 
+def normalize_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
+    raw_messages = _parse_json_maybe(raw_messages)
+    if not raw_messages:
+        raise ValueError("MM chat sample has no messages")
+    if not isinstance(raw_messages, list):
+        raise TypeError(
+            f"Expected MM chat messages to be a list, got {type(raw_messages).__name__}"
+        )
+    first = raw_messages[0]
+    if not isinstance(first, dict):
+        raise TypeError(
+            f"Expected each chat turn to be a dict, got {type(first).__name__}"
+        )
+
+    if "user" in first and "assistant" in first:
+        flattened = []
+        for message in raw_messages:
+            if not isinstance(message, dict):
+                raise TypeError(
+                    f"Expected each chat turn to be a dict, got "
+                    f"{type(message).__name__}"
+                )
+            flattened.append({"role": "user", "content": message["user"]})
+            flattened.append({"role": "assistant", "content": message["assistant"]})
+        raw_messages = flattened
+
+    messages = []
+    for message_idx, message in enumerate(raw_messages):
+        if not isinstance(message, dict):
+            raise TypeError(
+                f"Expected chat turn {message_idx} to be a dict, "
+                f"got {type(message).__name__}"
+            )
+        raw_role = message.get("role", message.get("from"))
+        role = raw_role
+        if role is None:
+            raise ValueError("MM chat message is missing role/from")
+        role = ROLE_TABLE.get(str(role), str(role))
+        content = message.get("content", message.get("value", ""))
+        if role == "tool_call":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [_normalize_tool_call(content)],
+                }
+            )
+            continue
+
+        normalized_message = {
+            "role": role,
+            "content": _normalize_content(content),
+        }
+        if role == "assistant":
+            normalized_message["content"] = _ensure_think_content(
+                normalized_message["content"],
+                reasoning=message.get("reasoning_content"),
+            )
+        if "name" in message:
+            normalized_message["name"] = message["name"]
+        if "tool_call_id" in message:
+            normalized_message["tool_call_id"] = message["tool_call_id"]
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None and message.get("function_call") is not None:
+            tool_calls = [message["function_call"]]
+        if tool_calls is not None:
+            if isinstance(tool_calls, str):
+                tool_calls = _parse_json_maybe(tool_calls)
+            if isinstance(tool_calls, dict):
+                tool_calls = [tool_calls]
+            if isinstance(tool_calls, list):
+                normalized_message["tool_calls"] = [
+                    _normalize_tool_call(tool_call) for tool_call in tool_calls
+                ]
+        messages.append(normalized_message)
+    return messages
+
+
 def _count_image_markers(messages: list[dict[str, Any]], image_placeholder: str) -> int:
     count = 0
     for message in messages:
@@ -347,6 +473,26 @@ def _prepend_missing_image_markers(
 
 
 def normalize_mm_chat_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    raw_messages = (
+        sample.get("messages") or sample.get("conversations") or sample.get("texts")
+    )
+    if raw_messages is None:
+        raise ValueError(
+            "MM chat sample must contain messages, conversations, or texts"
+        )
+
+    images = normalize_mm_chat_images(sample.get("images", sample.get("image", [])))
+    messages = normalize_mm_chat_messages(raw_messages)
+    tools = _normalize_tools(sample.get("tools", sample.get("available_tools", [])))
+    existing_markers = _count_image_markers(messages, "<image>")
+    _prepend_missing_image_markers(
+        messages,
+        num_missing=max(len(images) - existing_markers, 0),
+    )
+    return {"messages": messages, "images": images, "tools": tools}
+
+
+def normalize_nemotron_mm_chat_sample(sample: dict[str, Any]) -> dict[str, Any]:
     raw_messages = sample.get("messages")
     if raw_messages is None:
         raise ValueError("Nemotron MM chat sample must contain messages")
@@ -354,7 +500,7 @@ def normalize_mm_chat_sample(sample: dict[str, Any]) -> dict[str, Any]:
     if "image" in sample:
         raise ValueError("Nemotron MM chat sample must use images, not image")
     images = normalize_mm_chat_images(sample.get("images", []))
-    messages = normalize_mm_chat_messages(raw_messages)
+    messages = normalize_nemotron_mm_chat_messages(raw_messages)
     if "available_tools" in sample:
         raise ValueError("Nemotron MM chat sample must use tools, not available_tools")
     tools = _load_nemotron_tools(sample.get("tools", []))
@@ -448,12 +594,36 @@ def build_image_token_counts_by_message(
     return counts_by_message
 
 
+def _get_source_data_iter(
+    data: Any,
+    *,
+    sample_idx: int,
+    hf_state_restored: bool,
+) -> Any:
+    if hf_state_restored:
+        return iter(data)
+    if isinstance(data, Dataset):
+        worker_info = get_worker_info()
+        stride = 1 if worker_info is None else worker_info.num_workers
+        offset = 0 if worker_info is None else worker_info.id
+        start = sample_idx * stride + offset
+        if start >= len(data):
+            return iter([])
+        if stride == 1:
+            return iter(data.select(range(start, len(data))))
+        return (data[idx] for idx in range(start, len(data), stride))
+    return iter(data)
+
+
 class MMChatDataset(IterableDataset, Stateful):
     def __init__(
         self,
         dataset: Dataset,
         tokenizer,
         sample_processor: Callable = normalize_mm_chat_sample,
+        text_dataset: Dataset | None = None,
+        text_sample_probability: float = 0.5,
+        seed: int | None = None,
         seq_len: int = 2048,
         patch_size: int = 16,
         temporal_patch_size: int = 2,
@@ -470,9 +640,21 @@ class MMChatDataset(IterableDataset, Stateful):
         max_aspect_ratio: float = 50.0,
         pixel_values_dtype: str | None = "float32",
     ) -> None:
+        if text_dataset is not None and not 0.0 <= text_sample_probability <= 1.0:
+            raise ValueError(
+                "text_sample_probability must be between 0 and 1 when "
+                f"text_dataset is set, got {text_sample_probability}"
+            )
         self._data = split_dataset_by_node(dataset, dp_rank, dp_world_size)
+        self._text_data = (
+            split_dataset_by_node(text_dataset, dp_rank, dp_world_size)
+            if text_dataset is not None
+            else None
+        )
         self._tokenizer = tokenizer
         self._sample_processor = sample_processor
+        self.text_sample_probability = float(text_sample_probability)
+        self._mix_rng = random.Random((0 if seed is None else seed) + dp_rank)
         self.seq_len = seq_len
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -485,7 +667,9 @@ class MMChatDataset(IterableDataset, Stateful):
         self.pixel_values_dtype = _resolve_pixel_values_dtype(pixel_values_dtype)
         self.infinite = infinite
         self._sample_idx = 0
+        self._text_sample_idx = 0
         self._hf_state_restored = False
+        self._text_hf_state_restored = False
         self.enable_packing = packing_buffer_size > 0
         if self.enable_packing:
             self.packer = MMSamplePacker(
@@ -495,23 +679,72 @@ class MMChatDataset(IterableDataset, Stateful):
             )
 
     def _get_data_iter(self):
-        if self._hf_state_restored:
-            self._hf_state_restored = False
-            return iter(self._data)
-        if isinstance(self._data, Dataset):
-            worker_info = get_worker_info()
-            stride = 1 if worker_info is None else worker_info.num_workers
-            offset = 0 if worker_info is None else worker_info.id
-            start = self._sample_idx * stride + offset
-            if start >= len(self._data):
-                return iter([])
-            if stride == 1:
-                return iter(self._data.select(range(start, len(self._data))))
-            return (self._data[idx] for idx in range(start, len(self._data), stride))
-        return iter(self._data)
+        iterator = _get_source_data_iter(
+            self._data,
+            sample_idx=self._sample_idx,
+            hf_state_restored=self._hf_state_restored,
+        )
+        self._hf_state_restored = False
+        return iterator
 
-    def _tokenize_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
-        processed_sample = self._sample_processor(sample)
+    def _get_text_data_iter(self):
+        if self._text_data is None:
+            return iter([])
+        iterator = _get_source_data_iter(
+            self._text_data,
+            sample_idx=self._text_sample_idx,
+            hf_state_restored=self._text_hf_state_restored,
+        )
+        self._text_hf_state_restored = False
+        return iterator
+
+    def _iter_samples(self):
+        if self._text_data is None:
+            for sample in self._get_data_iter():
+                self._sample_idx += 1
+                yield sample, self._sample_processor, "MM chat"
+            return
+
+        image_iter = self._get_data_iter()
+        text_iter = self._get_text_data_iter()
+        sources = {
+            "image": (image_iter, self._sample_processor, "image-text"),
+            "text": (text_iter, normalize_nemotron_mm_chat_sample, "Nemotron text"),
+        }
+        done = {"image": False, "text": False}
+
+        def next_from(source_name: str):
+            if done[source_name]:
+                return None
+            iterator, processor, label = sources[source_name]
+            try:
+                sample = next(iterator)
+            except StopIteration:
+                done[source_name] = True
+                return None
+            if source_name == "text":
+                self._text_sample_idx += 1
+            else:
+                self._sample_idx += 1
+            return sample, processor, label
+
+        while not all(done.values()):
+            first = (
+                "text"
+                if self._mix_rng.random() < self.text_sample_probability
+                else "image"
+            )
+            fallback = "image" if first == "text" else "text"
+            item = next_from(first) or next_from(fallback)
+            if item is not None:
+                yield item
+
+    def _tokenize_sample(
+        self,
+        sample: dict[str, Any],
+        sample_processor: Callable | None = None,
+    ) -> dict[str, Any] | None:
+        processed_sample = (sample_processor or self._sample_processor)(sample)
         messages = processed_sample["messages"]
         images = processed_sample["images"]
         tools = processed_sample.get("tools", [])
@@ -595,12 +828,11 @@ class MMChatDataset(IterableDataset, Stateful):
 
     def __iter__(self):
         while True:
-            for sample in self._get_data_iter():
-                self._sample_idx += 1
+            for sample, sample_processor, source_name in self._iter_samples():
                 try:
-                    processed = self._tokenize_sample(sample)
+                    processed = self._tokenize_sample(sample, sample_processor)
                 except Exception as e:
-                    logger.warning(f"Skipping MM chat sample: {e}")
+                    logger.warning(f"Skipping {source_name} sample: {e}")
                     continue
                 if processed is None:
                     continue
@@ -623,11 +855,19 @@ class MMChatDataset(IterableDataset, Stateful):
             if not self.infinite:
                 break
             self._sample_idx = 0
+            self._text_sample_idx = 0
 
     def state_dict(self):
-        state = {"sample_idx": self._sample_idx}
+        state = {
+            "sample_idx": self._sample_idx,
+        }
         if hasattr(self._data, "state_dict"):
             state["hf_dataset_state"] = self._data.state_dict()
+        if self._text_data is not None:
+            state["text_sample_idx"] = self._text_sample_idx
+            state["mix_rng_state"] = self._mix_rng.getstate()
+            if hasattr(self._text_data, "state_dict"):
+                state["text_hf_dataset_state"] = self._text_data.state_dict()
         # Packer buffers hold processed image tensors. They are data-dependent,
         # can be multi-GiB with VLM inputs, and are cheap to refill after resume.
         return state
@@ -637,6 +877,16 @@ class MMChatDataset(IterableDataset, Stateful):
         if "hf_dataset_state" in state_dict and hasattr(self._data, "load_state_dict"):
             self._data.load_state_dict(state_dict["hf_dataset_state"])
             self._hf_state_restored = True
+        if self._text_data is not None:
+            self._text_sample_idx = state_dict.get("text_sample_idx", 0)
+            if "mix_rng_state" in state_dict:
+                self._mix_rng.setstate(state_dict["mix_rng_state"])
+            if "text_hf_dataset_state" in state_dict and hasattr(
+                self._text_data,
+                "load_state_dict",
+            ):
+                self._text_data.load_state_dict(state_dict["text_hf_dataset_state"])
+                self._text_hf_state_restored = True
         if self.enable_packing:
             self.packer._sample_buffer.clear()
             self.packer._next_id = 0
@@ -844,6 +1094,8 @@ class MMChatDataLoader(ParallelAwareDataloader):
         data_files: str | None = None
         split: str | None = "train"
         sample_processor: Callable = normalize_mm_chat_sample
+        text_dataset_path: str | None = None
+        text_sample_probability: float = 0.5
         infinite: bool = True
         packing_buffer_size: int = 0
         max_images_per_batch: int
@@ -867,10 +1119,19 @@ class MMChatDataLoader(ParallelAwareDataloader):
         tokenizer,
         seq_len: int,
         local_batch_size: int,
+        seed: int | None = None,
         **kwargs,
     ):
         if not config.dataset_path:
             raise ValueError("MMChatDataLoader requires dataset_path")
+        if (
+            config.text_dataset_path
+            and not 0.0 <= config.text_sample_probability <= 1.0
+        ):
+            raise ValueError(
+                "text_sample_probability must be between 0 and 1 when "
+                f"text_dataset_path is set, got {config.text_sample_probability}"
+            )
         load_kwargs = dict(config.load_dataset_kwargs)
         if config.data_files is not None:
             load_kwargs["data_files"] = config.data_files
@@ -885,10 +1146,17 @@ class MMChatDataLoader(ParallelAwareDataloader):
                     f"available splits are {sorted(dataset)}"
                 )
             dataset = dataset[split]
+
+        text_dataset = None
+        if config.text_dataset_path:
+            text_dataset = load_dataset(config.text_dataset_path, split="train")
         chat_dataset = MMChatDataset(
             dataset=dataset,
             tokenizer=tokenizer,
             sample_processor=config.sample_processor,
+            text_dataset=text_dataset,
+            text_sample_probability=config.text_sample_probability,
+            seed=seed,
             seq_len=seq_len,
             patch_size=config.patch_size,
             temporal_patch_size=config.temporal_patch_size,

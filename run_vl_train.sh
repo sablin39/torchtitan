@@ -41,6 +41,11 @@ rwkv7_path="/mnt/raid0_8t/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
 vision_model="/home/rwkv/models/Qwen3-VL-2B-Instruct"
 # W&B remote path: /data/HuggingFaceM4_FineVisionMax
 dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/tqa(cauldron,llava_format)"
+# Optional text-only SFT source. Image-text rows stay LLaVA/common-schema
+# friendly; text rows are loaded through the strict Nemotron chat processor.
+text_dataset_path="/mnt/raid0_8t/Nemotron-SFT-Agentic-v2"
+text_sample_probability="0.5"
+project_seed="1234"
 # 1.5B-v100M:
 # rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
 # vision_model="/home/molin/models/Qwen3.5-0.8B"
@@ -473,6 +478,11 @@ echo "Bucketing:"
 echo "  ViT patches:   ${vit_patch_bucket_size} (0 disables)"
 echo "  Inductor dir:  ${torchinductor_cache_dir:-<torch default>}"
 echo "  TORCH_LOGS:    ${torch_logs:-<unset>}"
+echo "Datasets:"
+echo "  Image-text:    ${dataset_path}"
+echo "  Text:          ${text_dataset_path:-<disabled>}"
+echo "  Text mix prob: ${text_sample_probability}"
+echo "  Project seed:  ${project_seed:-<unset>}"
 echo "Diagnostics:"
 echo "  Debugging:     ${debugging}"
 echo "  Terminal log:  ${terminal_log_file:-<unset>}"
@@ -568,6 +578,7 @@ train_args=(
     --metrics.log-freq "${log_freq}"
     --dataloader.dataset-path "${dataset_path}"
     --dataloader.split "${split}"
+    --dataloader.text-sample-probability "${text_sample_probability}"
     --optimizer.name "${optimizer_name}"
     --optimizer.lr "${learning_rate}"
     --optimizer.weight-decay "${weight_decay}"
@@ -594,6 +605,12 @@ train_args=(
     --checkpoint.export-dtype "${export_dtype}"
 )
 
+if [[ -n "${text_dataset_path}" ]]; then
+    train_args+=(--dataloader.text-dataset-path "${text_dataset_path}")
+fi
+if [[ -n "${project_seed}" ]]; then
+    train_args+=(--debug.seed "${project_seed}")
+fi
 if [[ "${run_until_epoch}" == "1" ]]; then
     train_args+=(--dataloader.no-infinite)
 fi

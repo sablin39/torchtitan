@@ -26,6 +26,7 @@ from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
     MMChatCollator,
     MMChatDataset,
     normalize_mm_chat_sample,
+    normalize_nemotron_mm_chat_sample,
     process_mm_chat_images,
 )
 from torchtitan.hf_datasets.multimodal.processor_core import (
@@ -631,7 +632,73 @@ class TestRwkvVLTokenizer(unittest.TestCase):
 
 
 class TestMMChatDataset(unittest.TestCase):
-    def test_normalize_mm_chat_sample_requires_nemotron_schema(self):
+    def test_normalize_mm_chat_sample_accepts_common_schemas(self):
+        image = Image.new("RGB", (32, 32), color="red")
+        cases = [
+            {
+                "conversations": [
+                    {"from": "human", "value": "Question"},
+                    {"from": "gpt", "value": "Answer"},
+                ],
+                "images": [image, None],
+            },
+            {
+                "messages": [
+                    {"from": "human", "value": "Question"},
+                    {"from": "gpt", "value": "Answer"},
+                ],
+                "images": [image],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "function_call": {
+                            "name": "search",
+                            "arguments": '{"query": "rwkv"}',
+                        },
+                    },
+                ],
+                "images": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "tool_call", "content": '{"name": "search"}'},
+                ],
+                "images": [],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "image": image,
+            },
+            {
+                "texts": [
+                    {"user": "Question", "assistant": "Answer"},
+                ],
+                "images": [image],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                "images": [],
+                "available_tools": [],
+            },
+        ]
+        for sample in cases:
+            normalized = normalize_mm_chat_sample(sample)
+            self.assertEqual(normalized["messages"][0]["role"], "user")
+            self.assertEqual(normalized["messages"][1]["role"], "assistant")
+            self.assertEqual(normalized["tools"], [])
+
+    def test_normalize_nemotron_mm_chat_sample_requires_nemotron_schema(self):
         image = Image.new("RGB", (32, 32), color="red")
         raw_cases = [
             {
@@ -687,7 +754,7 @@ class TestMMChatDataset(unittest.TestCase):
         ]
         for sample in raw_cases:
             with self.assertRaises((TypeError, ValueError)):
-                normalize_mm_chat_sample(sample)
+                normalize_nemotron_mm_chat_sample(sample)
 
     def test_normalize_mm_chat_sample_preserves_normalized_tools_and_tool_calls(self):
         sample = {
@@ -742,7 +809,21 @@ class TestMMChatDataset(unittest.TestCase):
         self.assertEqual(normalized["messages"][2]["role"], "tool")
         self.assertEqual(normalized["messages"][2]["tool_call_id"], "call-search")
 
-    def test_normalize_mm_chat_sample_renders_nemotron_reasoning_for_training(self):
+    def test_normalize_mm_chat_sample_adds_fake_thinking_for_llava_answers(self):
+        sample = {
+            "conversations": [
+                {"from": "human", "value": "Question"},
+                {"from": "gpt", "value": "Answer."},
+            ],
+            "images": [],
+        }
+        normalized = normalize_mm_chat_sample(sample)
+        self.assertEqual(
+            normalized["messages"][1]["content"],
+            "<think>\n</think>\n Answer.",
+        )
+
+    def test_normalize_nemotron_mm_chat_sample_uses_reasoning_for_training(self):
         sample = {
             "messages": [
                 {"role": "system", "content": "Policy."},
@@ -753,20 +834,26 @@ class TestMMChatDataset(unittest.TestCase):
                     "content": "Answer.",
                 },
                 {"role": "user", "content": "Short?"},
-                {"role": "assistant", "content": "Yes."},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "The answer is short.",
+                    "content": "Yes.",
+                },
             ],
             "images": [],
             "tools": [],
         }
-        normalized = normalize_mm_chat_sample(sample)
+        normalized = normalize_nemotron_mm_chat_sample(sample)
         self.assertEqual(
             normalized["messages"][2]["content"],
             "<think>\nNeed to inspect the policy.\n</think>\n Answer.",
         )
         self.assertEqual(
             normalized["messages"][4]["content"],
-            "<think>\n</think>\n Yes.",
+            "<think>\nThe answer is short.\n</think>\n Yes.",
         )
+        self.assertNotIn("<think>\n</think>", normalized["messages"][2]["content"])
+        self.assertNotIn("<think>\n</think>", normalized["messages"][4]["content"])
         self.assertNotIn("reasoning_content", normalized["messages"][2])
 
     def test_mm_chat_dataset_loads_nemotron_style_text_rows(self):
@@ -836,6 +923,78 @@ class TestMMChatDataset(unittest.TestCase):
                 "<think>\nTool confirmed the user.\n</think>\n Verified.",
                 supervised,
             )
+
+    def test_mm_chat_dataset_blends_llava_and_nemotron_processors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            llava_sample = {
+                "conversations": [
+                    {"from": "human", "value": "Describe this."},
+                    {"from": "gpt", "value": "A red square."},
+                ],
+                "images": [Image.new("RGB", (32, 32), color="red")],
+            }
+            nemotron_sample = {
+                "messages": [
+                    {"role": "user", "content": "Verify me"},
+                    {
+                        "role": "assistant",
+                        "reasoning_content": "Need to verify before answering.",
+                        "content": "Verified.",
+                    },
+                ],
+                "images": [],
+                "tools": [],
+            }
+            dataset = _make_mm_chat_dataset(
+                tok,
+                [llava_sample],
+                text_dataset=Dataset.from_list([nemotron_sample]),
+                text_sample_probability=0.5,
+                seq_len=2048,
+            )
+
+            samples = list(dataset)
+            self.assertEqual(len(samples), 2)
+            supervised = "\n".join(
+                tok.decode(sample["labels"][sample["labels"] != IGNORE_INDEX].tolist())
+                for sample in samples
+            )
+            self.assertIn("<think>\n</think>\n A red square.", supervised)
+            self.assertIn(
+                "<think>\nNeed to verify before answering.\n</think>\n Verified.",
+                supervised,
+            )
+            self.assertNotIn(
+                "<think>\n</think>\n Verified.",
+                supervised,
+            )
+
+    def test_mm_chat_dataset_blend_uses_project_seed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            image_samples = [
+                {"messages": [], "images": [], "source": "image0"},
+                {"messages": [], "images": [], "source": "image1"},
+            ]
+            text_samples = [
+                {"messages": [], "images": [], "source": "text0"},
+                {"messages": [], "images": [], "source": "text1"},
+            ]
+
+            def source_order(seed: int) -> list[str]:
+                dataset = _make_mm_chat_dataset(
+                    tok,
+                    image_samples,
+                    text_dataset=Dataset.from_list(text_samples),
+                    text_sample_probability=0.5,
+                    seed=seed,
+                    seq_len=2048,
+                )
+                return [sample["source"] for sample, _, _ in dataset._iter_samples()]
+
+            self.assertEqual(source_order(1234), source_order(1234))
+            self.assertNotEqual(source_order(1234), source_order(1235))
 
     def test_mm_chat_dataset_counts_image_tokens(self):
         with tempfile.TemporaryDirectory() as tmpdir:
