@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -23,10 +24,10 @@ from scripts.rwkv7_exporter.export_hf_model import (
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
     build_image_token_counts_by_message,
+    MMChatDataLoader,
     MMChatCollator,
     MMChatDataset,
     normalize_mm_chat_sample,
-    normalize_nemotron_mm_chat_sample,
     process_mm_chat_images,
 )
 from torchtitan.hf_datasets.multimodal.processor_core import (
@@ -62,6 +63,9 @@ def _write_tiny_rwkv_vocab(path: str) -> None:
             (65530, b"<|vision_start|>"),
             (65531, b"<|vision_end|>"),
             (65532, b"<|image_pad|>"),
+            (65533, b"<tool_call>"),
+            (65534, b"<tool_response>"),
+            (65535, b"<tools>"),
         ):
             f.write(f"{token_id} {repr(token)} {len(token)}\n")
 
@@ -187,6 +191,31 @@ class TinyImageProcessor(BaseImageProcessor):
 
 
 class TestRwkvVLTokenizer(unittest.TestCase):
+    def test_exporter_vocab_contains_tool_and_vision_special_tags(self):
+        vocab_path = (
+            Path(__file__).parents[2]
+            / "scripts"
+            / "rwkv7_exporter"
+            / "wr_vocab_v20230424.txt"
+        )
+        expected = {
+            65530: "<|vision_start|>",
+            65531: "<|vision_end|>",
+            65532: "<|image_pad|>",
+            65533: "<tool_call>",
+            65534: "<tool_response>",
+            65535: "<tools>",
+        }
+        found = {}
+        with open(vocab_path, encoding="utf-8") as f:
+            for line in f:
+                token_id = int(line[: line.index(" ")])
+                if token_id not in expected:
+                    continue
+                token = eval(line[line.index(" ") : line.rindex(" ")])
+                found[token_id] = token
+        self.assertEqual(found, expected)
+
     def test_exporter_has_no_static_core_copies(self):
         repo_root = Path(__file__).parents[2]
         exporter_dir = repo_root / "scripts" / "rwkv7_exporter"
@@ -290,6 +319,10 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             self.assertIn("<tools>\n", rendered)
             self.assertIn('"name": "search"', rendered)
             self.assertIn("<tool_call>\n", rendered)
+            rendered_ids = tok.encode(rendered)
+            self.assertIn(65533, rendered_ids)
+            self.assertIn(65534, rendered_ids)
+            self.assertIn(65535, rendered_ids)
             self.assertIn(
                 '{"name": "search", "arguments": {"query": "rwkv"}}', rendered
             )
@@ -312,6 +345,30 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             self.assertIn("Done.", supervised)
             self.assertNotIn("<tool_response>", supervised)
             self.assertNotIn("result one", supervised)
+
+    def test_tool_tags_are_atomic_but_closing_tags_remain_text(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            text = (
+                "<tools>x</tools>"
+                "<tool_call>\n{}\n</tool_call>"
+                "<tool_response>ok</tool_response>"
+            )
+            ids = tok.encode(text)
+            self.assertEqual(ids.count(65533), 1)
+            self.assertEqual(ids.count(65534), 1)
+            self.assertEqual(ids.count(65535), 1)
+            self.assertEqual(tok.decode(ids), text)
+            self.assertNotEqual(tok.token_to_id("</tool_call>"), 65533)
+            self.assertIsNone(tok.token_to_id("</tool_call>"))
+
+    def test_vision_special_tags_keep_exact_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            text = f"{tok.vision_start_token}{tok.image_token}{tok.vision_end_token}"
+            ids = tok.encode(text)
+            self.assertEqual(ids, [65530, 65532, 65531])
+            self.assertEqual(tok.decode(ids), text)
 
     def test_existing_qwen_tool_preamble_is_not_duplicated(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -364,6 +421,42 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 tt_tok.assistant_token_spans(messages, counts),
                 hf_tok.assistant_token_spans(messages, counts),
             )
+            self.assertEqual(hf_tok.convert_tokens_to_ids("<tool_call>"), 65533)
+            self.assertEqual(hf_tok.convert_tokens_to_ids("<tool_response>"), 65534)
+            self.assertEqual(hf_tok.convert_tokens_to_ids("<tools>"), 65535)
+            additional = [
+                str(token)
+                for token in getattr(hf_tok, "additional_special_tokens", [])
+            ]
+            self.assertIn("<tool_call>", additional)
+            self.assertIn("<tool_response>", additional)
+            self.assertIn("<tools>", additional)
+
+    def test_rwkv_vl_tokenizer_overrides_stale_exported_template(self):
+        stale_template = (
+            "{% for message in messages %}"
+            "{{ '\\x16' + message['role'] + ': ' }}"
+            "{% if message['role'] == 'assistant' %}"
+            "{{ ' <think>\\n</think>\\n' }}"
+            "{% endif %}"
+            "{{ message['content'] }}{{ '\\x17' }}"
+            "{% endfor %}"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_tiny_rwkv_vocab(os.path.join(tmpdir, "wr_vocab_v20230424.txt"))
+            with open(os.path.join(tmpdir, "chat_template.jinja"), "w") as f:
+                f.write(stale_template)
+            tok = RwkvVLMultiModalTokenizer(tokenizer_path=tmpdir)
+            rendered = tok.render_mm_chat(
+                [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer"},
+                ],
+                [[], []],
+            )
+            self.assertIn("\x16Assistant: Answer\x17", rendered)
+            self.assertNotIn("<think>\n</think>\nAnswer", rendered)
+            self.assertNotIn("assistant:", rendered)
 
     def test_expand_image_placeholders_adds_missing_and_drops_extra(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -698,64 +791,6 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertEqual(normalized["messages"][1]["role"], "assistant")
             self.assertEqual(normalized["tools"], [])
 
-    def test_normalize_nemotron_mm_chat_sample_requires_nemotron_schema(self):
-        image = Image.new("RGB", (32, 32), color="red")
-        raw_cases = [
-            {
-                "conversations": [
-                    {"from": "human", "value": "Question"},
-                    {"from": "gpt", "value": "Answer"},
-                ],
-                "images": [image, None],
-            },
-            {
-                "messages": [
-                    {"from": "human", "value": "Question"},
-                    {"from": "gpt", "value": "Answer"},
-                ],
-                "images": [image],
-            },
-            {
-                "messages": [
-                    {"role": "user", "content": "Question"},
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "function_call": {
-                            "name": "search",
-                            "arguments": '{"query": "rwkv"}',
-                        },
-                    },
-                ],
-                "images": [],
-            },
-            {
-                "messages": [
-                    {"role": "user", "content": "Question"},
-                    {"role": "tool_call", "content": '{"name": "search"}'},
-                ],
-                "images": [],
-            },
-            {
-                "messages": [
-                    {"role": "user", "content": "Question"},
-                    {"role": "assistant", "content": "Answer"},
-                ],
-                "image": image,
-            },
-            {
-                "messages": [
-                    {"role": "user", "content": "Question"},
-                    {"role": "assistant", "content": "Answer"},
-                ],
-                "images": [],
-                "available_tools": [],
-            },
-        ]
-        for sample in raw_cases:
-            with self.assertRaises((TypeError, ValueError)):
-                normalize_nemotron_mm_chat_sample(sample)
-
     def test_normalize_mm_chat_sample_preserves_normalized_tools_and_tool_calls(self):
         sample = {
             "messages": [
@@ -823,27 +858,27 @@ class TestMMChatDataset(unittest.TestCase):
             "<think>\n</think>\n Answer.",
         )
 
-    def test_normalize_nemotron_mm_chat_sample_uses_reasoning_for_training(self):
+    def test_normalize_mm_chat_sample_uses_reasoning_for_training(self):
         sample = {
             "messages": [
-                {"role": "system", "content": "Policy."},
-                {"role": "user", "content": "Question"},
+                {"from": "system", "value": "Policy."},
+                {"from": "human", "value": "Question"},
                 {
-                    "role": "assistant",
+                    "from": "gpt",
                     "reasoning_content": "Need to inspect the policy.",
-                    "content": "Answer.",
+                    "value": "Answer.",
                 },
-                {"role": "user", "content": "Short?"},
+                {"from": "human", "value": "Short?"},
                 {
-                    "role": "assistant",
+                    "from": "gpt",
                     "reasoning_content": "The answer is short.",
-                    "content": "Yes.",
+                    "value": "Yes.",
                 },
             ],
             "images": [],
             "tools": [],
         }
-        normalized = normalize_nemotron_mm_chat_sample(sample)
+        normalized = normalize_mm_chat_sample(sample)
         self.assertEqual(
             normalized["messages"][2]["content"],
             "<think>\nNeed to inspect the policy.\n</think>\n Answer.",
@@ -856,17 +891,17 @@ class TestMMChatDataset(unittest.TestCase):
         self.assertNotIn("<think>\n</think>", normalized["messages"][4]["content"])
         self.assertNotIn("reasoning_content", normalized["messages"][2])
 
-    def test_mm_chat_dataset_loads_nemotron_style_text_rows(self):
+    def test_mm_chat_dataset_loads_converted_sharegpt_tool_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tok = _make_tokenizer(tmpdir)
             sample = {
                 "messages": [
-                    {"role": "system", "content": "Policy."},
-                    {"role": "user", "content": "Verify me"},
+                    {"from": "system", "value": "Policy."},
+                    {"from": "human", "value": "Verify me"},
                     {
-                        "role": "assistant",
+                        "from": "gpt",
                         "reasoning_content": "Need a verification lookup.",
-                        "content": "",
+                        "value": "",
                         "tool_calls": [
                             {
                                 "type": "function",
@@ -878,14 +913,14 @@ class TestMMChatDataset(unittest.TestCase):
                         ],
                     },
                     {
-                        "role": "tool",
+                        "from": "tool",
                         "tool_call_id": "call-1",
-                        "content": '{"ok": true}',
+                        "value": '{"ok": true}',
                     },
                     {
-                        "role": "assistant",
+                        "from": "gpt",
                         "reasoning_content": "Tool confirmed the user.",
-                        "content": "Verified.",
+                        "value": "Verified.",
                     },
                 ],
                 "images": [],
@@ -918,13 +953,265 @@ class TestMMChatDataset(unittest.TestCase):
                 '<tool_response>\n{"ok": true}\n</tool_response>',
                 input_text,
             )
+            input_ids = processed["input_ids"].tolist()
+            label_ids = processed["labels"][
+                processed["labels"] != IGNORE_INDEX
+            ].tolist()
+            self.assertIn(65533, label_ids)
+            self.assertIn(65534, input_ids)
+            self.assertIn(65535, input_ids)
+            self.assertNotIn(65534, label_ids)
             self.assertNotIn("<tool_response>", supervised)
             self.assertIn(
                 "<think>\nTool confirmed the user.\n</think>\n Verified.",
                 supervised,
             )
 
-    def test_mm_chat_dataset_blends_llava_and_nemotron_processors(self):
+    def test_mm_chat_dataloader_streams_converted_text_parquet_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            image_path = os.path.join(tmpdir, "image.jsonl")
+            text_path = os.path.join(tmpdir, "nemotron.parquet")
+            image_row = {
+                "messages": [
+                    {"role": "user", "content": "image-free"},
+                    {"role": "assistant", "content": "ok"},
+                ],
+                "images": [],
+                "tools": [],
+            }
+            with open(image_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(image_row) + "\n")
+            row = {
+                "uuid": "row-1",
+                "messages": [
+                    {"role": "user", "content": "Verify"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "verify",
+                                    "arguments": {"required": [None]},
+                                    "required": [None],
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "content": "ok"},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "license": "test",
+                "used_in": ["unit"],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "verify",
+                            "description": "Verify.",
+                            "parameters": "{}",
+                            "required": [None],
+                        },
+                    }
+                ],
+            }
+            Dataset.from_list([row]).to_parquet(text_path)
+            config = MMChatDataLoader.Config(
+                dataset_path="json",
+                data_files=image_path,
+                text_dataset_path=text_path,
+                text_sample_probability=1.0,
+                infinite=False,
+                max_images_per_batch=8,
+                patch_size=16,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+                min_pixels=1024,
+                max_pixels=4096,
+                image_mean=(0.5, 0.5, 0.5),
+                image_std=(0.5, 0.5, 0.5),
+            )
+            loader = MMChatDataLoader(
+                config,
+                dp_world_size=1,
+                dp_rank=0,
+                tokenizer=tok,
+                seq_len=2048,
+                local_batch_size=1,
+            )
+            input_dict, labels = next(iter(loader))
+            self.assertIn(65535, input_dict["input"][0].tolist())
+            supervised = tok.decode(labels[labels != IGNORE_INDEX].tolist())
+            self.assertIn("<tool_call>", supervised)
+
+    def test_mm_chat_dataloader_loads_converted_text_parquet_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            image_path = os.path.join(tmpdir, "image.jsonl")
+            text_dir = os.path.join(tmpdir, "text")
+            os.makedirs(os.path.join(text_dir, "nested"))
+            image_row = {
+                "messages": [
+                    {"role": "user", "content": "image side"},
+                    {"role": "assistant", "content": "ok"},
+                ],
+                "images": [],
+            }
+            with open(image_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(image_row) + "\n")
+            text_row = {
+                "uuid": "text-1",
+                "source": "Nemotron-SFT-Science-v2/rqa",
+                "source_file": "/tmp/rqa.jsonl",
+                "source_line": 1,
+                "messages": [
+                    {"from": "human", "value": "Use the tool"},
+                    {
+                        "from": "gpt",
+                        "value": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "evaluate_code",
+                                    "arguments": {"source_code": "1 + 1"},
+                                },
+                            }
+                        ],
+                    },
+                    {"from": "tool", "value": "2"},
+                    {"from": "gpt", "value": "Two."},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "evaluate_code",
+                            "description": "Evaluate code.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"source_code": {"type": "string"}},
+                                "required": ["source_code"],
+                            },
+                        },
+                    }
+                ],
+                "license": "",
+                "used_in": [],
+                "metadata": {"dataset": "unit"},
+            }
+            Dataset.from_list([text_row]).to_parquet(
+                os.path.join(text_dir, "nested", "part-00000.parquet")
+            )
+            config = MMChatDataLoader.Config(
+                dataset_path="json",
+                data_files=image_path,
+                text_dataset_path=text_dir,
+                text_sample_probability=1.0,
+                infinite=False,
+                max_images_per_batch=8,
+                patch_size=16,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+                min_pixels=1024,
+                max_pixels=4096,
+                image_mean=(0.5, 0.5, 0.5),
+                image_std=(0.5, 0.5, 0.5),
+            )
+            loader = MMChatDataLoader(
+                config,
+                dp_world_size=1,
+                dp_rank=0,
+                tokenizer=tok,
+                seq_len=2048,
+                local_batch_size=1,
+            )
+            input_dict, labels = next(iter(loader))
+            input_text = tok.decode(input_dict["input"][0].tolist())
+            supervised = tok.decode(labels[labels != IGNORE_INDEX].tolist())
+            self.assertIn("<tools>", input_text)
+            self.assertIn("<tool_response>\n2\n</tool_response>", input_text)
+            self.assertIn("<tool_call>", supervised)
+
+    def test_mm_chat_dataloader_loads_primary_converted_parquet_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tok = _make_tokenizer(tmpdir)
+            dataset_dir = os.path.join(tmpdir, "converted")
+            os.makedirs(os.path.join(dataset_dir, "shard"))
+            row = {
+                "uuid": "text-1",
+                "source": "Nemotron-SFT-Agentic-v2/tool_calling",
+                "source_file": "/tmp/tool_calling.jsonl",
+                "source_line": 1,
+                "messages": [
+                    {"from": "human", "value": "Use the tool"},
+                    {
+                        "from": "gpt",
+                        "value": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": {"query": "rwkv"},
+                                },
+                            }
+                        ],
+                    },
+                    {"from": "tool", "value": "found"},
+                    {"from": "gpt", "value": "Done."},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "description": "Lookup.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"query": {"type": "string"}},
+                                "required": ["query"],
+                            },
+                        },
+                    }
+                ],
+                "license": "",
+                "used_in": [],
+                "metadata": {"dataset": "unit"},
+            }
+            Dataset.from_list([row]).to_parquet(
+                os.path.join(dataset_dir, "shard", "part-00000.parquet")
+            )
+            config = MMChatDataLoader.Config(
+                dataset_path=dataset_dir,
+                infinite=False,
+                max_images_per_batch=8,
+                patch_size=16,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+                min_pixels=1024,
+                max_pixels=4096,
+                image_mean=(0.5, 0.5, 0.5),
+                image_std=(0.5, 0.5, 0.5),
+            )
+            loader = MMChatDataLoader(
+                config,
+                dp_world_size=1,
+                dp_rank=0,
+                tokenizer=tok,
+                seq_len=2048,
+                local_batch_size=1,
+            )
+            input_dict, labels = next(iter(loader))
+            input_text = tok.decode(input_dict["input"][0].tolist())
+            supervised = tok.decode(labels[labels != IGNORE_INDEX].tolist())
+            self.assertIn("<tools>", input_text)
+            self.assertIn("<tool_response>\nfound\n</tool_response>", input_text)
+            self.assertIn("<tool_call>", supervised)
+
+    def test_mm_chat_dataset_blends_llava_and_converted_text_samples(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tok = _make_tokenizer(tmpdir)
             llava_sample = {
@@ -934,13 +1221,15 @@ class TestMMChatDataset(unittest.TestCase):
                 ],
                 "images": [Image.new("RGB", (32, 32), color="red")],
             }
-            nemotron_sample = {
+            text_sample = {
                 "messages": [
-                    {"role": "user", "content": "Verify me"},
+                    {"from": "human", "value": "Verify me"},
                     {
-                        "role": "assistant",
-                        "reasoning_content": "Need to verify before answering.",
-                        "content": "Verified.",
+                        "from": "gpt",
+                        "value": (
+                            "<think>\nNeed to verify before answering.\n</think>\n "
+                            "Verified."
+                        ),
                     },
                 ],
                 "images": [],
@@ -949,7 +1238,7 @@ class TestMMChatDataset(unittest.TestCase):
             dataset = _make_mm_chat_dataset(
                 tok,
                 [llava_sample],
-                text_dataset=Dataset.from_list([nemotron_sample]),
+                text_dataset=Dataset.from_list([text_sample]),
                 text_sample_probability=0.5,
                 seq_len=2048,
             )

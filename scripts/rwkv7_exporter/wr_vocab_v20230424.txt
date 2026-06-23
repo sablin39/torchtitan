@@ -65530,3 +65530,6 @@
 65530 '<|vision_start|>' 16
 65531 '<|vision_end|>' 14
 65532 '<|image_pad|>' 13
+65533 '<tool_call>' 11
+65534 '<tool_response>' 15
+65535 '<tools>' 7

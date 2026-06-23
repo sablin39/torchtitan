@@ -47,6 +47,7 @@ from torchtitan.models.rwkv7.tokenizer_core import (
     DEFAULT_VISION_END_TOKEN_ID,
     DEFAULT_VISION_START_TOKEN_ID,
 )
+from torchtitan.hf_datasets.multimodal.processor_core import CHAT_TEMPLATE
 
 
 IM_START_TOKEN_ID = 23
@@ -131,6 +132,12 @@ def save_processor_core(output: str) -> None:
     output_path = Path(output)
     output_path.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, output_path / "processor_core.py")
+
+
+def save_chat_template(output: str) -> None:
+    output_path = Path(output)
+    output_path.mkdir(parents=True, exist_ok=True)
+    (output_path / "chat_template.jinja").write_text(CHAT_TEMPLATE, encoding="utf-8")
 
 
 @contextmanager
@@ -742,6 +749,7 @@ def save_multimodal_processor(
             image_processor=image_processor,
         )
         processor.save_pretrained(output)
+        save_chat_template(output)
         save_tokenizer_core(output)
         save_processor_core(output)
 
@@ -860,6 +868,7 @@ def convert(
         )
         tokenizer.register_for_auto_class()
         tokenizer.save_pretrained(output)
+        save_chat_template(output)
         save_tokenizer_core(output)
 
     print(f"Saved text-only HF checkpoint to {output}")

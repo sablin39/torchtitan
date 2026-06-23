@@ -38,6 +38,9 @@ def _write_tiny_rwkv_vocab(path: str) -> None:
             (65530, b"<|vision_start|>"),
             (65531, b"<|vision_end|>"),
             (65532, b"<|image_pad|>"),
+            (65533, b"<tool_call>"),
+            (65534, b"<tool_response>"),
+            (65535, b"<tools>"),
         ):
             f.write(f"{token_id} {repr(token)} {len(token)}\n")
 
@@ -425,6 +428,24 @@ class TestRWKV7Backend(unittest.TestCase):
 
 
 class TestRWKVTokenizer(unittest.TestCase):
+    def test_rwkv_tokenizer_injects_missing_reserved_tool_tokens(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vocab_path = os.path.join(tmpdir, "wr_vocab_v20230424.txt")
+            with open(vocab_path, "w", encoding="utf-8") as f:
+                for byte in range(256):
+                    token = bytes([byte])
+                    f.write(f"{byte + 1} {repr(token)} {len(token)}\n")
+                for token_id, token in (
+                    (65530, b"<|vision_start|>"),
+                    (65531, b"<|vision_end|>"),
+                    (65532, b"<|image_pad|>"),
+                ):
+                    f.write(f"{token_id} {repr(token)} {len(token)}\n")
+            tok = RwkvTokenizer(tokenizer_path=tmpdir)
+            ids = tok.encode("<tool_call>x</tool_call>")
+            self.assertIn(65533, ids)
+            self.assertEqual(tok.decode(ids), "<tool_call>x</tool_call>")
+
     def test_rwkv_tokenizer_preserves_sparse_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             _write_tiny_rwkv_vocab(os.path.join(tmpdir, "wr_vocab_v20230424.txt"))
@@ -432,9 +453,13 @@ class TestRWKVTokenizer(unittest.TestCase):
             self.assertEqual(tok.get_vocab_size(), 65536)
             self.assertEqual(tok.image_id, 65532)
             self.assertEqual(tok.vision_start_id, 65530)
-            ids = tok.encode("A<|image_pad|>B")
+            ids = tok.encode("A<|image_pad|>B<tool_call>{}</tool_call>")
             self.assertIn(65532, ids)
-            self.assertEqual(tok.decode(ids), "A<|image_pad|>B")
+            self.assertIn(65533, ids)
+            self.assertEqual(tok.token_to_id("<tool_response>"), 65534)
+            self.assertEqual(tok.token_to_id("<tools>"), 65535)
+            self.assertIsNone(tok.token_to_id("</tool_call>"))
+            self.assertEqual(tok.decode(ids), "A<|image_pad|>B<tool_call>{}</tool_call>")
 
     def test_rwkv_multimodal_tokenizer_has_no_video_field(self):
         with tempfile.TemporaryDirectory() as tmpdir:

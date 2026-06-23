@@ -16,6 +16,9 @@ try:
     from .tokenizer_core import (
         CHAT_TEMPLATE,
         DEFAULT_IMAGE_TOKEN,
+        DEFAULT_TOOL_CALL_TOKEN,
+        DEFAULT_TOOL_RESPONSE_TOKEN,
+        DEFAULT_TOOLS_TOKEN,
         DEFAULT_VISION_END_TOKEN,
         DEFAULT_VISION_START_TOKEN,
         RWKVSpecialTokens,
@@ -25,6 +28,9 @@ except ImportError:
     from torchtitan.models.rwkv7.tokenizer_core import (
         CHAT_TEMPLATE,
         DEFAULT_IMAGE_TOKEN,
+        DEFAULT_TOOL_CALL_TOKEN,
+        DEFAULT_TOOL_RESPONSE_TOKEN,
+        DEFAULT_TOOLS_TOKEN,
         DEFAULT_VISION_END_TOKEN,
         DEFAULT_VISION_START_TOKEN,
         RWKVSpecialTokens,
@@ -43,6 +49,9 @@ DEFAULT_ADDITIONAL_SPECIAL_TOKENS = [
     DEFAULT_VISION_START_TOKEN,
     DEFAULT_VISION_END_TOKEN,
     DEFAULT_IMAGE_TOKEN,
+    DEFAULT_TOOL_CALL_TOKEN,
+    DEFAULT_TOOL_RESPONSE_TOKEN,
+    DEFAULT_TOOLS_TOKEN,
 ]
 
 
@@ -116,6 +125,7 @@ class RwkvTokenizer(PreTrainedTokenizer):
             chat_template=self.chat_template,
             **kwargs,
         )
+        self.additional_special_tokens = list(additional_special_tokens)
 
         self.image_token = self.core.image_token
         self.vision_start_token = self.core.vision_start_token

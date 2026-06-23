@@ -8,6 +8,7 @@
 
 import json
 import math
+import os
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -45,7 +46,6 @@ ROLE_TABLE = {
 }
 
 EMPTY_THINK_PREFIX = "<think>\n</think>\n "
-NEMOTRON_ROLES = {"system", "user", "assistant", "tool"}
 
 
 _PIXEL_VALUE_DTYPES = {
@@ -70,6 +70,58 @@ def _resolve_pixel_values_dtype(dtype: str | None) -> torch.dtype | None:
             f"{sorted(_PIXEL_VALUE_DTYPES)} or 'auto'"
         )
     return _PIXEL_VALUE_DTYPES[normalized]
+
+
+def _local_parquet_files(path: str) -> list[str]:
+    if os.path.isfile(path) and path.endswith(".parquet"):
+        return [path]
+    if not os.path.isdir(path):
+        return []
+    parquet_files = []
+    for root, _, files in os.walk(path):
+        for filename in files:
+            if filename.endswith(".parquet"):
+                parquet_files.append(os.path.join(root, filename))
+    return sorted(parquet_files)
+
+
+def _load_local_chat_dataset(path: str, *, split: str | None = "train"):
+    parquet_files = _local_parquet_files(path)
+    if parquet_files:
+        return load_dataset(
+            "parquet",
+            data_files=parquet_files,
+            split=split or "train",
+            streaming=True,
+        )
+    load_kwargs = {
+        "split": split or "train",
+        "streaming": True,
+    }
+    if os.path.isfile(path) and path.endswith((".json", ".jsonl")):
+        return load_dataset("json", data_files=path, **load_kwargs)
+    return None
+
+
+def _load_text_chat_dataset(path: str, *, split: str | None = "train"):
+    local_dataset = _load_local_chat_dataset(path, split=split)
+    if local_dataset is not None:
+        return local_dataset
+
+    load_kwargs = {
+        "split": split or "train",
+        "streaming": True,
+    }
+    dataset = load_dataset(path, **load_kwargs)
+    if isinstance(dataset, DatasetDict):
+        split_name = split or "train"
+        if split_name not in dataset:
+            raise ValueError(
+                f"MMChatDataLoader could not find chat split "
+                f"{split_name!r}; available splits are {sorted(dataset)}"
+            )
+        dataset = dataset[split_name]
+    return dataset
 
 
 def _tensor_chunks(value: Any) -> list[torch.Tensor]:
@@ -238,123 +290,6 @@ def _normalize_tools(raw_tools: Any) -> list[dict[str, Any]]:
     return [tool for tool in tools if isinstance(tool, dict)]
 
 
-def _load_nemotron_tools(raw_tools: Any) -> list[dict[str, Any]]:
-    tools = _parse_json_maybe(raw_tools)
-    if not tools:
-        return []
-    if not isinstance(tools, list):
-        raise TypeError(f"Nemotron tools must be a list, got {type(tools).__name__}")
-    for idx, tool in enumerate(tools):
-        if not isinstance(tool, dict):
-            raise TypeError(
-                f"Nemotron tool {idx} must be a dict, got {type(tool).__name__}"
-            )
-    return tools
-
-
-def _load_nemotron_tool_calls(raw_tool_calls: Any, *, message_idx: int) -> list[dict]:
-    tool_calls = _parse_json_maybe(raw_tool_calls)
-    if not isinstance(tool_calls, list):
-        raise TypeError(
-            f"Nemotron assistant message {message_idx} tool_calls must be a list, "
-            f"got {type(tool_calls).__name__}"
-        )
-    for tool_idx, tool_call in enumerate(tool_calls):
-        if not isinstance(tool_call, dict):
-            raise TypeError(
-                f"Nemotron assistant message {message_idx} tool_call {tool_idx} "
-                f"must be a dict, got {type(tool_call).__name__}"
-            )
-        function = tool_call.get("function")
-        if not isinstance(function, dict):
-            raise ValueError(
-                f"Nemotron assistant message {message_idx} tool_call {tool_idx} "
-                "is missing a function object"
-            )
-        if function.get("name") is None:
-            raise ValueError(
-                f"Nemotron assistant message {message_idx} tool_call {tool_idx} "
-                "is missing function.name"
-            )
-        if "arguments" not in function:
-            raise ValueError(
-                f"Nemotron assistant message {message_idx} tool_call {tool_idx} "
-                "is missing function.arguments"
-            )
-    return tool_calls
-
-
-def normalize_nemotron_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
-    raw_messages = _parse_json_maybe(raw_messages)
-    if not raw_messages:
-        raise ValueError("MM chat sample has no messages")
-    if not isinstance(raw_messages, list):
-        raise TypeError(
-            f"Nemotron messages must be a list, got {type(raw_messages).__name__}"
-        )
-
-    messages = []
-    for message_idx, message in enumerate(raw_messages):
-        if not isinstance(message, dict):
-            raise TypeError(
-                f"Nemotron message {message_idx} must be a dict, "
-                f"got {type(message).__name__}"
-            )
-        if "from" in message:
-            raise ValueError(
-                f"Nemotron message {message_idx} uses source field 'from'; "
-                "run source preprocessing first"
-            )
-        if "value" in message:
-            raise ValueError(
-                f"Nemotron message {message_idx} uses source field 'value'; "
-                "run source preprocessing first"
-            )
-        if "function_call" in message:
-            raise ValueError(
-                f"Nemotron message {message_idx} uses raw function_call; "
-                "run source preprocessing first"
-            )
-
-        raw_role = message.get("role")
-        role = raw_role
-        if role is None:
-            raise ValueError(f"Nemotron message {message_idx} is missing role")
-        role = str(role)
-        if role not in NEMOTRON_ROLES:
-            raise ValueError(
-                f"Nemotron message {message_idx} has unsupported role {role!r}; "
-                "run source preprocessing first"
-            )
-        content = message.get("content", "")
-
-        normalized_message = {
-            "role": role,
-            "content": _normalize_content(content),
-        }
-        if role == "assistant":
-            normalized_message["content"] = _ensure_think_content(
-                normalized_message["content"],
-                reasoning=message.get("reasoning_content"),
-            )
-        if "name" in message:
-            normalized_message["name"] = message["name"]
-        if "tool_call_id" in message:
-            normalized_message["tool_call_id"] = message["tool_call_id"]
-        tool_calls = message.get("tool_calls")
-        if tool_calls is not None:
-            if role != "assistant":
-                raise ValueError(
-                    f"Nemotron message {message_idx} has tool_calls on role {role!r}"
-                )
-            normalized_message["tool_calls"] = _load_nemotron_tool_calls(
-                tool_calls,
-                message_idx=message_idx,
-            )
-        messages.append(normalized_message)
-    return messages
-
-
 def normalize_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
     raw_messages = _parse_json_maybe(raw_messages)
     if not raw_messages:
@@ -484,26 +419,6 @@ def normalize_mm_chat_sample(sample: dict[str, Any]) -> dict[str, Any]:
     images = normalize_mm_chat_images(sample.get("images", sample.get("image", [])))
     messages = normalize_mm_chat_messages(raw_messages)
     tools = _normalize_tools(sample.get("tools", sample.get("available_tools", [])))
-    existing_markers = _count_image_markers(messages, "<image>")
-    _prepend_missing_image_markers(
-        messages,
-        num_missing=max(len(images) - existing_markers, 0),
-    )
-    return {"messages": messages, "images": images, "tools": tools}
-
-
-def normalize_nemotron_mm_chat_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    raw_messages = sample.get("messages")
-    if raw_messages is None:
-        raise ValueError("Nemotron MM chat sample must contain messages")
-
-    if "image" in sample:
-        raise ValueError("Nemotron MM chat sample must use images, not image")
-    images = normalize_mm_chat_images(sample.get("images", []))
-    messages = normalize_nemotron_mm_chat_messages(raw_messages)
-    if "available_tools" in sample:
-        raise ValueError("Nemotron MM chat sample must use tools, not available_tools")
-    tools = _load_nemotron_tools(sample.get("tools", []))
     existing_markers = _count_image_markers(messages, "<image>")
     _prepend_missing_image_markers(
         messages,
@@ -709,7 +624,7 @@ class MMChatDataset(IterableDataset, Stateful):
         text_iter = self._get_text_data_iter()
         sources = {
             "image": (image_iter, self._sample_processor, "image-text"),
-            "text": (text_iter, normalize_nemotron_mm_chat_sample, "Nemotron text"),
+            "text": (text_iter, self._sample_processor, "text"),
         }
         done = {"image": False, "text": False}
 
@@ -1095,6 +1010,7 @@ class MMChatDataLoader(ParallelAwareDataloader):
         split: str | None = "train"
         sample_processor: Callable = normalize_mm_chat_sample
         text_dataset_path: str | None = None
+        text_split: str | None = "train"
         text_sample_probability: float = 0.5
         infinite: bool = True
         packing_buffer_size: int = 0
@@ -1132,24 +1048,36 @@ class MMChatDataLoader(ParallelAwareDataloader):
                 "text_sample_probability must be between 0 and 1 when "
                 f"text_dataset_path is set, got {config.text_sample_probability}"
             )
-        load_kwargs = dict(config.load_dataset_kwargs)
-        if config.data_files is not None:
-            load_kwargs["data_files"] = config.data_files
-        if config.split is not None:
-            load_kwargs["split"] = config.split
-        dataset = load_dataset(config.dataset_path, **load_kwargs)
-        if isinstance(dataset, DatasetDict):
-            split = config.split or "train"
-            if split not in dataset:
-                raise ValueError(
-                    f"MMChatDataLoader could not find split {split!r}; "
-                    f"available splits are {sorted(dataset)}"
-                )
-            dataset = dataset[split]
+        local_dataset = None
+        if config.data_files is None and not config.load_dataset_kwargs:
+            local_dataset = _load_local_chat_dataset(
+                config.dataset_path,
+                split=config.split,
+            )
+        if local_dataset is not None:
+            dataset = local_dataset
+        else:
+            load_kwargs = dict(config.load_dataset_kwargs)
+            if config.data_files is not None:
+                load_kwargs["data_files"] = config.data_files
+            if config.split is not None:
+                load_kwargs["split"] = config.split
+            dataset = load_dataset(config.dataset_path, **load_kwargs)
+            if isinstance(dataset, DatasetDict):
+                split = config.split or "train"
+                if split not in dataset:
+                    raise ValueError(
+                        f"MMChatDataLoader could not find split {split!r}; "
+                        f"available splits are {sorted(dataset)}"
+                    )
+                dataset = dataset[split]
 
         text_dataset = None
         if config.text_dataset_path:
-            text_dataset = load_dataset(config.text_dataset_path, split="train")
+            text_dataset = _load_text_chat_dataset(
+                config.text_dataset_path,
+                split=config.text_split,
+            )
         chat_dataset = MMChatDataset(
             dataset=dataset,
             tokenizer=tokenizer,

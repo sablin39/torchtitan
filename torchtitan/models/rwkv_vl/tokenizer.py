@@ -7,6 +7,7 @@
 from dataclasses import dataclass
 from typing import Any
 
+from torchtitan.hf_datasets.multimodal.processor_core import CHAT_TEMPLATE
 from torchtitan.models.rwkv7.tokenizer import RwkvTokenizer
 
 
@@ -23,6 +24,7 @@ class RwkvVLMultiModalTokenizer(RwkvTokenizer):
 
     def __init__(self, config: Config | None = None, *, tokenizer_path: str):
         super().__init__(config, tokenizer_path=tokenizer_path)
+        self.set_chat_template(CHAT_TEMPLATE)
         cfg = config or RwkvVLMultiModalTokenizer.Config()
         for name in self.TOKEN_FIELDS:
             token_str = getattr(cfg, f"{name}_token")

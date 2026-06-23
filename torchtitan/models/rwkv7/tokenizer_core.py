@@ -21,10 +21,16 @@ DEFAULT_UNK_TOKEN = "\x16"
 DEFAULT_IMAGE_TOKEN = "<|image_pad|>"
 DEFAULT_VISION_START_TOKEN = "<|vision_start|>"
 DEFAULT_VISION_END_TOKEN = "<|vision_end|>"
+DEFAULT_TOOL_CALL_TOKEN = "<tool_call>"
+DEFAULT_TOOL_RESPONSE_TOKEN = "<tool_response>"
+DEFAULT_TOOLS_TOKEN = "<tools>"
 DEFAULT_IMAGE_PLACEHOLDER_TOKEN = "<image>"
 DEFAULT_VISION_START_TOKEN_ID = 65530
 DEFAULT_VISION_END_TOKEN_ID = 65531
 DEFAULT_IMAGE_TOKEN_ID = 65532
+DEFAULT_TOOL_CALL_TOKEN_ID = 65533
+DEFAULT_TOOL_RESPONSE_TOKEN_ID = 65534
+DEFAULT_TOOLS_TOKEN_ID = 65535
 
 CHAT_TEMPLATE = r"""
 {%- macro render_tools_block(tools) -%}
@@ -130,6 +136,9 @@ SPECIAL_TOKEN_TEXT_TO_ID = {
     DEFAULT_VISION_START_TOKEN: DEFAULT_VISION_START_TOKEN_ID,
     DEFAULT_VISION_END_TOKEN: DEFAULT_VISION_END_TOKEN_ID,
     DEFAULT_IMAGE_TOKEN: DEFAULT_IMAGE_TOKEN_ID,
+    DEFAULT_TOOL_CALL_TOKEN: DEFAULT_TOOL_CALL_TOKEN_ID,
+    DEFAULT_TOOL_RESPONSE_TOKEN: DEFAULT_TOOL_RESPONSE_TOKEN_ID,
+    DEFAULT_TOOLS_TOKEN: DEFAULT_TOOLS_TOKEN_ID,
 }
 
 SPECIAL_TOKEN_ID_TO_TEXT = {
@@ -150,40 +159,47 @@ class RWKVSpecialTokens:
 
 
 class ByteTrie:
-    __slots__ = ("children", "value")
+    __slots__ = ("children", "token")
 
     def __init__(self) -> None:
-        self.children: dict[int, "ByteTrie"] = {}
-        self.value: int | None = None
+        self.children: list["ByteTrie" | None] = [None for _ in range(256)]
+        self.token = 0
 
     def add(self, token: bytes, token_id: int) -> None:
         node = self
         for byte in token:
-            node = node.children.setdefault(byte, ByteTrie())
-        node.value = token_id
+            child = node.children[byte]
+            if child is None:
+                child = ByteTrie()
+                node.children[byte] = child
+            node = child
+        node.token = token_id + 1
 
     def longest(self, data: bytes, start: int) -> tuple[int, int]:
         node = self
-        best_id = None
+        best_token = 0
         best_end = start
         idx = start
-        while idx < len(data) and data[idx] in node.children:
-            node = node.children[data[idx]]
+        while idx < len(data):
+            child = node.children[data[idx]]
+            if child is None:
+                break
+            node = child
             idx += 1
-            if node.value is not None:
-                best_id = node.value
+            if node.token:
+                best_token = node.token
                 best_end = idx
-        if best_id is None:
+        if not best_token:
             raise ValueError(f"RWKV tokenizer could not encode byte at offset {start}")
-        return best_end, best_id
+        return best_end, best_token - 1
 
 
 def _as_bytes(token: str | bytes) -> bytes:
     return token.encode("utf-8") if isinstance(token, str) else token
 
 
-def load_rwkv_vocab(vocab_file: str) -> tuple[dict[int, bytes], dict[bytes, int]]:
-    idx2token: dict[int, bytes] = {}
+def load_rwkv_vocab(vocab_file: str) -> tuple[list[bytes], dict[bytes, int]]:
+    idx2token_by_id: dict[int, bytes] = {}
     with open(vocab_file, "r", encoding="utf-8") as f:
         for line in f:
             line = line.rstrip("\n")
@@ -201,8 +217,20 @@ def load_rwkv_vocab(vocab_file: str) -> tuple[dict[int, bytes], dict[bytes, int]
                     f"Invalid RWKV vocab token length for id {token_id}: "
                     f"expected {token_len}, got {len(token)}"
                 )
-            idx2token[token_id] = token
-    token2idx = {token: idx for idx, token in idx2token.items()}
+            idx2token_by_id[token_id] = token
+    for token_text, token_id in SPECIAL_TOKEN_TEXT_TO_ID.items():
+        token = token_text.encode("utf-8")
+        existing = idx2token_by_id.get(token_id)
+        if existing is not None and existing != token:
+            raise ValueError(
+                f"RWKV vocab id {token_id} is reserved for {token_text!r}, "
+                f"but the vocab contains {existing!r}"
+            )
+        idx2token_by_id[token_id] = token
+    idx2token = [b"" for _ in range(max(idx2token_by_id) + 1)]
+    for token_id, token in idx2token_by_id.items():
+        idx2token[token_id] = token
+    token2idx = {token: idx for idx, token in idx2token_by_id.items()}
     return idx2token, token2idx
 
 
@@ -392,20 +420,26 @@ class RWKVTokenizerCore:
         return self.token2idx.get(_as_bytes(token))
 
     def id_to_token(self, token_id: int) -> str | None:
-        token = self.idx2token.get(int(token_id))
-        if token is None:
+        token_id = int(token_id)
+        if token_id < 0 or token_id >= len(self.idx2token):
+            return None
+        token = self.idx2token[token_id]
+        if not token:
             return None
         return token.decode("utf-8", errors="replace")
 
     def get_vocab(self) -> dict[str, int]:
         return {
             token.decode("utf-8", errors="replace"): idx
-            for idx, token in self.idx2token.items()
+            for idx, token in enumerate(self.idx2token)
+            if token
         }
 
     def save_vocabulary(self, vocab_file: str) -> None:
         with open(vocab_file, "w", encoding="utf-8") as writer:
-            for token_index, token in sorted(self.idx2token.items()):
+            for token_index, token in enumerate(self.idx2token):
+                if not token:
+                    continue
                 writer.write(f"{token_index} {repr(token)} {len(token)}\n")
 
     def expand_image_placeholders(

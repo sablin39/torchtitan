@@ -44,6 +44,7 @@ dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/tqa(cauldron,llava_format)"
 # Optional text-only SFT source. Image-text rows stay LLaVA/common-schema
 # friendly; text rows are loaded through the strict Nemotron chat processor.
 text_dataset_path="/mnt/raid0_8t/Nemotron-SFT-Agentic-v2"
+text_split="train"
 text_sample_probability="0.5"
 project_seed="1234"
 # 1.5B-v100M:
@@ -481,6 +482,7 @@ echo "  TORCH_LOGS:    ${torch_logs:-<unset>}"
 echo "Datasets:"
 echo "  Image-text:    ${dataset_path}"
 echo "  Text:          ${text_dataset_path:-<disabled>}"
+echo "  Text split:    ${text_split}"
 echo "  Text mix prob: ${text_sample_probability}"
 echo "  Project seed:  ${project_seed:-<unset>}"
 echo "Diagnostics:"
@@ -607,6 +609,7 @@ train_args=(
 
 if [[ -n "${text_dataset_path}" ]]; then
     train_args+=(--dataloader.text-dataset-path "${text_dataset_path}")
+    train_args+=(--dataloader.text-split "${text_split}")
 fi
 if [[ -n "${project_seed}" ]]; then
     train_args+=(--debug.seed "${project_seed}")
