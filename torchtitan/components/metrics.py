@@ -160,9 +160,13 @@ class WandBLogger(BaseLogger):
         os.makedirs(log_dir, exist_ok=True)
 
         wandb_init_kwargs = {}
-        if sync_swanlab and (
-            not swanlab_wandb_run or os.getenv("WANDB_MODE", "").lower() == "disabled"
-        ):
+        # When SwanLab is the cloud backend, force WandB into offline mode so it
+        # needs no API key and SwanLab mirrors the metrics in real time. This is
+        # equivalent to ``swanlab.sync_wandb(wandb_run=False)`` and matches the
+        # default ``tracking=1`` intent (offline WandB locally + SwanLab cloud).
+        # Only honor an explicit online request (``WANDB_MODE=online``, with the
+        # user's own key); any other/unset mode falls back to offline under sync.
+        if sync_swanlab and os.getenv("WANDB_MODE", "").lower() != "online":
             wandb_init_kwargs["mode"] = "offline"
 
         self.wandb.init(
