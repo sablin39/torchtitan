@@ -76,9 +76,17 @@ batch_size="24"
 # batch_size is TorchTitan training.local_batch_size. With RWKV/FLA CP it is
 # the number of packed seq_len rows per batch-parallel group. CP shards the
 # flattened tokens inside each row group; it does not multiply batch size.
-# With global_batch_size=-1, TorchTitan's effective global batch is:
-# batch_size * (ngpu / context_parallel_degree).
+# The effective global batch is:
+#   batch_size * (ngpu / context_parallel_degree) * gradient_accumulation_steps
+# which the script derives and passes to TorchTitan as training.global-batch-size
+# (TorchTitan has no dedicated accumulation field; it computes the step count from
+# global_batch_size / (local_batch_size * batch_degree)).
 # Sequence packing is controlled by the multimodal dataloader, not by CP.
+# Gradient accumulation: how many forward/backward microbatches are summed before
+# each optimizer step. Default 1 keeps the pre-accumulation behavior. The trainer
+# buffers all microbatches on the CPU before stepping, so large values with
+# multimodal data raise host RAM use.
+gradient_accumulation_steps="1"
 # packing_buffer_size is the number of tokenized samples kept in a CPU-side
 # buffer before greedily combining them into seq_len rows. Larger values usually
 # improve non-padding token occupancy, but increase preprocessing latency and
@@ -133,17 +141,17 @@ projector_norm="layernorm"
 # Inner-FFN activation ("relu" / "gelu" / "swiglu"). For cross_attn this picks
 # the post-attention FFN; for mlp it picks the inner activation.
 projector_ffn="relu"
-# Cross-attention head config (cross_attn only). project_dim must equal
-# num_heads * head_dim; leave head_dim empty to default to project_dim/num_heads.
-projector_num_heads="8"
-projector_head_dim=""
 # Extra projector-side PatchMerger ratio. ``1`` (default) keeps the existing
 # additive-DeepStack behavior. Set > 1 to compress the projector main stream
 # so the processor produces fewer <image_pad> tokens per image than vision
 # K/V tokens. The processor and dataloader merge sizes are derived
 # automatically as ``vision_encoder.spatial_merge_size * this``. Only
 # supported with projector_kind=cross_attn.
-projector_extra_merge_size="4"
+projector_extra_merge_size="1"
+# Cross-attention head config (cross_attn only). project_dim must equal
+# num_heads * head_dim; leave head_dim empty to default to project_dim/num_heads.
+projector_num_heads="8"
+projector_head_dim=""
 # Static FlexAttention buckets for the cross_attn projector (cross_attn only).
 # Each forward pads Q and K/V to exactly these sizes so the compiled FlexAttention
 # kernel sees a single static shape. Pick values >= the largest expected per-batch
@@ -278,6 +286,11 @@ fi
 
 if ! [[ "${batch_size}" =~ ^[0-9]+$ ]] || (( batch_size < 1 )); then
     echo "batch_size must be a positive integer, got: ${batch_size}" >&2
+    exit 2
+fi
+
+if ! [[ "${gradient_accumulation_steps}" =~ ^[0-9]+$ ]] || (( gradient_accumulation_steps < 1 )); then
+    echo "gradient_accumulation_steps must be a positive integer, got: ${gradient_accumulation_steps}" >&2
     exit 2
 fi
 
@@ -419,6 +432,13 @@ fi
 
 batch_parallel_degree=$((ngpu / context_parallel_degree))
 
+# TorchTitan derives gradient accumulation as
+#   global_batch_size / (local_batch_size * batch_degree),
+# where batch_degree == batch_parallel_degree (DP replicate * shard; CP is
+# excluded since it shards the sequence, not the batch). Derive global_batch_size
+# here so the user-facing knob is the human-friendly step count, not a raw total.
+global_batch_size=$((batch_size * batch_parallel_degree * gradient_accumulation_steps))
+
 hf_dir="${output_root}/hf_export"
 dcp_dir="${output_root}/dcp_from_hf"
 train_dump_dir="${output_root}/train"
@@ -475,6 +495,8 @@ echo "  CP degree:     ${context_parallel_degree}"
 echo "  DP replicate:  ${data_parallel_replicate_degree}"
 echo "  DP shard:      ${data_parallel_shard_degree} (effective ${effective_data_parallel_shard_degree})"
 echo "  Batch groups:  ${batch_parallel_degree}"
+echo "  Grad accum:    ${gradient_accumulation_steps} step(s)/update"
+echo "  Global batch:  ${global_batch_size} (local ${batch_size} x ${batch_parallel_degree} x ${gradient_accumulation_steps})"
 echo "Bucketing:"
 echo "  ViT patches:   ${vit_patch_bucket_size} (0 disables)"
 echo "  Inductor dir:  ${torchinductor_cache_dir:-<torch default>}"
@@ -594,6 +616,7 @@ train_args=(
     --training.seq-len "${seq_len}"
     --training.steps "${training_steps}"
     --training.local-batch-size "${batch_size}"
+    --training.global-batch-size "${global_batch_size}"
     --dataloader.packing-buffer-size "${packing_buffer_size}"
     --dataloader.vit-patch-bucket-size "${vit_patch_bucket_size}"
     --dataloader.num-workers "${dataloader_num_workers}"
