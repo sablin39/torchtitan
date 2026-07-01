@@ -116,6 +116,7 @@ class RwkvTokenizer(PreTrainedTokenizer):
             "additional_special_tokens",
             DEFAULT_ADDITIONAL_SPECIAL_TOKENS,
         )
+        kwargs.setdefault("padding_side", "left")
         super().__init__(
             bos_token=bos_token,
             eos_token=eos_token,

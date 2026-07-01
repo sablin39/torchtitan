@@ -729,6 +729,7 @@ def save_multimodal_processor(
             eos_token="\x17",
             pad_token="\x17",
             unk_token="\x16",
+            padding_side="left",
         )
         image_processor = AutoImageProcessor.from_pretrained(
             image_processor_source,
@@ -865,6 +866,7 @@ def convert(
             eos_token=DEFAULT_EOS_TOKEN,
             pad_token=DEFAULT_EOS_TOKEN,
             unk_token=DEFAULT_BOS_TOKEN,
+            padding_side="left",
         )
         tokenizer.register_for_auto_class()
         tokenizer.save_pretrained(output)
