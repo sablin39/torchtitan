@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -172,6 +173,76 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm = config.route_norm
         self.route_scale = config.route_scale
         self._debug_force_load_balance = config._debug_force_load_balance
+        for name in (
+            "_router_token_entropy_sum",
+            "_router_load_entropy_sum",
+            "_router_max_vio_sum",
+            "_router_metrics_count",
+        ):
+            self.register_buffer(
+                name,
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=False,
+            )
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        device = buffer_device or self._router_metrics_count.device
+        if device.type == "meta":
+            return
+        for name in (
+            "_router_token_entropy_sum",
+            "_router_load_entropy_sum",
+            "_router_max_vio_sum",
+            "_router_metrics_count",
+        ):
+            setattr(self, name, torch.tensor(0.0, dtype=torch.float32, device=device))
+
+    def _record_router_metrics(
+        self,
+        *,
+        scores: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> None:
+        eps = 1e-10
+        if scores.shape[0] == 0:
+            mean_token_entropy = scores.new_tensor(0.0)
+        else:
+            if self.score_func == "sigmoid":
+                probs = scores / (scores.sum(dim=-1, keepdim=True) + eps)
+            else:
+                probs = scores
+            token_entropy = -(probs * torch.log(probs + eps)).sum(dim=-1)
+            mean_token_entropy = token_entropy.mean()
+
+        counts = num_tokens_per_expert.float()
+        load_probs = counts / counts.sum().clamp_min(1.0)
+        load_entropy = -(load_probs * torch.log(load_probs + eps)).sum()
+        if self.num_experts > 1:
+            load_entropy = load_entropy / math.log(self.num_experts)
+        else:
+            load_entropy = counts.new_tensor(0.0)
+        max_vio = (load_probs * self.num_experts - 1.0).max().clamp_min(0.0)
+
+        self._router_token_entropy_sum.add_(mean_token_entropy.detach())
+        self._router_load_entropy_sum.add_(load_entropy.detach())
+        self._router_max_vio_sum.add_(max_vio.detach())
+        self._router_metrics_count.add_(1.0)
+
+    def consume_router_metrics(self) -> dict[str, float]:
+        if self._router_metrics_count.item() == 0:
+            return {}
+
+        count = self._router_metrics_count
+        metrics = {
+            "token_entropy": (self._router_token_entropy_sum / count).item(),
+            "load_entropy": (self._router_load_entropy_sum / count).item(),
+            "MaxVio": (self._router_max_vio_sum / count).item(),
+        }
+        self._router_token_entropy_sum.zero_()
+        self._router_load_entropy_sum.zero_()
+        self._router_max_vio_sum.zero_()
+        self._router_metrics_count.zero_()
+        return metrics
 
     def _debug_force_load_balance_routing(
         self, scores: torch.Tensor
@@ -291,11 +362,17 @@ class TokenChoiceTopKRouter(Module):
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
         num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
+            selected_experts_indices.view(-1).float(),
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
         )
+
+        with torch.no_grad():
+            self._record_router_metrics(
+                scores=scores,
+                num_tokens_per_expert=num_tokens_per_expert,
+            )
 
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
@@ -415,6 +492,12 @@ class MoE(Module):
         )
 
         return out.reshape(bs, slen, dim)
+
+    def consume_router_metrics(self) -> dict[str, float]:
+        consume_router_metrics = getattr(self.router, "consume_router_metrics", None)
+        if callable(consume_router_metrics):
+            return consume_router_metrics()
+        return {}
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         assert isinstance(buffer_device, torch.device)

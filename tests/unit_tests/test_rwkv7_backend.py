@@ -15,7 +15,11 @@ from torchtitan.config.manager import ConfigManager
 
 from torchtitan.distributed.context_parallel import _build_flattened_cu_seqlens
 from torchtitan.models.rwkv7 import model_registry as rwkv7_model_registry
-from torchtitan.models.rwkv7.model import _token_shift_varlen_eager
+from torchtitan.models.rwkv7.model import (
+    _token_shift_varlen_eager,
+    rwkv7_backbone_config,
+    RWKV7MoEChannelMix,
+)
 from torchtitan.models.rwkv7.state_dict_adapter import RWKV7StateDictAdapter
 from torchtitan.models.rwkv7.tokenizer import RwkvTokenizer
 from torchtitan.models.rwkv_vl import (
@@ -52,6 +56,59 @@ class TestRWKV7Backend(unittest.TestCase):
             model = spec.model.build()
         model.verify_module_protocol()
         self.assertEqual(model.vocab_size, 2048)
+
+    def test_rwkv7_debugmodel_keeps_dense_channel_mix_by_default(self):
+        spec = rwkv7_model_registry("debugmodel")
+        self.assertIsNone(spec.model.llm.moe_channel_mix_start_layer)
+        with torch.device("meta"):
+            model = spec.model.build()
+        self.assertFalse(any(block.moe_enabled for block in model.llm.layers.values()))
+
+    def test_rwkv7_moe_flavor_builds_moe_layers_on_meta(self):
+        spec = rwkv7_model_registry("3B-MoE")
+        self.assertIsNotNone(spec.post_optimizer_build_fn)
+        self.assertEqual(spec.model.llm.moe_channel_mix_num_experts, 64)
+        self.assertEqual(spec.model.llm.moe_channel_mix_top_k, 6)
+
+        with torch.device("meta"):
+            model = spec.model.build()
+
+        self.assertFalse(model.llm.layers["0"].moe_enabled)
+        self.assertTrue(model.llm.layers["1"].moe_enabled)
+        self.assertIsInstance(model.llm.layers["1"].moe, RWKV7MoEChannelMix)
+
+    def test_rwkv7_tiny_moe_backbone_selects_layers_and_buffers(self):
+        cfg = rwkv7_backbone_config(
+            vocab_size=128,
+            hidden_size=16,
+            num_hidden_layers=4,
+            num_heads=2,
+            head_dim=8,
+            intermediate_size=32,
+            value_dim=[16] * 4,
+            a_low_rank_dim=4,
+            decay_low_rank_dim=4,
+            gate_low_rank_dim=8,
+            v_low_rank_dim=4,
+            moe_channel_mix_start_layer=1,
+            moe_channel_mix_layer_freq=2,
+            moe_channel_mix_intermediate_size=8,
+            moe_channel_mix_num_experts=4,
+            moe_channel_mix_num_shared_experts=1,
+            moe_channel_mix_top_k=2,
+            moe_channel_mix_load_balance_coeff=1e-3,
+            skip_embedding_init=True,
+        )
+        backbone = cfg.build()
+        self.assertEqual(
+            [block.moe_enabled for block in backbone.layers.values()],
+            [False, True, False, True],
+        )
+        backbone.init_states(buffer_device=torch.device("cpu"))
+        moe = backbone.layers["1"].moe
+        self.assertIsInstance(moe, RWKV7MoEChannelMix)
+        self.assertEqual(tuple(moe.tokens_per_expert.shape), (4,))
+        self.assertEqual(tuple(moe.expert_bias.shape), (4,))
 
     def test_rwkv7_first_layer_state_lives_on_backbone(self):
         spec = rwkv7_model_registry("debugmodel")
@@ -459,7 +516,9 @@ class TestRWKVTokenizer(unittest.TestCase):
             self.assertEqual(tok.token_to_id("<tool_response>"), 65534)
             self.assertEqual(tok.token_to_id("<tools>"), 65535)
             self.assertIsNone(tok.token_to_id("</tool_call>"))
-            self.assertEqual(tok.decode(ids), "A<|image_pad|>B<tool_call>{}</tool_call>")
+            self.assertEqual(
+                tok.decode(ids), "A<|image_pad|>B<tool_call>{}</tool_call>"
+            )
 
     def test_rwkv_multimodal_tokenizer_has_no_video_field(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -6,14 +6,15 @@
 
 from collections.abc import Callable
 
+from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import (
-    RWKV7Backbone,
-    RWKV7ForCausalLM,
     rwkv7_backbone_config,
     rwkv7_causal_lm_from_backbone,
+    RWKV7Backbone,
+    RWKV7ForCausalLM,
 )
 from .parallelize import parallelize_rwkv7
 from .state_dict_adapter import RWKV7StateDictAdapter
@@ -52,6 +53,7 @@ def _backbone(
     head_dim: int = 64,
     chunk_size: int = 64,
     skip_embedding_init: bool = False,
+    **rwkv7_kwargs,
 ) -> RWKV7Backbone.Config:
     return rwkv7_backbone_config(
         vocab_size=vocab_size,
@@ -70,6 +72,7 @@ def _backbone(
         v_low_rank_dim=v_low_rank_dim,
         chunk_size=chunk_size,
         skip_embedding_init=skip_embedding_init,
+        **rwkv7_kwargs,
     )
 
 
@@ -87,6 +90,34 @@ def _debug_backbone(*, skip_embedding_init: bool = False) -> RWKV7Backbone.Confi
         v_low_rank_dim=32,
         chunk_size=64,
         skip_embedding_init=skip_embedding_init,
+    )
+
+
+def _moe_3b_backbone(**kwargs) -> RWKV7Backbone.Config:
+    return _backbone(
+        vocab_size=151680,
+        hidden_size=1536,
+        num_hidden_layers=12,
+        num_heads=12,
+        head_dim=128,
+        intermediate_size=8192,
+        a_low_rank_dim=96,
+        decay_low_rank_dim=96,
+        gate_low_rank_dim=320,
+        v_low_rank_dim=64,
+        moe_channel_mix_start_layer=1,
+        moe_channel_mix_layer_freq=1,
+        moe_channel_mix_intermediate_size=1024,
+        moe_channel_mix_num_experts=64,
+        moe_channel_mix_num_shared_experts=2,
+        moe_channel_mix_top_k=6,
+        moe_channel_mix_score_func="softmax",
+        moe_channel_mix_route_norm=False,
+        moe_channel_mix_route_scale=1.0,
+        moe_channel_mix_num_expert_groups=1,
+        moe_channel_mix_num_limited_groups=1,
+        moe_channel_mix_load_balance_coeff=1e-3,
+        **kwargs,
     )
 
 
@@ -162,6 +193,7 @@ def _g1f_13_3b_backbone(**kwargs) -> RWKV7Backbone.Config:
 
 rwkv7_backbones: dict[str, Callable[..., RWKV7Backbone.Config]] = {
     "debugmodel": _debug_backbone,
+    "3B-MoE": _moe_3b_backbone,
     "0.4B": _g1d_0_4b_backbone,
     "1.5B": _g1f_1_5b_backbone,
     "2.9B": _g1f_2_9b_backbone,
@@ -200,6 +232,6 @@ def model_registry(
         model=config,
         parallelize_fn=parallelize_rwkv7,
         pipelining_fn=None,
-        post_optimizer_build_fn=None,
+        post_optimizer_build_fn=register_moe_load_balancing_hook,
         state_dict_adapter=RWKV7StateDictAdapter,
     )

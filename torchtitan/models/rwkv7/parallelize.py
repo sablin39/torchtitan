@@ -41,6 +41,11 @@ def parallelize_rwkv7(
         raise NotImplementedError("RWKV7 v1 does not support tensor parallelism")
     if parallel_dims.pp_enabled:
         raise NotImplementedError("RWKV7 v1 does not support pipeline parallelism")
+    if parallel_dims.ep_enabled:
+        raise NotImplementedError(
+            "RWKV7 MoE ChannelMix currently uses local experts and does not support "
+            "expert parallelism"
+        )
 
     if parallel_dims.cp_enabled:
         if parallelism.context_parallel_load_balancer is not None:

@@ -124,7 +124,11 @@ class TensorBoardLogger(BaseLogger):
     def log(self, metrics: dict[str, Any], step: int) -> None:
         for k, v in metrics.items():
             tag = k if self.tag is None else f"{self.tag}/{k}"
-            self.writer.add_scalar(tag, v, step)
+            if isinstance(v, dict):
+                scalar_dict = {sub_k: float(sub_v) for sub_k, sub_v in v.items()}
+                self.writer.add_scalars(tag, scalar_dict, step)
+            else:
+                self.writer.add_scalar(tag, v, step)
 
     def close(self) -> None:
         self.writer.close()
@@ -155,6 +159,7 @@ class WandBLogger(BaseLogger):
 
         self.wandb = wandb
         self.tag = tag
+        self._series_history: dict[str, dict[str, Any]] = {}
 
         # Create logging directory
         os.makedirs(log_dir, exist_ok=True)
@@ -187,10 +192,38 @@ class WandBLogger(BaseLogger):
         logger.info("WandB logging enabled")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        wandb_metrics = {
-            (k if self.tag is None else f"{self.tag}/{k}"): v
-            for k, v in metrics.items()
-        }
+        def _flatten(obj: Any, prefix: str = "") -> list[tuple[str, Any]]:
+            if isinstance(obj, dict):
+                items: list[tuple[str, Any]] = []
+                for kk, vv in obj.items():
+                    key = f"{prefix}/{kk}" if prefix else kk
+                    items.extend(_flatten(vv, key))
+                return items
+            return [(prefix, obj)]
+
+        wandb_metrics: dict[str, Any] = {}
+        for k, v in metrics.items():
+            key = k if self.tag is None else f"{self.tag}/{k}"
+            if isinstance(v, dict):
+                is_flat = all(not isinstance(sub_v, dict) for sub_v in v.values())
+                if is_flat and len(v) > 0:
+                    if key not in self._series_history:
+                        self._series_history[key] = {"steps": [], "values": {}}
+                    hist = self._series_history[key]
+                    hist["steps"].append(step)
+                    for sub_key, sub_val in v.items():
+                        hist["values"].setdefault(sub_key, []).append(float(sub_val))
+                    wandb_metrics[key] = self.wandb.plot.line_series(
+                        xs=hist["steps"],
+                        ys=list(hist["values"].values()),
+                        keys=list(hist["values"].keys()),
+                        title=key,
+                        xname="step",
+                    )
+                for sub_key, sub_val in _flatten(v, key):
+                    wandb_metrics[sub_key] = sub_val
+            else:
+                wandb_metrics[key] = v
         self.wandb.log(wandb_metrics, step=step)
 
     def close(self) -> None:

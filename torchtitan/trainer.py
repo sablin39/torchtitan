@@ -781,6 +781,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 ) + float(value)
         self.data_metric_count += 1
 
+    def _collect_moe_metrics(self) -> dict[str, Any]:
+        metrics_by_name: dict[str, dict[str, float]] = {}
+        for model_part in self.model_parts:
+            for layers_fqn in ("layers", "llm.layers"):
+                try:
+                    layers = model_part.get_submodule(layers_fqn)
+                except AttributeError:
+                    continue
+                if not isinstance(layers, torch.nn.ModuleDict):
+                    continue
+                for name, block in layers.items():
+                    if not getattr(block, "moe_enabled", False):
+                        continue
+                    moe = getattr(block, "moe", None)
+                    consume_router_metrics = getattr(
+                        moe, "consume_router_metrics", None
+                    )
+                    if not callable(consume_router_metrics):
+                        continue
+                    for metric_name, value in consume_router_metrics().items():
+                        if isinstance(value, torch.Tensor):
+                            value = value.item()
+                        if isinstance(value, (int, float)):
+                            metrics_by_name.setdefault(f"moe/{metric_name}", {})[
+                                name
+                            ] = float(value)
+                break
+        return metrics_by_name
+
     def _consume_data_metrics(self) -> dict[str, float]:
         if self.data_metric_count == 0:
             return {}
@@ -975,6 +1004,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "lr": lr,
         }
         extra_metrics.update(self._consume_data_metrics())
+        extra_metrics.update(self._collect_moe_metrics())
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

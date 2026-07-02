@@ -110,6 +110,15 @@ def rwkv7_2_9b() -> Trainer.Config:
     return _rwkv7_lm_config("2.9B", lr=4e-4)
 
 
+def rwkv7_moe_3b() -> Trainer.Config:
+    return _rwkv7_lm_config(
+        "3B-MoE",
+        lr=3e-4,
+        local_batch_size=2,
+        warmup_steps=2000,
+    )
+
+
 def rwkv7_7_2b() -> Trainer.Config:
     return _rwkv7_lm_config("7.2B", lr=3e-4)
 
