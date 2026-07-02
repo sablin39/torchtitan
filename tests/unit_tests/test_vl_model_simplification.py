@@ -371,6 +371,7 @@ class TestModelVisionInsertion(unittest.TestCase):
         llm.norm = fake_llm.norm
         model.llm = llm
         model.lm_head = nn.Identity()
+        model.proj = SimpleNamespace(kind="mlp")
         model._skip_lm_head = True
         model._cp_group = None
         model._vision_patch_sync_group = None
@@ -378,7 +379,8 @@ class TestModelVisionInsertion(unittest.TestCase):
 
         def _get_vision_embeds(self, pixel_values, *, grid_thw):
             del pixel_values, grid_thw
-            return features
+            embeds, deepstack, num_tokens_per_item = features
+            return embeds, deepstack, num_tokens_per_item, num_tokens_per_item
 
         model._get_vision_embeds = types.MethodType(_get_vision_embeds, model)
         return model

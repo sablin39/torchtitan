@@ -27,6 +27,8 @@ class BaseTokenizer(ABC, Configurable):
     def __init__(self):
         self.eos_id = None
         self._chat_template = None
+        self.chat_template_add_bos = True
+        self.chat_template_append_eos = True
 
     @abstractmethod
     def encode(self, *args, **kwargs) -> list[int]:

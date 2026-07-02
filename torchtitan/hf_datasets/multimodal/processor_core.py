@@ -92,30 +92,30 @@ CHAT_TEMPLATE = r"""
 {%- endif -%}
 {%- set has_tools = tools is defined and tools and not ns.tool_prompt_exists -%}
 {%- if has_tools and (messages|length == 0 or messages[0]['role'] != 'system') -%}
-{{ '\x16System: ' }}{{ render_tools_block(tools) }}{{ '\x17' }}
-{%- if messages|length > 0 or add_generation_prompt -%}{{ '\n\n' }}{%- endif -%}
+{{ 'System✿' }}{{ render_tools_block(tools) }}{{ '✿' }}
+{%- if messages|length > 0 or add_generation_prompt -%}{{ '\n' }}{%- endif -%}
 {%- endif -%}
 {%- for message in messages -%}
 {%- if message['role'] == 'tool' -%}
 {%- if loop.first or messages[loop.index0 - 1]['role'] != 'tool' -%}
-{{ '\x16User: ' }}
+{{ 'User✿' }}
 {%- endif -%}
 {{ render_tool_response(message) }}
 {%- if loop.last or messages[loop.index0 + 1]['role'] != 'tool' -%}
-{{ '\x17' }}
-{%- if not loop.last or add_generation_prompt -%}{{ '\n\n' }}{%- endif -%}
+{{ '✿' }}
+{%- if not loop.last or add_generation_prompt -%}{{ '\n' }}{%- endif -%}
 {%- else -%}
 {{ '\n' }}
 {%- endif -%}
 {%- else -%}
 {%- if message['role'] == 'assistant' -%}
-{%- set role_name = 'Assistant' -%}
+{%- set role_name = 'Bot' -%}
 {%- elif message['role'] == 'system' -%}
 {%- set role_name = 'System' -%}
 {%- else -%}
 {%- set role_name = 'User' -%}
 {%- endif -%}
-{{ '\x16' + role_name + ': ' }}{{ render_content(message['content']) }}
+{{ role_name }}{{ '✿' }}{{ render_content(message['content']) }}
 {%- if message['role'] == 'system' and loop.first and has_tools -%}
 {%- if message['content'] -%}{{ '\n\n' }}{%- endif -%}
 {{ render_tools_block(tools) }}
@@ -126,13 +126,12 @@ CHAT_TEMPLATE = r"""
 {{ render_tool_call(tool_call) }}{%- if not loop.last -%}{{ '\n' }}{%- endif -%}
 {%- endfor -%}
 {%- endif -%}
-{{ '\x17' }}
-{%- if not loop.last or add_generation_prompt -%}{{ '\n\n' }}{%- endif -%}
+{{ '✿' }}
+{%- if not loop.last or add_generation_prompt -%}{{ '\n' }}{%- endif -%}
 {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
-{{ '\x16Assistant:' }}
-{%- if thinking is defined and thinking -%}{{ ' <think>' }}{%- endif -%}
+{{ 'Bot✿' }}
 {%- endif -%}
 """
 

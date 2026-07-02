@@ -390,10 +390,16 @@ class ChatDataset(IterableDataset, Stateful):
         self._validate_messages(messages)
 
         full_text = self._tokenizer.apply_chat_template(messages)
-        # Strip extra newline and ensure the sequence ends with EOS without duplicates
+        chat_add_bos = getattr(self._tokenizer, "chat_template_add_bos", True)
+        chat_append_eos = getattr(self._tokenizer, "chat_template_append_eos", True)
+        # Strip extra newline and optionally ensure the sequence ends with EOS.
         full_text = full_text.rstrip("\n")
-        full_tokens = self._tokenizer.encode(full_text, add_bos=True, add_eos=False)
-        if full_tokens[-1] != self._eos_id:
+        full_tokens = self._tokenizer.encode(
+            full_text,
+            add_bos=chat_add_bos,
+            add_eos=False,
+        )
+        if chat_append_eos and full_tokens[-1] != self._eos_id:
             full_tokens.append(self._eos_id)
 
         if not self._logged_first_sample:
@@ -416,7 +422,11 @@ class ChatDataset(IterableDataset, Stateful):
         prompt_text = self._tokenizer.apply_chat_template(
             messages[:1], add_generation_prompt=True
         )
-        prompt_tokens = self._tokenizer.encode(prompt_text, add_bos=True, add_eos=False)
+        prompt_tokens = self._tokenizer.encode(
+            prompt_text,
+            add_bos=chat_add_bos,
+            add_eos=False,
+        )
         prompt_len = len(prompt_tokens)
 
         # Labels are shifted by one token, so the first assistant token is

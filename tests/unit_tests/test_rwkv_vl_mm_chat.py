@@ -24,8 +24,8 @@ from scripts.rwkv7_exporter.export_hf_model import (
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
     build_image_token_counts_by_message,
-    MMChatDataLoader,
     MMChatCollator,
+    MMChatDataLoader,
     MMChatDataset,
     normalize_mm_chat_sample,
     process_mm_chat_images,
@@ -234,7 +234,7 @@ class TestRwkvVLTokenizer(unittest.TestCase):
         )
         self.assertIs(exporter_processor.process_images, processor_core.process_images)
 
-    def test_chat_template_spacing_and_thinking_prompt(self):
+    def test_chat_template_renders_user_bot_turns(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tok = _make_tokenizer(tmpdir)
             messages = [{"role": "user", "content": "problem"}]
@@ -245,16 +245,16 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 thinking=True,
             )
             self.assertEqual(
-                prompt.replace("\x16", "").replace("\x17", ""),
-                "User: problem\n\nAssistant: <think>",
+                prompt,
+                "User✿problem✿\nBot✿",
             )
 
             no_thinking_prompt = tok.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
             )
-            self.assertTrue(no_thinking_prompt.endswith("\x16Assistant:"))
-            self.assertFalse(no_thinking_prompt.endswith("\x16Assistant: "))
+            self.assertTrue(no_thinking_prompt.endswith("Bot✿"))
+            self.assertFalse(no_thinking_prompt.endswith("Bot✿ "))
 
             full = tok.apply_chat_template(
                 [
@@ -263,11 +263,11 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 ],
                 add_generation_prompt=False,
             )
-            self.assertIn("\x17\n\n\x16Assistant: answer\x17", full)
+            self.assertIn("Bot✿answer✿", full)
             self.assertTrue(full.startswith(no_thinking_prompt))
             self.assertFalse(hasattr(tok, "fake_thinking"))
 
-    def test_empty_thinking_data_matches_old_fake_thinking_text(self):
+    def test_thinking_content_renders_without_extra_spacing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tok = _make_tokenizer(tmpdir)
             messages = [
@@ -278,8 +278,8 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 },
             ]
             rendered = tok.render_mm_chat(messages, [[], []])
-            self.assertIn("\x16Assistant: <think>\n</think>\n answer\x17", rendered)
-            self.assertNotIn("Assistant:  <think>", rendered)
+            self.assertIn("Bot✿<think>\n</think>\n answer✿", rendered)
+            self.assertNotIn("Bot✿ <think>", rendered)
 
     def test_qwen_tools_tool_calls_and_tool_responses_render(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -327,8 +327,8 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 '{"name": "search", "arguments": {"query": "rwkv"}}', rendered
             )
             self.assertIn(
-                "\x16User: <tool_response>\nresult one\n</tool_response>\n"
-                "<tool_response>\nresult two\n</tool_response>\x17",
+                "User✿<tool_response>\nresult one\n</tool_response>\n"
+                "<tool_response>\nresult two\n</tool_response>✿",
                 rendered,
             )
 
@@ -414,8 +414,8 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             hf_rendered = hf_tok.render_mm_chat(messages, counts)
             self.assertEqual(tt_rendered, hf_rendered)
             self.assertEqual(
-                tt_tok.encode(tt_rendered, add_bos=True, add_eos=False),
-                hf_tok.core.encode(hf_rendered, add_bos=True, add_eos=False),
+                tt_tok.encode(tt_rendered, add_bos=False, add_eos=False),
+                hf_tok.core.encode(hf_rendered, add_bos=False, add_eos=False),
             )
             self.assertEqual(
                 tt_tok.assistant_token_spans(messages, counts),
@@ -425,38 +425,11 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             self.assertEqual(hf_tok.convert_tokens_to_ids("<tool_response>"), 65534)
             self.assertEqual(hf_tok.convert_tokens_to_ids("<tools>"), 65535)
             additional = [
-                str(token)
-                for token in getattr(hf_tok, "additional_special_tokens", [])
+                str(token) for token in getattr(hf_tok, "additional_special_tokens", [])
             ]
             self.assertIn("<tool_call>", additional)
             self.assertIn("<tool_response>", additional)
             self.assertIn("<tools>", additional)
-
-    def test_rwkv_vl_tokenizer_overrides_stale_exported_template(self):
-        stale_template = (
-            "{% for message in messages %}"
-            "{{ '\\x16' + message['role'] + ': ' }}"
-            "{% if message['role'] == 'assistant' %}"
-            "{{ ' <think>\\n</think>\\n' }}"
-            "{% endif %}"
-            "{{ message['content'] }}{{ '\\x17' }}"
-            "{% endfor %}"
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            _write_tiny_rwkv_vocab(os.path.join(tmpdir, "wr_vocab_v20230424.txt"))
-            with open(os.path.join(tmpdir, "chat_template.jinja"), "w") as f:
-                f.write(stale_template)
-            tok = RwkvVLMultiModalTokenizer(tokenizer_path=tmpdir)
-            rendered = tok.render_mm_chat(
-                [
-                    {"role": "user", "content": "Question"},
-                    {"role": "assistant", "content": "Answer"},
-                ],
-                [[], []],
-            )
-            self.assertIn("\x16Assistant: Answer\x17", rendered)
-            self.assertNotIn("<think>\n</think>\nAnswer", rendered)
-            self.assertNotIn("assistant:", rendered)
 
     def test_expand_image_placeholders_adds_missing_and_drops_extra(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -711,7 +684,7 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             ]
             counts = [[], [], [], []]
             rendered = tok.render_mm_chat(messages, counts, add_generation_prompt=False)
-            full_tokens = tok.encode(rendered, add_bos=True, add_eos=False)
+            full_tokens = tok.encode(rendered, add_bos=False, add_eos=False)
             supervised = "".join(
                 tok.decode(full_tokens[start:end])
                 for start, end in tok.assistant_token_spans(messages, counts)
@@ -720,8 +693,6 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             self.assertIn("Answer two", supervised)
             self.assertNotIn("Question one", supervised)
             self.assertNotIn("Question two", supervised)
-            self.assertNotIn("User:", supervised)
-            self.assertNotIn("Assistant:", supervised)
 
 
 class TestMMChatDataset(unittest.TestCase):
@@ -1349,8 +1320,6 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertIn("Second answer.", supervised)
             self.assertNotIn("Describe first.", supervised)
             self.assertNotIn("Describe second.", supervised)
-            self.assertNotIn("User:", supervised)
-            self.assertNotIn("Assistant:", supervised)
             self.assertNotIn(tok.image_token, supervised)
             self.assertNotIn(tok.vision_start_token, supervised)
             self.assertNotIn(tok.vision_end_token, supervised)

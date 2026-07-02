@@ -243,7 +243,7 @@ class RwkvTokenizer(PreTrainedTokenizer):
         messages: list[dict],
         image_token_counts_by_message: list[list[int]],
         *,
-        add_bos: bool = True,
+        add_bos: bool = False,
         tools: list[dict] | None = None,
     ) -> list[tuple[int, int]]:
         return self.core.assistant_token_spans(

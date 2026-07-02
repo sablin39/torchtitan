@@ -50,6 +50,8 @@ class RwkvTokenizer(BaseTokenizer):
         tokenizer_path: str,
     ):
         super().__init__()
+        self.chat_template_add_bos = False
+        self.chat_template_append_eos = False
         self.config = config or RwkvTokenizer.Config()
         self.tokenizer_path = tokenizer_path
         self.vocab_file = os.path.join(tokenizer_path, self.config.vocab_file)

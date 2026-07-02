@@ -691,8 +691,14 @@ class MMChatDataset(IterableDataset, Stateful):
             add_generation_prompt=False,
             tools=tools,
         )
-        full_tokens = self._tokenizer.encode(full_text, add_bos=True, add_eos=False)
-        if full_tokens[-1] != self._tokenizer.eos_id:
+        chat_add_bos = getattr(self._tokenizer, "chat_template_add_bos", True)
+        chat_append_eos = getattr(self._tokenizer, "chat_template_append_eos", True)
+        full_tokens = self._tokenizer.encode(
+            full_text,
+            add_bos=chat_add_bos,
+            add_eos=False,
+        )
+        if chat_append_eos and full_tokens[-1] != self._tokenizer.eos_id:
             full_tokens.append(self._tokenizer.eos_id)
         if len(full_tokens) - 1 > self.seq_len:
             return None
@@ -702,7 +708,7 @@ class MMChatDataset(IterableDataset, Stateful):
         spans = self._tokenizer.assistant_token_spans(
             messages,
             image_counts_by_message,
-            add_bos=True,
+            add_bos=chat_add_bos,
             tools=tools,
         )
         for start, end in spans:
