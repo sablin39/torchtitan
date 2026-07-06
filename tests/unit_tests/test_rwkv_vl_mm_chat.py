@@ -242,19 +242,18 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             prompt = tok.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
-                thinking=True,
             )
             self.assertEqual(
                 prompt,
                 "User✿problem✿\nBot✿",
             )
 
-            no_thinking_prompt = tok.apply_chat_template(
+            generation_prompt = tok.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
             )
-            self.assertTrue(no_thinking_prompt.endswith("Bot✿"))
-            self.assertFalse(no_thinking_prompt.endswith("Bot✿ "))
+            self.assertTrue(generation_prompt.endswith("Bot✿"))
+            self.assertFalse(generation_prompt.endswith("Bot✿ "))
 
             full = tok.apply_chat_template(
                 [
@@ -264,8 +263,7 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 add_generation_prompt=False,
             )
             self.assertIn("Bot✿answer✿", full)
-            self.assertTrue(full.startswith(no_thinking_prompt))
-            self.assertFalse(hasattr(tok, "fake_thinking"))
+            self.assertTrue(full.startswith(generation_prompt))
 
     def test_thinking_content_renders_without_extra_spacing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -274,11 +272,11 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 {"role": "user", "content": "problem"},
                 {
                     "role": "assistant",
-                    "content": "<think>\n</think>\n answer",
+                    "content": "<think>\nreason\n</think>\n answer",
                 },
             ]
             rendered = tok.render_mm_chat(messages, [[], []])
-            self.assertIn("Bot✿<think>\n</think>\n answer✿", rendered)
+            self.assertIn("Bot✿<think>\nreason\n</think>\n answer✿", rendered)
             self.assertNotIn("Bot✿ <think>", rendered)
 
     def test_qwen_tools_tool_calls_and_tool_responses_render(self):
@@ -815,7 +813,7 @@ class TestMMChatDataset(unittest.TestCase):
         self.assertEqual(normalized["messages"][2]["role"], "tool")
         self.assertEqual(normalized["messages"][2]["tool_call_id"], "call-search")
 
-    def test_normalize_mm_chat_sample_adds_fake_thinking_for_llava_answers(self):
+    def test_normalize_mm_chat_sample_preserves_plain_llava_answers(self):
         sample = {
             "conversations": [
                 {"from": "human", "value": "Question"},
@@ -826,7 +824,7 @@ class TestMMChatDataset(unittest.TestCase):
         normalized = normalize_mm_chat_sample(sample)
         self.assertEqual(
             normalized["messages"][1]["content"],
-            "<think>\n</think>\n Answer.",
+            "Answer.",
         )
 
     def test_normalize_mm_chat_sample_uses_reasoning_for_training(self):
@@ -1220,15 +1218,13 @@ class TestMMChatDataset(unittest.TestCase):
                 tok.decode(sample["labels"][sample["labels"] != IGNORE_INDEX].tolist())
                 for sample in samples
             )
-            self.assertIn("<think>\n</think>\n A red square.", supervised)
+            self.assertIn("A red square.", supervised)
+            self.assertNotIn("<think>\n</think>\n A red square.", supervised)
             self.assertIn(
                 "<think>\nNeed to verify before answering.\n</think>\n Verified.",
                 supervised,
             )
-            self.assertNotIn(
-                "<think>\n</think>\n Verified.",
-                supervised,
-            )
+            self.assertNotIn("<think>\n</think>", supervised)
 
     def test_mm_chat_dataset_blend_uses_project_seed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1332,7 +1328,7 @@ class TestMMChatDataset(unittest.TestCase):
                     {"role": "user", "content": "Question"},
                     {
                         "role": "assistant",
-                        "content": "<think>\n</think>\n Answer",
+                        "content": "Answer",
                     },
                 ],
                 "images": [],
@@ -1344,7 +1340,8 @@ class TestMMChatDataset(unittest.TestCase):
             supervised = tok.decode(
                 processed["labels"][processed["labels"] != IGNORE_INDEX].tolist()
             )
-            self.assertIn("<think>\n</think>\n Answer", supervised)
+            self.assertIn("Answer", supervised)
+            self.assertNotIn("<think>\n</think>", supervised)
 
             collator = MMChatCollator(
                 batch_size=1,
@@ -1421,7 +1418,7 @@ class TestMMChatDataset(unittest.TestCase):
                         "content": [
                             {
                                 "type": "text",
-                                "text": "<think>\n</think>\n Answer",
+                                "text": "Answer",
                             }
                         ],
                     },

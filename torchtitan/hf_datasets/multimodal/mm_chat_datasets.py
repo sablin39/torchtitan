@@ -45,9 +45,6 @@ ROLE_TABLE = {
     "gpt": "assistant",
 }
 
-EMPTY_THINK_PREFIX = "<think>\n</think>\n "
-
-
 _PIXEL_VALUE_DTYPES = {
     "float32": torch.float32,
     "fp32": torch.float32,
@@ -216,31 +213,25 @@ def _split_think_content(content: str) -> tuple[str | None, str]:
     return reasoning.strip("\n "), answer.lstrip()
 
 
-def _ensure_think_content(
+def _apply_reasoning_content(
     content: Any,
     *,
     reasoning: Any | None = None,
 ) -> Any:
+    if reasoning in (None, ""):
+        return content
+
     text = _text_content_to_string(content)
     if text is None:
         return content
 
-    existing_reasoning, existing_answer = _split_think_content(text)
-    if reasoning not in (None, ""):
-        reasoning_text = str(reasoning).strip("\n ")
-        answer_text = (
-            existing_answer.strip() if existing_reasoning is not None else text.strip()
-        )
-        return f"<think>\n{reasoning_text}\n</think>\n {answer_text}"
+    reasoning_text = str(reasoning).strip("\n ")
+    if not reasoning_text:
+        return content
 
-    if existing_reasoning is not None:
-        reasoning_text = existing_reasoning.strip("\n ")
-        answer_text = existing_answer.strip()
-        if reasoning_text:
-            return f"<think>\n{reasoning_text}\n</think>\n {answer_text}"
-        return EMPTY_THINK_PREFIX + answer_text
-
-    return EMPTY_THINK_PREFIX + text.strip()
+    _, existing_answer = _split_think_content(text)
+    answer_text = existing_answer.strip()
+    return f"<think>\n{reasoning_text}\n</think>\n {answer_text}"
 
 
 def _parse_json_maybe(value: Any) -> Any:
@@ -344,7 +335,7 @@ def normalize_mm_chat_messages(raw_messages: Any) -> list[dict[str, Any]]:
             "content": _normalize_content(content),
         }
         if role == "assistant":
-            normalized_message["content"] = _ensure_think_content(
+            normalized_message["content"] = _apply_reasoning_content(
                 normalized_message["content"],
                 reasoning=message.get("reasoning_content"),
             )
