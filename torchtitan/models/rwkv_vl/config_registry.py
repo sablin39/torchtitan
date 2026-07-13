@@ -11,22 +11,31 @@ from torchtitan.components.loss import ChunkedCELoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.components.tokenizer import MultiModalTokenizer
-from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig, TrainingConfig
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.hf_datasets.multimodal.mm_chat_datasets import MMChatDataLoader
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMDataLoader
-from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
+from torchtitan.models.rwkv7.tokenizer_core import (
+    DEFAULT_IMAGE_TOKEN,
+    DEFAULT_PAD_TOKEN,
+    DEFAULT_VISION_END_TOKEN,
+    DEFAULT_VISION_START_TOKEN,
+)
 from torchtitan.trainer import Trainer
 
 from . import model_registry
 
 
 _DEBUG_SPECIAL_TOKENS = {
-    "image_token": "<|image_pad|>",
+    "image_token": DEFAULT_IMAGE_TOKEN,
     "video_token": "<|video_pad|>",
-    "vision_start_token": "<|vision_start|>",
-    "vision_end_token": "<|vision_end|>",
-    "pad_token": "<|endoftext|>",
+    "vision_start_token": DEFAULT_VISION_START_TOKEN,
+    "vision_end_token": DEFAULT_VISION_END_TOKEN,
+    "pad_token": DEFAULT_PAD_TOKEN,
 }
 
 
@@ -126,7 +135,7 @@ def rwkv_vl_debugmodel() -> Trainer.Config:
     return RWKVVLTrainerConfig(
         loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
         hf_assets_path="./tests/assets/tokenizer",
-        tokenizer=MultiModalTokenizer.Config(**_DEBUG_SPECIAL_TOKENS),
+        tokenizer=HuggingFaceTokenizer.Config(**_DEBUG_SPECIAL_TOKENS),
         model_spec=model_registry("debugmodel"),
         dataloader=_rwkv_vl_dataloader("cc12m-test"),
         optimizer=OptimizersContainer.Config(lr=8e-4),
@@ -149,7 +158,11 @@ def rwkv_vl_debugmodel_chat() -> Trainer.Config:
     return RWKVVLTrainerConfig(
         loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
         hf_assets_path="./tests/assets/tokenizer",
-        tokenizer=RwkvVLMultiModalTokenizer.Config(),
+        tokenizer=HuggingFaceTokenizer.Config(
+            trust_remote_code=True,
+            chat_template_add_bos=False,
+            chat_template_append_eos=False,
+        ),
         model_spec=model_registry("debugmodel"),
         dataloader=_rwkv_vl_chat_dataloader(dataset_path="./tests/assets/cc12m_test"),
         optimizer=OptimizersContainer.Config(lr=8e-4),
@@ -172,7 +185,11 @@ def _rwkv_vl_chat_config(model_flavor: str) -> Trainer.Config:
     return RWKVVLTrainerConfig(
         loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
         hf_assets_path="./tests/assets/tokenizer",
-        tokenizer=RwkvVLMultiModalTokenizer.Config(),
+        tokenizer=HuggingFaceTokenizer.Config(
+            trust_remote_code=True,
+            chat_template_add_bos=False,
+            chat_template_append_eos=False,
+        ),
         model_spec=model_registry(model_flavor),
         dataloader=_rwkv_vl_chat_dataloader(dataset_path="./tests/assets/cc12m_test"),
         optimizer=OptimizersContainer.Config(lr=8e-4),

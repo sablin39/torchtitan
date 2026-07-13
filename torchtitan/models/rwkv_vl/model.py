@@ -34,6 +34,11 @@ from torchtitan.models.rwkv7.model import (
     LayerNorm,
     RWKV7Backbone,
 )
+from torchtitan.models.rwkv7.tokenizer_core import (
+    DEFAULT_IMAGE_TOKEN_ID,
+    DEFAULT_VISION_END_TOKEN_ID,
+    DEFAULT_VISION_START_TOKEN_ID,
+)
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleList, Sequential
 
@@ -245,11 +250,11 @@ def _validate_backbone_chunk_size(chunk_size: int) -> int:
     chunk_size = int(chunk_size)
     if chunk_size < 16:
         raise ValueError(
-            "RWKV-VL backbone_chunk_size must be at least 16; " f"got {chunk_size}"
+            f"RWKV-VL backbone_chunk_size must be at least 16; got {chunk_size}"
         )
     if chunk_size & (chunk_size - 1):
         raise ValueError(
-            "RWKV-VL backbone_chunk_size must be a power of two; " f"got {chunk_size}"
+            f"RWKV-VL backbone_chunk_size must be a power of two; got {chunk_size}"
         )
     return chunk_size
 
@@ -293,9 +298,7 @@ def _projector_linear(
     *,
     bias: bool = True,
 ) -> Linear:
-    return _projector_linear_config(
-        in_features, out_features, bias=bias
-    ).build()
+    return _projector_linear_config(in_features, out_features, bias=bias).build()
 
 
 class _SwiGLUFFN(Module):
@@ -436,23 +439,15 @@ class _VisualStreamCrossAttnProjector(Module):
         self.head_dim = head_dim
         self.project_dim = project_dim
         self.kv_norm = _build_norm(norm, encoder_dim, norm_eps)
-        self.k_proj = _projector_linear(
-            encoder_dim, num_heads * head_dim, bias=False
-        )
-        self.v_proj = _projector_linear(
-            encoder_dim, num_heads * head_dim, bias=False
-        )
+        self.k_proj = _projector_linear(encoder_dim, num_heads * head_dim, bias=False)
+        self.v_proj = _projector_linear(encoder_dim, num_heads * head_dim, bias=False)
         self.q_norm = _build_norm(norm, project_dim, norm_eps)
-        self.o_proj = _projector_linear(
-            num_heads * head_dim, project_dim, bias=False
-        )
+        self.o_proj = _projector_linear(num_heads * head_dim, project_dim, bias=False)
         self.kernel_options = dict(_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT)
         if kernel_options:
             self.kernel_options.update(kernel_options)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Project encoder features to ``(k, v)`` tensors.
 
         Args:
@@ -499,13 +494,9 @@ class _VisualStreamCrossAttnProjector(Module):
         q_real_len = q_real.shape[0]
         kv_real_len = k_real.shape[0]
         if q_real_len > q_bucket:
-            raise ValueError(
-                f"q_real_len={q_real_len} exceeds q_bucket={q_bucket}"
-            )
+            raise ValueError(f"q_real_len={q_real_len} exceeds q_bucket={q_bucket}")
         if kv_real_len > kv_bucket:
-            raise ValueError(
-                f"kv_real_len={kv_real_len} exceeds kv_bucket={kv_bucket}"
-            )
+            raise ValueError(f"kv_real_len={kv_real_len} exceeds kv_bucket={kv_bucket}")
 
         q_in = self.q_norm(q_real)
         # Pad to bucket lengths along the sequence axis.
@@ -625,8 +616,7 @@ class VisualAdapter(Module):
         if config.kind == "cross_attn":
             if config.num_heads is None:
                 raise ValueError(
-                    "VisualAdapter.Config.num_heads is required when "
-                    "kind='cross_attn'"
+                    "VisualAdapter.Config.num_heads is required when kind='cross_attn'"
                 )
             head_dim = config.head_dim or (config.project_dim // config.num_heads)
             if config.num_heads * head_dim != config.project_dim:
@@ -684,9 +674,9 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         vision_encoder: Qwen3VLVisionEncoder.Config
         proj: VisualAdapter.Config
         lm_head: Linear.Config | None = None
-        image_token_id: int = 65532
-        vision_start_token_id: int = 65530
-        vision_end_token_id: int = 65531
+        image_token_id: int = DEFAULT_IMAGE_TOKEN_ID
+        vision_start_token_id: int = DEFAULT_VISION_START_TOKEN_ID
+        vision_end_token_id: int = DEFAULT_VISION_END_TOKEN_ID
         uses_fla_context_parallel: bool = True
         # Spatial merge size used by the processor / dataloader when counting
         # ``<image_pad>`` tokens. Must be a positive integer multiple of
@@ -734,9 +724,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                 self.llm = replace(
                     self.llm,
                     vocab_size=new_vocab,
-                    embeddings=replace(
-                        self.llm.embeddings, num_embeddings=new_vocab
-                    ),
+                    embeddings=replace(self.llm.embeddings, num_embeddings=new_vocab),
                 )
                 if self.lm_head is not None:
                     self.lm_head = replace(self.lm_head, out_features=new_vocab)
@@ -965,9 +953,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             merged_embeds,
             deepstack_features,
         )
-        num_kv_per_item = (
-            grid_thw.prod(-1) // self.vision_encoder.spatial_merge_unit
-        )
+        num_kv_per_item = grid_thw.prod(-1) // self.vision_encoder.spatial_merge_unit
         processor_unit = self.processor_spatial_merge_size**2
         num_tokens_per_item = grid_thw.prod(-1) // processor_unit
         return merged_embeds, deepstack_features, num_tokens_per_item, num_kv_per_item
@@ -1101,9 +1087,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             shard_start = 0
         else:
             global_input_ids_used = global_input_ids
-            shard_start = (
-                int(global_start.item()) if global_start is not None else 0
-            )
+            shard_start = int(global_start.item()) if global_start is not None else 0
         shard_length = local_tokens.numel()
 
         spans = _find_vision_spans(
@@ -1112,7 +1096,9 @@ class RWKV7VLForConditionalGeneration(BaseModel):
 
         # Gather local Q metadata: contiguous slice ranges in the flat local
         # token stream + per-row image_id label.
-        local_ranges: list[tuple[int, int, int]] = []  # (local_start, local_end, image_id)
+        local_ranges: list[
+            tuple[int, int, int]
+        ] = []  # (local_start, local_end, image_id)
         for span in spans:
             span_end = span.start + span.length
             overlap_start = max(span.start, shard_start)
@@ -1138,18 +1124,10 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         kv_ladder = self.proj.config.kv_buckets
 
         def _bucket_q(n: int) -> int:
-            return (
-                _ceil_to_bucket(n, q_ladder)
-                if q_ladder
-                else _next_pow2_bucket(n)
-            )
+            return _ceil_to_bucket(n, q_ladder) if q_ladder else _next_pow2_bucket(n)
 
         def _bucket_kv(n: int) -> int:
-            return (
-                _ceil_to_bucket(n, kv_ladder)
-                if kv_ladder
-                else _next_pow2_bucket(n)
-            )
+            return _ceil_to_bucket(n, kv_ladder) if kv_ladder else _next_pow2_bucket(n)
 
         # Group local Q ranges by their image_id for fast per-chunk filtering.
         ranges_by_image: dict[int, list[tuple[int, int]]] = {}
@@ -1200,9 +1178,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             kv_cursor = 0
             for image_id in range(img_lo, img_hi):
                 length = num_kv_list[image_id]
-                kv_image_id_chunk[kv_cursor : kv_cursor + length] = (
-                    image_id - img_lo
-                )
+                kv_image_id_chunk[kv_cursor : kv_cursor + length] = image_id - img_lo
                 kv_cursor += length
 
             # Per-chunk closure: mask_mod captures this chunk's id tensors so
@@ -1287,13 +1263,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         special_tokens: dict[str, int] | None,
         fla_cp_global_input_ids: torch.Tensor | None,
         fla_cp_global_start: torch.Tensor | None,
-    ) -> tuple[
-        torch.Tensor,
-        list[Any],
-        torch.Tensor | None,
-        torch.Tensor | None,
-        int,
-    ]:
+    ) -> tuple[torch.Tensor, list[Any], torch.Tensor | None, torch.Tensor | None, int,]:
         inputs_embeds = self.llm.embeddings(tokens)
         image_token_id = (
             special_tokens.get("image_id", self.config.image_token_id)
@@ -1343,9 +1313,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                     zero_grad_tensors.append(entry)
                 else:
                     zero_grad_tensors.extend(entry)
-            inputs_embeds = self._add_zero_grad_edge(
-                inputs_embeds, *zero_grad_tensors
-            )
+            inputs_embeds = self._add_zero_grad_edge(inputs_embeds, *zero_grad_tensors)
         return (
             inputs_embeds,
             deepstack_features,

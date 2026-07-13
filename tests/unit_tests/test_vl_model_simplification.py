@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import importlib
 import os
-import shutil
 import sys
 import tempfile
 import types
@@ -20,16 +19,12 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from scripts.rwkv7_exporter.export_hf_model import (
-    save_processor_core,
-    save_tokenizer_core,
-)
-from torchtitan.hf_datasets.multimodal.processor_core import CHAT_TEMPLATE
+from scripts.rwkv7_exporter.export_hf_model import save_remote_code_assets
 from torchtitan.models.qwen3_vl.model import Qwen3VLModel
 from torchtitan.models.rwkv7.model import RWKV7Backbone
+from torchtitan.models.rwkv7.tokenizer_core import CHAT_TEMPLATE
 from torchtitan.models.rwkv_vl import _vl_vision_encoder_config
 from torchtitan.models.rwkv_vl.model import RWKV7VLForConditionalGeneration
-from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
 from transformers import BaseImageProcessor
 
 
@@ -56,11 +51,7 @@ def _load_exported_remote_code(tmpdir: str):
     export_dir = Path(tmpdir) / "remote"
     export_dir.mkdir()
     (export_dir / "__init__.py").write_text("", encoding="utf-8")
-    exporter_dir = Path(__file__).parents[2] / "scripts" / "rwkv7_exporter"
-    shutil.copyfile(exporter_dir / "tokenizer.py", export_dir / "tokenizer.py")
-    shutil.copyfile(exporter_dir / "processor.py", export_dir / "processor.py")
-    save_tokenizer_core(str(export_dir))
-    save_processor_core(str(export_dir))
+    save_remote_code_assets(str(export_dir), include_processor=True)
     package_name = export_dir.name
     module_names = (
         package_name,
@@ -89,13 +80,6 @@ def _load_exported_remote_code(tmpdir: str):
         return tokenizer_module.RwkvTokenizer, processor_module.ModRWKVProcessor
     finally:
         sys.path.remove(str(export_dir.parent))
-
-
-def _make_tt_tokenizer(tmpdir: str) -> RwkvVLMultiModalTokenizer:
-    _write_tiny_rwkv_vocab(os.path.join(tmpdir, "wr_vocab_v20230424.txt"))
-    with open(os.path.join(tmpdir, "chat_template.jinja"), "w") as f:
-        f.write(CHAT_TEMPLATE)
-    return RwkvVLMultiModalTokenizer(tokenizer_path=tmpdir)
 
 
 class TinyImageProcessor(BaseImageProcessor):
@@ -608,47 +592,7 @@ class TestCudaVisionEncoderParity(unittest.TestCase):
             )
 
 
-class TestTokenizerProcessorParity(unittest.TestCase):
-    def test_torchtitan_and_remote_tokenizer_chat_helpers_align(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            HFRwkvTokenizer, _ = _load_exported_remote_code(tmpdir)
-            vocab_file = os.path.join(tmpdir, "wr_vocab_v20230424.txt")
-            tt_tok = _make_tt_tokenizer(tmpdir)
-            hf_tok = HFRwkvTokenizer(
-                vocab_file=vocab_file,
-                bos_token="\x16",
-                eos_token="\x17",
-                pad_token="\x17",
-                unk_token="\x16",
-                chat_template=CHAT_TEMPLATE,
-            )
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": "Describe."},
-                    ],
-                },
-                {"role": "assistant", "content": "Answer."},
-            ]
-            counts = [[2], []]
-            self.assertEqual(tt_tok.image_token_id, hf_tok.image_token_id)
-            self.assertEqual(tt_tok.vision_start_token_id, hf_tok.vision_start_token_id)
-            self.assertEqual(tt_tok.vision_end_token_id, hf_tok.vision_end_token_id)
-            self.assertEqual(
-                tt_tok.render_mm_chat(messages, counts),
-                hf_tok.render_mm_chat(messages, counts),
-            )
-            self.assertEqual(
-                tt_tok.assistant_token_spans(messages, counts),
-                hf_tok.assistant_token_spans(messages, counts),
-            )
-            self.assertEqual(
-                tt_tok.expand_image_placeholders("\x16User:<image>\x17", [3]),
-                hf_tok.expand_image_placeholders("\x16User:<image>\x17", [3]),
-            )
-
+class TestRemoteProcessor(unittest.TestCase):
     def test_remote_processor_text_policy_and_cuda_vision_smoke(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             HFRwkvTokenizer, ModRWKVProcessor = _load_exported_remote_code(tmpdir)
@@ -656,10 +600,6 @@ class TestTokenizerProcessorParity(unittest.TestCase):
             _write_tiny_rwkv_vocab(vocab_file)
             hf_tok = HFRwkvTokenizer(
                 vocab_file=vocab_file,
-                bos_token="\x16",
-                eos_token="\x17",
-                pad_token="\x17",
-                unk_token="\x16",
                 chat_template=CHAT_TEMPLATE,
             )
             processor = ModRWKVProcessor(

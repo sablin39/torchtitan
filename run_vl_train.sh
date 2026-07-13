@@ -37,13 +37,13 @@ torchrun_cmd="torchrun"
 # Edit this block directly for now. We will replace it with a smarter config
 # system later.
 
-rwkv7_path="/mnt/raid0_8t/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
-vision_model="/home/rwkv/models/Qwen3-VL-2B-Instruct"
+rwkv7_path="${HOME}/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
+vision_model="${HOME}/models/Qwen3-VL-2B-Instruct"
 # W&B remote path: /data/HuggingFaceM4_FineVisionMax
-dataset_path="/mnt/raid0_8t/LLaVA-OneVision-Data/tqa(cauldron,llava_format)"
+dataset_path="${HOME}/data/LLaVA-OneVision-Data/ai2d(cauldron,llava_format)"
 # Optional text-only SFT source. Image-text rows stay LLaVA/common-schema
 # friendly; text rows are loaded through the strict Nemotron chat processor.
-text_dataset_path="/mnt/raid0_8t/Nemotron-SFT-Agentic-v2"
+text_dataset_path="${HOME}/data/nemotron_cleaned/agentic_v2_cleaned"
 text_split="train"
 text_sample_probability="0.5"
 project_seed="1234"
@@ -72,7 +72,7 @@ data_parallel_shard_degree="-1"
 seq_len="8192"
 # The recovered 4096-token W&B run used batch_size=24. For 8192-token local
 # stress on this shared 4x96GB workstation, batch_size=8 is the verified default.
-batch_size="24"
+batch_size="8"
 # batch_size is TorchTitan training.local_batch_size. With RWKV/FLA CP it is
 # the number of packed seq_len rows per batch-parallel group. CP shards the
 # flattened tokens inside each row group; it does not multiply batch size.

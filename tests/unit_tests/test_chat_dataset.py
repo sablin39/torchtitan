@@ -95,7 +95,11 @@ class TestChatDatasetShiftedTokens(unittest.TestCase):
         messages = _process_sample(sample)
         full_text = tokenizer.apply_chat_template(messages)
         # Chat templates already include end tokens, so no add_eos
-        full_tokens = tokenizer.encode(full_text, add_bos=True, add_eos=False)
+        full_tokens = tokenizer.encode(
+            full_text,
+            add_bos=tokenizer.chat_template_add_bos,
+            add_eos=False,
+        )
 
         expected_input = full_tokens[:-1]
         expected_label = full_tokens[1:]
@@ -112,7 +116,11 @@ class TestChatDatasetShiftedTokens(unittest.TestCase):
         prompt_text = tokenizer.apply_chat_template(
             messages[:1], add_generation_prompt=True
         )
-        prompt_tokens = tokenizer.encode(prompt_text, add_bos=True, add_eos=False)
+        prompt_tokens = tokenizer.encode(
+            prompt_text,
+            add_bos=tokenizer.chat_template_add_bos,
+            add_eos=False,
+        )
         response_start = len(prompt_tokens) - 1
         self.assertGreaterEqual(response_start, 0)
         self.assertNotEqual(

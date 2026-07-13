@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """RWKV-VL HF remote-code model used by the exporter.
 
 This file intentionally lives beside the exporter so the generated checkpoint
 is self-contained.
 """
 
-from dataclasses import dataclass
 import warnings
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from transformers.cache_utils import Cache
+import torch.nn.functional as F
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -21,8 +27,12 @@ from transformers import (
     PreTrainedModel,
     Qwen3VLVisionModel,
 )
+from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
 
 try:
@@ -119,7 +129,9 @@ class ModRWKVConfig(PretrainedConfig):
         cls,
         text_config: Union[RWKV7Config, Dict[str, Any]],
         vision_config: Union[Qwen3VLVisionConfig, Dict[str, Any]],
-        projector_config: Optional[Union[ModRWKVProjectorConfig, Dict[str, Any]]] = None,
+        projector_config: Optional[
+            Union[ModRWKVProjectorConfig, Dict[str, Any]]
+        ] = None,
         **kwargs,
     ) -> "ModRWKVConfig":
         return cls(
@@ -133,10 +145,12 @@ class ModRWKVConfig(PretrainedConfig):
         self,
         text_config: Optional[Union[RWKV7Config, Dict[str, Any]]] = None,
         vision_config: Optional[Union[Qwen3VLVisionConfig, Dict[str, Any]]] = None,
-        projector_config: Optional[Union[ModRWKVProjectorConfig, Dict[str, Any]]] = None,
-        image_token_id: int = 65532,
-        vision_start_token_id: int = 65530,
-        vision_end_token_id: int = 65531,
+        projector_config: Optional[
+            Union[ModRWKVProjectorConfig, Dict[str, Any]]
+        ] = None,
+        image_token_id: Optional[int] = None,
+        vision_start_token_id: Optional[int] = None,
+        vision_end_token_id: Optional[int] = None,
         tie_word_embeddings: bool = False,
         use_conv_in_projector: bool = False,
         processor_spatial_merge_size: Optional[int] = None,
@@ -293,9 +307,7 @@ class _VisualStreamProjector(nn.Module):
         self.merge_unit = merge_size**2
 
         in_dim = encoder_dim * self.merge_unit
-        self.in_norm = (
-            _build_norm(norm, encoder_dim) if merge_size > 1 else None
-        )
+        self.in_norm = _build_norm(norm, encoder_dim) if merge_size > 1 else None
         self.pre_norm = _build_norm(norm, project_dim)
         self.mlp = _build_ffn(ffn, in_dim, self.hidden_dim, project_dim)
 
@@ -338,9 +350,7 @@ class _VisualStreamCrossAttnProjector(nn.Module):
         self.q_norm = _build_norm(norm, project_dim)
         self.o_proj = nn.Linear(num_heads * head_dim, project_dim, bias=False)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.kv_norm(x)
         k = self.k_proj(x).reshape(-1, self.num_heads, self.head_dim)
         v = self.v_proj(x).reshape(-1, self.num_heads, self.head_dim)
@@ -394,9 +404,7 @@ class VisualAdapter(nn.Module):
         if use_conv:
             raise ValueError("Convolutional visual projectors are not supported.")
         if extra_merge_size < 1:
-            raise ValueError(
-                f"extra_merge_size must be >= 1; got {extra_merge_size}"
-            )
+            raise ValueError(f"extra_merge_size must be >= 1; got {extra_merge_size}")
         if extra_merge_size > 1 and kind != "cross_attn":
             raise ValueError(
                 "extra_merge_size > 1 is only supported with kind='cross_attn'"
@@ -502,7 +510,8 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         # a smaller merge size, in which case the projector's extra_merger
         # bridges the gap on the main stream.
         self._processor_spatial_merge_size = getattr(
-            config, "processor_spatial_merge_size",
+            config,
+            "processor_spatial_merge_size",
             getattr(self.encoder.config, "spatial_merge_size", 2),
         )
         self.llm = RWKV7Model(config.text_config)
@@ -637,9 +646,11 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         """
         flat_input = input_ids.view(-1)
         flat_hidden = hidden_states.view(-1, hidden_states.shape[-1]).clone()
-        q_positions = (flat_input == self.config.image_token_id).nonzero(
-            as_tuple=False
-        ).reshape(-1)
+        q_positions = (
+            (flat_input == self.config.image_token_id)
+            .nonzero(as_tuple=False)
+            .reshape(-1)
+        )
         if q_positions.numel() == 0:
             return hidden_states
         if q_positions.shape[0] != int(num_tokens_per_item.sum().item()):
@@ -651,9 +662,7 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
 
         # Build per-row image_id labels for Q and K/V.
         device = hidden_states.device
-        q_image_id = torch.empty(
-            q_positions.shape[0], dtype=torch.long, device=device
-        )
+        q_image_id = torch.empty(q_positions.shape[0], dtype=torch.long, device=device)
         cursor = 0
         for i, count in enumerate(num_tokens_per_item.tolist()):
             q_image_id[cursor : cursor + count] = i
@@ -672,9 +681,7 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         attn_mask = q_image_id[:, None] == kv_image_id[None, :]
 
         q_real = flat_hidden.index_select(0, q_positions)
-        delta = projector.attend(
-            q_real.to(k_real.dtype), k_real, v_real, attn_mask
-        )
+        delta = projector.attend(q_real.to(k_real.dtype), k_real, v_real, attn_mask)
         flat_hidden.index_add_(0, q_positions, delta.to(flat_hidden.dtype))
         return flat_hidden.view_as(hidden_states)
 
@@ -721,7 +728,9 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must provide either input_ids or inputs_embeds.")
         if (pixel_values is None) != (image_grid_thw is None):
-            raise ValueError("pixel_values and image_grid_thw must be provided together.")
+            raise ValueError(
+                "pixel_values and image_grid_thw must be provided together."
+            )
         if pixel_values is not None and input_ids is None:
             raise ValueError("input_ids are required when pixel_values are provided.")
 
@@ -731,9 +740,11 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
         num_kv_per_item: Optional[torch.Tensor] = None
         num_tokens_per_item: Optional[torch.Tensor] = None
         if pixel_values is not None:
-            image_features, deepstack_features, num_kv_per_item = (
-                self._get_image_features(pixel_values, image_grid_thw)
-            )
+            (
+                image_features,
+                deepstack_features,
+                num_kv_per_item,
+            ) = self._get_image_features(pixel_values, image_grid_thw)
             num_tokens_per_item = image_grid_thw.prod(-1) // (
                 self._processor_spatial_merge_size**2
             )
@@ -743,9 +754,13 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
                 image_features,
             )
 
-        if use_cache and past_key_values is not None and not isinstance(
-            past_key_values,
-            Cache,
+        if (
+            use_cache
+            and past_key_values is not None
+            and not isinstance(
+                past_key_values,
+                Cache,
+            )
         ):
             from_legacy_cache = getattr(Cache, "from_legacy_cache", None)
             if callable(from_legacy_cache):
@@ -943,7 +958,9 @@ class RWKV7VLForConditionalGeneration(ModRWKVPreTrainedModel, GenerationMixin):
         )
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(
-            hidden_states if logits_to_keep is None else hidden_states[:, -logits_to_keep:]
+            hidden_states
+            if logits_to_keep is None
+            else hidden_states[:, -logits_to_keep:]
         )
 
         loss = None
@@ -970,7 +987,9 @@ class RWKV7VLForConditionalGeneration(ModRWKVPreTrainedModel, GenerationMixin):
 
 AutoConfig.register(ModRWKVConfig.model_type, ModRWKVConfig, exist_ok=True)
 AutoModel.register(ModRWKVConfig, RWKV7VLForConditionalGeneration, exist_ok=True)
-AutoModelForCausalLM.register(ModRWKVConfig, RWKV7VLForConditionalGeneration, exist_ok=True)
+AutoModelForCausalLM.register(
+    ModRWKVConfig, RWKV7VLForConditionalGeneration, exist_ok=True
+)
 AutoModelForImageTextToText.register(
     ModRWKVConfig,
     RWKV7VLForConditionalGeneration,

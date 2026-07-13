@@ -13,9 +13,9 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.components.tokenizer import MultiModalTokenizer
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
+from torchtitan.hf_datasets.multimodal.processor_core import vision_to_patches
 from torchtitan.tools.logging import logger
-from .utils.image import vision_to_patches
 from .utils.text import pad_batch_dim, pad_seq_len
 
 
@@ -33,7 +33,7 @@ class MultiModalCollator:
     patch_size: int
     temporal_patch_size: int
     spatial_merge_size: int
-    tokenizer: MultiModalTokenizer
+    tokenizer: HuggingFaceTokenizer
 
     def collate_images(
         self, all_images: list[torch.Tensor]

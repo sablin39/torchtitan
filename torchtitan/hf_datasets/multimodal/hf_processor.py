@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Hugging Face processor wrapper backed by TorchTitan's processor core."""
+
 import copy
 
 import torch
@@ -19,7 +21,6 @@ from transformers.processing_utils import (
 try:
     from .processor_core import (
         append_missing_image_tags,
-        CHAT_TEMPLATE,
         flatten_images,
         get_images_per_text_sample,
         make_image_config_from_processor,
@@ -31,7 +32,6 @@ try:
 except ImportError:
     from torchtitan.hf_datasets.multimodal.processor_core import (
         append_missing_image_tags,
-        CHAT_TEMPLATE,
         flatten_images,
         get_images_per_text_sample,
         make_image_config_from_processor,
@@ -39,6 +39,21 @@ except ImportError:
         process_images,
         strip_excess_image_tags,
         validate_image_token_alignment,
+    )
+
+try:
+    from .tokenizer_core import (
+        CHAT_TEMPLATE,
+        DEFAULT_IMAGE_TOKEN,
+        DEFAULT_VISION_END_TOKEN,
+        DEFAULT_VISION_START_TOKEN,
+    )
+except ImportError:
+    from torchtitan.models.rwkv7.tokenizer_core import (
+        CHAT_TEMPLATE,
+        DEFAULT_IMAGE_TOKEN,
+        DEFAULT_VISION_END_TOKEN,
+        DEFAULT_VISION_START_TOKEN,
     )
 
 
@@ -73,11 +88,13 @@ class ModRWKVProcessor(ProcessorMixin):
         )
         self.auto_insert_image_tags = auto_insert_image_tags
         self.total_pixels_budget = total_pixels_budget
-        self.image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
+        self.image_token = getattr(tokenizer, "image_token", DEFAULT_IMAGE_TOKEN)
         self.vision_start_token = getattr(
-            tokenizer, "vision_start_token", "<|vision_start|>"
+            tokenizer, "vision_start_token", DEFAULT_VISION_START_TOKEN
         )
-        self.vision_end_token = getattr(tokenizer, "vision_end_token", "<|vision_end|>")
+        self.vision_end_token = getattr(
+            tokenizer, "vision_end_token", DEFAULT_VISION_END_TOKEN
+        )
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
         self.vision_start_token_id = self.tokenizer.convert_tokens_to_ids(
             self.vision_start_token

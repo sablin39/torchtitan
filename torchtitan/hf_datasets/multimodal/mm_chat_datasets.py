@@ -24,9 +24,9 @@ from torch.utils.data import get_worker_info, IterableDataset
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.hf_datasets.multimodal.processor_core import (
-    process_images as process_rwkv_vl_images,
+    flatten_images,
+    process_images,
     RWKVVLImageProcessorConfig,
-    RWKVVLProcessedImages,
 )
 from torchtitan.hf_datasets.multimodal.utils.packing import MMSamplePacker
 from torchtitan.hf_datasets.multimodal.utils.text import pad_batch_dim, pad_seq_len
@@ -137,25 +137,8 @@ def _num_grid_patches(grid_thw: torch.Tensor | None) -> int:
     return 0 if grid_thw is None else int(grid_thw.prod(-1).sum().item())
 
 
-def _flatten_images(images: Any) -> list[Any]:
-    if images is None:
-        return []
-    if isinstance(images, dict) and (
-        images.get("bytes") is not None or images.get("path") is not None
-    ):
-        return [images]
-    if isinstance(images, (str, bytes)) or hasattr(images, "convert"):
-        return [images]
-    if isinstance(images, list | tuple):
-        flattened = []
-        for image in images:
-            flattened.extend(_flatten_images(image))
-        return flattened
-    return [images]
-
-
 def normalize_mm_chat_images(images: Any) -> list[Any]:
-    return [image for image in _flatten_images(images) if image is not None]
+    return [image for image in flatten_images(images) if image is not None]
 
 
 def _normalize_content(content: Any) -> Any:
@@ -425,33 +408,6 @@ def validate_mm_chat_messages(messages: list[dict[str, Any]]) -> None:
         raise ValueError("MM chat sample has no assistant turn")
 
 
-def process_mm_chat_images(
-    images: list[Any],
-    *,
-    patch_size: int,
-    temporal_patch_size: int,
-    spatial_merge_size: int,
-    min_pixels: int,
-    max_pixels: int,
-    image_mean: tuple[float, ...],
-    image_std: tuple[float, ...],
-    max_aspect_ratio: float,
-) -> RWKVVLProcessedImages:
-    return process_rwkv_vl_images(
-        images,
-        RWKVVLImageProcessorConfig(
-            patch_size=patch_size,
-            temporal_patch_size=temporal_patch_size,
-            spatial_merge_size=spatial_merge_size,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-            image_mean=image_mean,
-            image_std=image_std,
-            max_aspect_ratio=max_aspect_ratio,
-        ),
-    )
-
-
 def build_image_token_counts_by_message(
     messages: list[dict[str, Any]],
     image_token_counts: list[int],
@@ -657,16 +613,18 @@ class MMChatDataset(IterableDataset, Stateful):
         validate_mm_chat_messages(messages)
         processed_images = None
         if images:
-            processed_images = process_mm_chat_images(
+            processed_images = process_images(
                 images,
-                patch_size=self.patch_size,
-                temporal_patch_size=self.temporal_patch_size,
-                spatial_merge_size=self.spatial_merge_size,
-                min_pixels=self.min_pixels,
-                max_pixels=self.max_pixels,
-                image_mean=self.image_mean,
-                image_std=self.image_std,
-                max_aspect_ratio=self.max_aspect_ratio,
+                RWKVVLImageProcessorConfig(
+                    patch_size=self.patch_size,
+                    temporal_patch_size=self.temporal_patch_size,
+                    spatial_merge_size=self.spatial_merge_size,
+                    min_pixels=self.min_pixels,
+                    max_pixels=self.max_pixels,
+                    image_mean=self.image_mean,
+                    image_std=self.image_std,
+                    max_aspect_ratio=self.max_aspect_ratio,
+                ),
             )
             image_counts_by_message = build_image_token_counts_by_message(
                 messages,

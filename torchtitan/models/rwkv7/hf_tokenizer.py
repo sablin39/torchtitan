@@ -15,10 +15,14 @@ from transformers.utils import logging
 try:
     from .tokenizer_core import (
         CHAT_TEMPLATE,
+        DEFAULT_BOS_TOKEN,
+        DEFAULT_EOS_TOKEN,
         DEFAULT_IMAGE_TOKEN,
+        DEFAULT_PAD_TOKEN,
         DEFAULT_TOOL_CALL_TOKEN,
         DEFAULT_TOOL_RESPONSE_TOKEN,
         DEFAULT_TOOLS_TOKEN,
+        DEFAULT_UNK_TOKEN,
         DEFAULT_VISION_END_TOKEN,
         DEFAULT_VISION_START_TOKEN,
         RWKVSpecialTokens,
@@ -27,10 +31,14 @@ try:
 except ImportError:
     from torchtitan.models.rwkv7.tokenizer_core import (
         CHAT_TEMPLATE,
+        DEFAULT_BOS_TOKEN,
+        DEFAULT_EOS_TOKEN,
         DEFAULT_IMAGE_TOKEN,
+        DEFAULT_PAD_TOKEN,
         DEFAULT_TOOL_CALL_TOKEN,
         DEFAULT_TOOL_RESPONSE_TOKEN,
         DEFAULT_TOOLS_TOKEN,
+        DEFAULT_UNK_TOKEN,
         DEFAULT_VISION_END_TOKEN,
         DEFAULT_VISION_START_TOKEN,
         RWKVSpecialTokens,
@@ -66,10 +74,10 @@ class RwkvTokenizer(PreTrainedTokenizer):
     def __init__(
         self,
         vocab_file,
-        bos_token="\x16",
-        eos_token="\x17",
-        pad_token="\x17",
-        unk_token="\x16",
+        bos_token=DEFAULT_BOS_TOKEN,
+        eos_token=DEFAULT_EOS_TOKEN,
+        pad_token=DEFAULT_PAD_TOKEN,
+        unk_token=DEFAULT_UNK_TOKEN,
         chat_template=None,
         **kwargs,
     ):

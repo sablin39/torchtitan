@@ -14,6 +14,11 @@ from torchtitan.models.common import Linear
 from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
 from torchtitan.models.rwkv7 import rwkv7_backbones
 from torchtitan.models.rwkv7.model import RWKV7Backbone
+from torchtitan.models.rwkv7.tokenizer_core import (
+    DEFAULT_IMAGE_TOKEN_ID,
+    DEFAULT_VISION_END_TOKEN_ID,
+    DEFAULT_VISION_START_TOKEN_ID,
+)
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import RWKV7VLForConditionalGeneration, VisualAdapter
@@ -96,9 +101,7 @@ def _lm_head_config(*, hidden_size: int, vocab_size: int) -> Linear.Config:
         out_features=vocab_size,
         bias=False,
         param_init={
-            "weight": partial(
-                nn.init.trunc_normal_, std=std, a=-3 * std, b=3 * std
-            )
+            "weight": partial(nn.init.trunc_normal_, std=std, a=-3 * std, b=3 * std)
         },
     )
 
@@ -187,9 +190,9 @@ def _rwkv_vl_config(
             norm_eps=1e-5,
         ),
         lm_head=_lm_head_config(hidden_size=hidden_size, vocab_size=vocab_size),
-        image_token_id=65532,
-        vision_start_token_id=65530,
-        vision_end_token_id=65531,
+        image_token_id=DEFAULT_IMAGE_TOKEN_ID,
+        vision_start_token_id=DEFAULT_VISION_START_TOKEN_ID,
+        vision_end_token_id=DEFAULT_VISION_END_TOKEN_ID,
     )
 
 

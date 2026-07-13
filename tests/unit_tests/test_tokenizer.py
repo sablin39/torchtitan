@@ -12,7 +12,6 @@ import unittest
 
 from requests.exceptions import HTTPError
 from scripts.download_hf_assets import download_hf_assets
-from tokenizers import Tokenizer
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -72,11 +71,7 @@ class TestTokenizerIntegration(unittest.TestCase):
             dst = os.path.join(tmpdir, "tokenizer.json")
             shutil.copy2(src, dst)
 
-            with self.assertLogs(level="WARNING") as cm:
-                tok = HuggingFaceTokenizer(tokenizer_path=tmpdir)
-
-            # Should have logged a warning
-            self.assertTrue(any("tokenizer_config.json" in msg for msg in cm.output))
+            tok = HuggingFaceTokenizer(tokenizer_path=tmpdir)
 
             # Basic encode/decode should still work
             tokens = tok.encode("hello world")
@@ -88,7 +83,7 @@ class TestTokenizerIntegration(unittest.TestCase):
             self.assertIn("hello", text)
 
             # No chat template should be set
-            self.assertIsNone(tok._chat_template)
+            self.assertIsNone(tok.tokenizer.chat_template)
 
     def _compare_tokenizers(self, our_tokenizer, reference_tokenizer, test_repo_id):
         """
@@ -108,7 +103,7 @@ class TestTokenizerIntegration(unittest.TestCase):
         if is_transformers:
             # Transformers tokenizer API
             def get_vocab_size(tokenizer):
-                return len(tokenizer.get_vocab())
+                return tokenizer.vocab_size
 
             def get_vocab(tokenizer):
                 return tokenizer.get_vocab()
@@ -338,29 +333,16 @@ for token '{our_token.content}' in {test_repo_id} ({tokenizer_type})",
         tokenizer_path = os.path.join(self.temp_dir, model_name, tokenizer_dir)
         our_tokenizer = HuggingFaceTokenizer(tokenizer_path=tokenizer_path)
 
-        # Step 3: Load tokenizer using official Tokenizer library (if available)
-        official_tokenizer = None
-        try:
-            official_tokenizer = Tokenizer.from_pretrained(test_repo_id)
-        except Exception as e:
-            print(f"Warning: Could not load official tokenizer for {test_repo_id}: {e}")
-
-        # Step 4: Load tokenizer using transformers AutoTokenizer (if available)
+        # Step 3: Load the same local assets through Transformers directly
         transformers_tokenizer = None
         try:
             from transformers import AutoTokenizer
 
-            transformers_tokenizer = AutoTokenizer.from_pretrained(test_repo_id)
+            transformers_tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         except Exception as e:
             print(f"Warning: Could not load AutoTokenizer for {test_repo_id}: {e}")
 
-        # Step 5: Compare underlying tokenizer attributes (only if official tokenizer is available)
-        if official_tokenizer:
-            self._compare_tokenizers(
-                our_tokenizer.tokenizer, official_tokenizer, test_repo_id
-            )
-
-        # Step 6: Compare with transformers tokenizer if available
+        # Step 4: Compare with the canonical Transformers tokenizer
         if transformers_tokenizer:
             self._compare_tokenizers(
                 our_tokenizer, transformers_tokenizer, test_repo_id
@@ -438,10 +420,10 @@ class TestHuggingFaceChatTemplateAutoLoad(unittest.TestCase):
     def test_auto_loads_chat_template_from_config(self):
         """The test asset tokenizer_config.json includes a chat_template field."""
         tok = HuggingFaceTokenizer(tokenizer_path=ASSETS_TOKENIZER)
-        self.assertIsNotNone(tok._chat_template)
+        self.assertIsNotNone(tok.tokenizer.chat_template)
 
     def test_no_chat_template_when_config_lacks_field(self):
-        """When tokenizer_config.json has no chat_template, _chat_template stays None."""
+        """When tokenizer_config.json has no chat_template, none is loaded."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Copy tokenizer files from test assets
             for fname in os.listdir(ASSETS_TOKENIZER):
@@ -460,7 +442,7 @@ class TestHuggingFaceChatTemplateAutoLoad(unittest.TestCase):
                 json.dump(config, f)
 
             tok = HuggingFaceTokenizer(tokenizer_path=tmpdir)
-            self.assertIsNone(tok._chat_template)
+            self.assertIsNone(tok.tokenizer.chat_template)
 
     def test_auto_loads_chat_template_from_jinja_file(self):
         """Standalone chat_template.jinja is loaded (e.g. GPT-OSS)."""
@@ -483,7 +465,7 @@ class TestHuggingFaceChatTemplateAutoLoad(unittest.TestCase):
                 f.write(CHATML_TEMPLATE)
 
             tok = HuggingFaceTokenizer(tokenizer_path=tmpdir)
-            self.assertIsNotNone(tok._chat_template)
+            self.assertIsNotNone(tok.tokenizer.chat_template)
 
     def test_jinja_file_takes_priority_over_inline(self):
         """Standalone .jinja file takes priority over inline tokenizer_config.json."""

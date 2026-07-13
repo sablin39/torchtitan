@@ -7,7 +7,6 @@
 import importlib
 import json
 import os
-import shutil
 import sys
 import tempfile
 import unittest
@@ -16,27 +15,23 @@ from pathlib import Path
 import torch
 from datasets import Dataset
 from PIL import Image
-from scripts.rwkv7_exporter.export_hf_model import (
-    save_processor_core,
-    save_tokenizer_core,
-)
+from scripts.rwkv7_exporter.export_hf_model import save_remote_code_assets
 
 from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
     build_image_token_counts_by_message,
     MMChatCollator,
     MMChatDataLoader,
     MMChatDataset,
     normalize_mm_chat_sample,
-    process_mm_chat_images,
 )
 from torchtitan.hf_datasets.multimodal.processor_core import (
-    CHAT_TEMPLATE,
     process_images as process_rwkv_vl_images,
     RWKVVLImageProcessorConfig,
 )
+from torchtitan.models.rwkv7.tokenizer_core import CHAT_TEMPLATE
 from torchtitan.models.rwkv_vl import _vl_vision_encoder_config
-from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
 from transformers import BaseImageProcessor
 
 
@@ -70,11 +65,36 @@ def _write_tiny_rwkv_vocab(path: str) -> None:
             f.write(f"{token_id} {repr(token)} {len(token)}\n")
 
 
-def _make_tokenizer(tmpdir: str) -> RwkvVLMultiModalTokenizer:
+def _make_tokenizer(tmpdir: str) -> HuggingFaceTokenizer:
     _write_tiny_rwkv_vocab(os.path.join(tmpdir, "wr_vocab_v20230424.txt"))
+    save_remote_code_assets(tmpdir)
     with open(os.path.join(tmpdir, "chat_template.jinja"), "w") as f:
         f.write(CHAT_TEMPLATE)
-    return RwkvVLMultiModalTokenizer(tokenizer_path=tmpdir)
+    with open(os.path.join(tmpdir, "tokenizer_config.json"), "w") as f:
+        json.dump(
+            {
+                "auto_map": {
+                    "AutoTokenizer": ["tokenizer.RwkvTokenizer", None],
+                },
+                "tokenizer_class": "RwkvTokenizer",
+                "bos_token": "<|endoftext|>",
+                "eos_token": "✿",
+                "pad_token": "<|endoftext|>",
+                "unk_token": "<|endoftext|>",
+                "add_bos_token": False,
+                "add_eos_token": False,
+                "model_max_length": 8192,
+            },
+            f,
+        )
+    return HuggingFaceTokenizer(
+        config=HuggingFaceTokenizer.Config(
+            trust_remote_code=True,
+            chat_template_add_bos=False,
+            chat_template_append_eos=False,
+        ),
+        tokenizer_path=tmpdir,
+    )
 
 
 def _two_image_messages() -> list[dict]:
@@ -115,7 +135,7 @@ def _two_image_sample() -> dict:
 
 
 def _make_mm_chat_dataset(
-    tokenizer: RwkvVLMultiModalTokenizer,
+    tokenizer: HuggingFaceTokenizer,
     samples: list[dict],
     **overrides,
 ) -> MMChatDataset:
@@ -132,11 +152,7 @@ def _load_exported_remote_code(tmpdir: str):
     export_dir = Path(tmpdir) / "remote"
     export_dir.mkdir()
     (export_dir / "__init__.py").write_text("", encoding="utf-8")
-    exporter_dir = Path(__file__).parents[2] / "scripts" / "rwkv7_exporter"
-    shutil.copyfile(exporter_dir / "tokenizer.py", export_dir / "tokenizer.py")
-    shutil.copyfile(exporter_dir / "processor.py", export_dir / "processor.py")
-    save_tokenizer_core(str(export_dir))
-    save_processor_core(str(export_dir))
+    save_remote_code_assets(str(export_dir), include_processor=True)
     package_name = export_dir.name
     module_names = (
         package_name,
@@ -221,18 +237,8 @@ class TestRwkvVLTokenizer(unittest.TestCase):
         exporter_dir = repo_root / "scripts" / "rwkv7_exporter"
         self.assertFalse((exporter_dir / "processor_core.py").exists())
         self.assertFalse((exporter_dir / "tokenizer_core.py").exists())
-
-    def test_source_exporter_wrappers_use_live_cores(self):
-        import scripts.rwkv7_exporter.processor as exporter_processor
-        import scripts.rwkv7_exporter.tokenizer as exporter_tokenizer
-        import torchtitan.hf_datasets.multimodal.processor_core as processor_core
-        import torchtitan.models.rwkv7.tokenizer_core as tokenizer_core
-
-        self.assertIs(
-            exporter_tokenizer.RWKVTokenizerCore,
-            tokenizer_core.RWKVTokenizerCore,
-        )
-        self.assertIs(exporter_processor.process_images, processor_core.process_images)
+        self.assertFalse((exporter_dir / "processor.py").exists())
+        self.assertFalse((exporter_dir / "tokenizer.py").exists())
 
     def test_chat_template_renders_user_bot_turns(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -389,60 +395,20 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             self.assertEqual(rendered.count("# Tools"), 1)
             self.assertNotIn("You may call one or more functions", rendered)
 
-    def test_torchtitan_and_hf_exporter_tokenizers_align(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            HFRwkvTokenizer, _ = _load_exported_remote_code(tmpdir)
-            vocab_file = os.path.join(tmpdir, "wr_vocab_v20230424.txt")
-            _write_tiny_rwkv_vocab(vocab_file)
-            with open(os.path.join(tmpdir, "chat_template.jinja"), "w") as f:
-                f.write(CHAT_TEMPLATE)
-
-            tt_tok = RwkvVLMultiModalTokenizer(tokenizer_path=tmpdir)
-            hf_tok = HFRwkvTokenizer(
-                vocab_file=vocab_file,
-                bos_token="\x16",
-                eos_token="\x17",
-                pad_token="\x17",
-                unk_token="\x16",
-                chat_template=CHAT_TEMPLATE,
-            )
-            messages = _two_image_messages()
-            counts = [[1], [], [2], []]
-            tt_rendered = tt_tok.render_mm_chat(messages, counts)
-            hf_rendered = hf_tok.render_mm_chat(messages, counts)
-            self.assertEqual(tt_rendered, hf_rendered)
-            self.assertEqual(
-                tt_tok.encode(tt_rendered, add_bos=False, add_eos=False),
-                hf_tok.core.encode(hf_rendered, add_bos=False, add_eos=False),
-            )
-            self.assertEqual(
-                tt_tok.assistant_token_spans(messages, counts),
-                hf_tok.assistant_token_spans(messages, counts),
-            )
-            self.assertEqual(hf_tok.convert_tokens_to_ids("<tool_call>"), 65533)
-            self.assertEqual(hf_tok.convert_tokens_to_ids("<tool_response>"), 65534)
-            self.assertEqual(hf_tok.convert_tokens_to_ids("<tools>"), 65535)
-            additional = [
-                str(token) for token in getattr(hf_tok, "additional_special_tokens", [])
-            ]
-            self.assertIn("<tool_call>", additional)
-            self.assertIn("<tool_response>", additional)
-            self.assertIn("<tools>", additional)
-
     def test_expand_image_placeholders_adds_missing_and_drops_extra(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tok = _make_tokenizer(tmpdir)
             text = "\x16User:<image><image>hello\x17"
             expanded = tok.expand_image_placeholders(text, [2])
-            self.assertEqual(expanded.count(tok.core.vision_start_token), 1)
-            self.assertEqual(expanded.count(tok.core.vision_end_token), 1)
-            self.assertEqual(expanded.count(tok.core.image_token), 2)
+            self.assertEqual(expanded.count(tok.vision_start_token), 1)
+            self.assertEqual(expanded.count(tok.vision_end_token), 1)
+            self.assertEqual(expanded.count(tok.image_token), 2)
             self.assertNotIn("<image>", expanded)
 
             expanded = tok.expand_image_placeholders("\x16User:hello\x17", [1, 3])
-            self.assertEqual(expanded.count(tok.core.vision_start_token), 2)
-            self.assertEqual(expanded.count(tok.core.vision_end_token), 2)
-            self.assertEqual(expanded.count(tok.core.image_token), 4)
+            self.assertEqual(expanded.count(tok.vision_start_token), 2)
+            self.assertEqual(expanded.count(tok.vision_end_token), 2)
+            self.assertEqual(expanded.count(tok.image_token), 4)
 
     def test_image_count_builder_caps_extra_tags_and_prepends_missing(self):
         messages = [
@@ -482,10 +448,6 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             _write_tiny_rwkv_vocab(vocab_file)
             hf_tok = HFRwkvTokenizer(
                 vocab_file=vocab_file,
-                bos_token="\x16",
-                eos_token="\x17",
-                pad_token="\x17",
-                unk_token="\x16",
                 chat_template=CHAT_TEMPLATE,
             )
             processor = ModRWKVProcessor(
@@ -524,51 +486,18 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 2,
             )
 
-    def test_hf_exporter_processor_requires_local_core_copy(self):
+    def test_hf_exporter_copies_remote_code_dependencies(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            HFRwkvTokenizer, ModRWKVProcessor = _load_exported_remote_code(tmpdir)
-            vocab_file = os.path.join(tmpdir, "wr_vocab_v20230424.txt")
-            _write_tiny_rwkv_vocab(vocab_file)
-            hf_tok = HFRwkvTokenizer(
-                vocab_file=vocab_file,
-                bos_token="\x16",
-                eos_token="\x17",
-                pad_token="\x17",
-                unk_token="\x16",
-                chat_template=CHAT_TEMPLATE,
-            )
-            processor = ModRWKVProcessor(
-                tokenizer=hf_tok,
-                image_processor=TinyImageProcessor(),
-            )
             output_dir = os.path.join(tmpdir, "exported")
-            save_processor_core(output_dir)
-            processor.save_pretrained(output_dir)
-            self.assertTrue(os.path.isfile(os.path.join(output_dir, "processor.py")))
-            self.assertTrue(
-                os.path.isfile(os.path.join(output_dir, "processor_core.py"))
-            )
-
-    def test_hf_exporter_tokenizer_requires_local_core_copy(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            HFRwkvTokenizer, _ = _load_exported_remote_code(tmpdir)
-            vocab_file = os.path.join(tmpdir, "wr_vocab_v20230424.txt")
-            _write_tiny_rwkv_vocab(vocab_file)
-            hf_tok = HFRwkvTokenizer(
-                vocab_file=vocab_file,
-                bos_token="\x16",
-                eos_token="\x17",
-                pad_token="\x17",
-                unk_token="\x16",
-                chat_template=CHAT_TEMPLATE,
-            )
-            hf_tok.register_for_auto_class("AutoTokenizer")
-            output_dir = os.path.join(tmpdir, "exported")
-            save_tokenizer_core(output_dir)
-            hf_tok.save_pretrained(output_dir)
-            self.assertTrue(os.path.isfile(os.path.join(output_dir, "tokenizer.py")))
-            self.assertTrue(
-                os.path.isfile(os.path.join(output_dir, "tokenizer_core.py"))
+            save_remote_code_assets(output_dir, include_processor=True)
+            self.assertEqual(
+                set(os.listdir(output_dir)),
+                {
+                    "tokenizer.py",
+                    "tokenizer_core.py",
+                    "processor.py",
+                    "processor_core.py",
+                },
             )
 
     def test_max_pixels_reduces_actual_patch_and_token_counts_for_odd_sizes(self):
@@ -618,7 +547,9 @@ class TestRwkvVLTokenizer(unittest.TestCase):
             self.assertEqual(tok.image_id, 65532)
             self.assertEqual(tok.vision_start_id, 65530)
             self.assertEqual(tok.vision_end_id, 65531)
-            self.assertEqual(tok.pad_id, 24)
+            self.assertEqual(tok.bos_id, 0)
+            self.assertEqual(tok.eos_id, 10060)
+            self.assertEqual(tok.pad_id, 0)
             self.assertEqual(tok.image_placeholder_token, "<image>")
 
     def test_render_mm_chat_expands_image_placeholders(self):
@@ -1281,19 +1212,21 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertEqual(sample["pixel_values"].dtype, torch.bfloat16)
 
     def test_mm_chat_image_processing_uses_shared_pixel_budget(self):
-        processed = process_mm_chat_images(
+        processed = process_rwkv_vl_images(
             [
                 Image.new("RGB", (128, 128), color="red"),
                 Image.new("RGB", (128, 128), color="blue"),
             ],
-            patch_size=16,
-            temporal_patch_size=2,
-            spatial_merge_size=2,
-            min_pixels=1024,
-            max_pixels=4096,
-            image_mean=(0.5, 0.5, 0.5),
-            image_std=(0.5, 0.5, 0.5),
-            max_aspect_ratio=50.0,
+            RWKVVLImageProcessorConfig(
+                patch_size=16,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+                min_pixels=1024,
+                max_pixels=4096,
+                image_mean=(0.5, 0.5, 0.5),
+                image_std=(0.5, 0.5, 0.5),
+                max_aspect_ratio=50.0,
+            ),
         )
         self.assertEqual(processed.grid_thw.shape[0], 2)
         self.assertLessEqual(

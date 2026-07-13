@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 import os
 import tempfile
 import unittest
@@ -11,6 +12,8 @@ import unittest
 import torch
 import torchtitan.models.rwkv_vl.config_registry as rwkv_vl_config_registry
 import torchtitan.models.rwkv_vl.parallelize as rwkv_vl_parallelize
+from scripts.rwkv7_exporter.export_hf_model import save_remote_code_assets
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config.manager import ConfigManager
 
 from torchtitan.distributed.context_parallel import _build_flattened_cu_seqlens
@@ -21,14 +24,12 @@ from torchtitan.models.rwkv7.model import (
     RWKV7MoEChannelMix,
 )
 from torchtitan.models.rwkv7.state_dict_adapter import RWKV7StateDictAdapter
-from torchtitan.models.rwkv7.tokenizer import RwkvTokenizer
 from torchtitan.models.rwkv_vl import (
     model_registry as rwkv_vl_model_registry,
     rwkv_vl_configs,
 )
 from torchtitan.models.rwkv_vl.model import VisualAdapter
 from torchtitan.models.rwkv_vl.state_dict_adapter import RWKVVLStateDictAdapter
-from torchtitan.models.rwkv_vl.tokenizer import RwkvVLMultiModalTokenizer
 
 
 def _write_tiny_rwkv_vocab(path: str) -> None:
@@ -47,6 +48,39 @@ def _write_tiny_rwkv_vocab(path: str) -> None:
             (65535, b"<tools>"),
         ):
             f.write(f"{token_id} {repr(token)} {len(token)}\n")
+
+
+def _write_tiny_rwkv_tokenizer_assets(path: str) -> None:
+    _write_tiny_rwkv_vocab(os.path.join(path, "wr_vocab_v20230424.txt"))
+    save_remote_code_assets(path)
+    with open(os.path.join(path, "tokenizer_config.json"), "w") as f:
+        json.dump(
+            {
+                "auto_map": {
+                    "AutoTokenizer": ["tokenizer.RwkvTokenizer", None],
+                },
+                "tokenizer_class": "RwkvTokenizer",
+                "bos_token": "<|endoftext|>",
+                "eos_token": "✿",
+                "pad_token": "<|endoftext|>",
+                "unk_token": "<|endoftext|>",
+                "add_bos_token": False,
+                "add_eos_token": False,
+                "model_max_length": 8192,
+            },
+            f,
+        )
+
+
+def _make_rwkv_tokenizer(path: str) -> HuggingFaceTokenizer:
+    return HuggingFaceTokenizer(
+        config=HuggingFaceTokenizer.Config(
+            trust_remote_code=True,
+            chat_template_add_bos=False,
+            chat_template_append_eos=False,
+        ),
+        tokenizer_path=path,
+    )
 
 
 class TestRWKV7Backend(unittest.TestCase):
@@ -498,15 +532,26 @@ class TestRWKVTokenizer(unittest.TestCase):
                     (65532, b"<|image_pad|>"),
                 ):
                     f.write(f"{token_id} {repr(token)} {len(token)}\n")
-            tok = RwkvTokenizer(tokenizer_path=tmpdir)
+            save_remote_code_assets(tmpdir)
+            with open(os.path.join(tmpdir, "tokenizer_config.json"), "w") as f:
+                json.dump(
+                    {
+                        "auto_map": {
+                            "AutoTokenizer": ["tokenizer.RwkvTokenizer", None],
+                        },
+                        "tokenizer_class": "RwkvTokenizer",
+                    },
+                    f,
+                )
+            tok = _make_rwkv_tokenizer(tmpdir)
             ids = tok.encode("<tool_call>x</tool_call>")
             self.assertIn(65533, ids)
             self.assertEqual(tok.decode(ids), "<tool_call>x</tool_call>")
 
     def test_rwkv_tokenizer_preserves_sparse_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            _write_tiny_rwkv_vocab(os.path.join(tmpdir, "wr_vocab_v20230424.txt"))
-            tok = RwkvTokenizer(tokenizer_path=tmpdir)
+            _write_tiny_rwkv_tokenizer_assets(tmpdir)
+            tok = _make_rwkv_tokenizer(tmpdir)
             self.assertEqual(tok.get_vocab_size(), 65536)
             self.assertEqual(tok.image_id, 65532)
             self.assertEqual(tok.vision_start_id, 65530)
@@ -522,13 +567,15 @@ class TestRWKVTokenizer(unittest.TestCase):
 
     def test_rwkv_multimodal_tokenizer_has_no_video_field(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            _write_tiny_rwkv_vocab(os.path.join(tmpdir, "wr_vocab_v20230424.txt"))
-            tok = RwkvVLMultiModalTokenizer(tokenizer_path=tmpdir)
+            _write_tiny_rwkv_tokenizer_assets(tmpdir)
+            tok = _make_rwkv_tokenizer(tmpdir)
             self.assertEqual(
                 tok.TOKEN_FIELDS, ("image", "vision_start", "vision_end", "pad")
             )
             self.assertFalse(hasattr(tok, "video_id"))
-            self.assertEqual(tok.pad_id, 24)
+            self.assertEqual(tok.bos_id, 0)
+            self.assertEqual(tok.eos_id, 10060)
+            self.assertEqual(tok.pad_id, 0)
 
 
 if __name__ == "__main__":

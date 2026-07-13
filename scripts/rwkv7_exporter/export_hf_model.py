@@ -40,18 +40,21 @@ try:
 except ImportError:
     from configuration_rwkv7 import RWKV7Config
     from modeling_rwkv7 import RWKV7ForCausalLM
-from torchtitan.models.rwkv7.tokenizer_core import (
+from torchtitan.models.rwkv7.tokenizer_core import (  # noqa: E402
+    CHAT_TEMPLATE,
     DEFAULT_BOS_TOKEN,
+    DEFAULT_BOS_TOKEN_ID,
     DEFAULT_EOS_TOKEN,
+    DEFAULT_EOS_TOKEN_IDS,
     DEFAULT_IMAGE_TOKEN_ID,
+    DEFAULT_PAD_TOKEN,
+    DEFAULT_PAD_TOKEN_ID,
+    DEFAULT_UNK_TOKEN,
     DEFAULT_VISION_END_TOKEN_ID,
     DEFAULT_VISION_START_TOKEN_ID,
 )
-from torchtitan.hf_datasets.multimodal.processor_core import CHAT_TEMPLATE
 
 
-IM_START_TOKEN_ID = 23
-IM_END_TOKEN_ID = 24
 DEFAULT_MAX_SHARD_SIZE = "1000GB"
 VISION_PREFIXES = (
     "model.visual.",
@@ -112,26 +115,30 @@ def resolve_vocab_file(name: str) -> Path:
     raise FileNotFoundError(f"Could not find RWKV vocab file. Checked:\n{formatted}")
 
 
-def save_tokenizer_core(output: str) -> None:
-    import torchtitan.models.rwkv7.tokenizer_core as tokenizer_core
-
-    source = Path(tokenizer_core.__file__)
+def _copy_module_source(module_name: str, destination: Path) -> None:
+    module = importlib.import_module(module_name)
+    source = Path(module.__file__)
     if not source.is_file():
-        raise FileNotFoundError(f"Could not find tokenizer_core.py at {source}")
+        raise FileNotFoundError(f"Could not find source for {module_name} at {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+
+
+_REMOTE_CODE_ASSETS = {
+    "tokenizer.py": "torchtitan.models.rwkv7.hf_tokenizer",
+    "tokenizer_core.py": "torchtitan.models.rwkv7.tokenizer_core",
+    "processor.py": "torchtitan.hf_datasets.multimodal.hf_processor",
+    "processor_core.py": "torchtitan.hf_datasets.multimodal.processor_core",
+}
+
+
+def save_remote_code_assets(output: str, *, include_processor: bool = False) -> None:
     output_path = Path(output)
-    output_path.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, output_path / "tokenizer_core.py")
-
-
-def save_processor_core(output: str) -> None:
-    import torchtitan.hf_datasets.multimodal.processor_core as processor_core
-
-    source = Path(processor_core.__file__)
-    if not source.is_file():
-        raise FileNotFoundError(f"Could not find processor_core.py at {source}")
-    output_path = Path(output)
-    output_path.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, output_path / "processor_core.py")
+    filenames = ["tokenizer.py", "tokenizer_core.py"]
+    if include_processor:
+        filenames.extend(["processor.py", "processor_core.py"])
+    for filename in filenames:
+        _copy_module_source(_REMOTE_CODE_ASSETS[filename], output_path / filename)
 
 
 def save_chat_template(output: str) -> None:
@@ -152,16 +159,8 @@ def _remote_code_package(*, include_processor: bool = False):
         package_dir = Path(tmpdir) / package_name
         package_dir.mkdir()
         (package_dir / "__init__.py").write_text("", encoding="utf-8")
-        shutil.copyfile(
-            Path(__file__).with_name("tokenizer.py"), package_dir / "tokenizer.py"
-        )
-        save_tokenizer_core(str(package_dir))
+        save_remote_code_assets(str(package_dir), include_processor=include_processor)
         if include_processor:
-            shutil.copyfile(
-                Path(__file__).with_name("processor.py"),
-                package_dir / "processor.py",
-            )
-            save_processor_core(str(package_dir))
             module_names.extend(
                 [f"{package_name}.processor", f"{package_name}.processor_core"]
             )
@@ -255,9 +254,9 @@ def build_config(
         a_low_rank_dim=a_low_rank_dim,
         v_low_rank_dim=v_low_rank_dim,
         max_position_embeddings=max_position_embeddings,
-        bos_token_id=IM_START_TOKEN_ID,
-        eos_token_id=IM_END_TOKEN_ID,
-        pad_token_id=IM_END_TOKEN_ID,
+        bos_token_id=DEFAULT_BOS_TOKEN_ID,
+        eos_token_id=list(DEFAULT_EOS_TOKEN_IDS),
+        pad_token_id=DEFAULT_PAD_TOKEN_ID,
         fuse_cross_entropy=False,
         fuse_linear_cross_entropy=False,
     )
@@ -725,10 +724,10 @@ def save_multimodal_processor(
 
         tokenizer = VLRwkvTokenizer(
             vocab_file=str(resolve_vocab_file("wr_vocab_v20230424.txt")),
-            bos_token="\x16",
-            eos_token="\x17",
-            pad_token="\x17",
-            unk_token="\x16",
+            bos_token=DEFAULT_BOS_TOKEN,
+            eos_token=DEFAULT_EOS_TOKEN,
+            pad_token=DEFAULT_PAD_TOKEN,
+            unk_token=DEFAULT_UNK_TOKEN,
             padding_side="left",
         )
         image_processor = AutoImageProcessor.from_pretrained(
@@ -751,8 +750,7 @@ def save_multimodal_processor(
         )
         processor.save_pretrained(output)
         save_chat_template(output)
-        save_tokenizer_core(output)
-        save_processor_core(output)
+        save_remote_code_assets(output, include_processor=True)
 
 
 def verify_text_export(
@@ -864,14 +862,14 @@ def convert(
             vocab_file=str(resolve_vocab_file("wr_vocab_v20230424.txt")),
             bos_token=DEFAULT_BOS_TOKEN,
             eos_token=DEFAULT_EOS_TOKEN,
-            pad_token=DEFAULT_EOS_TOKEN,
-            unk_token=DEFAULT_BOS_TOKEN,
+            pad_token=DEFAULT_PAD_TOKEN,
+            unk_token=DEFAULT_UNK_TOKEN,
             padding_side="left",
         )
         tokenizer.register_for_auto_class()
         tokenizer.save_pretrained(output)
         save_chat_template(output)
-        save_tokenizer_core(output)
+        save_remote_code_assets(output)
 
     print(f"Saved text-only HF checkpoint to {output}")
     verify_text_export(output, dtype=dtype, verify_model_load=verify_model_load)

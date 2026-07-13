@@ -8,13 +8,13 @@ import unittest
 
 import torch
 
-from torchtitan.components.tokenizer import MultiModalTokenizer
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMDataLoader
 
 
 _TOKENIZER_PATH = "tests/assets/tokenizer"
 
-_TOKENIZER_CONFIG = MultiModalTokenizer.Config(
+_TOKENIZER_CONFIG = HuggingFaceTokenizer.Config(
     image_token="<|image_pad|>",
     video_token="<|video_pad|>",
     vision_start_token="<|vision_start|>",

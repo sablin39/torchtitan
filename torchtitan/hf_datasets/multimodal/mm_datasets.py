@@ -74,14 +74,14 @@ from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.components.tokenizer import MultiModalTokenizer
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 from .mm_collator import MultiModalCollator
 from .processor_core import (
-    RWKVVLImageProcessorConfig,
     process_images as process_rwkv_vl_images,
+    RWKVVLImageProcessorConfig,
 )
 from .utils.packing import MMSamplePacker
 from .utils.text import insert_vision_placeholders
@@ -90,7 +90,7 @@ from .utils.text import insert_vision_placeholders
 def _process_mm_sample(
     texts: list[str | None],
     images: list[bytes | None],
-    tokenizer: MultiModalTokenizer,
+    tokenizer: HuggingFaceTokenizer,
     patch_size: int,
     temporal_patch_size: int,
     spatial_merge_size: int,
@@ -195,7 +195,7 @@ def _process_mm_sample(
 
 def _process_obelics_sample(
     sample: dict[str, Any],
-    tokenizer: MultiModalTokenizer,
+    tokenizer: HuggingFaceTokenizer,
     patch_size: int,
     temporal_patch_size: int,
     spatial_merge_size: int,
@@ -222,7 +222,7 @@ def _process_obelics_sample(
 
 def _process_cc12_wd_sample(
     sample: dict[str, Any],
-    tokenizer: MultiModalTokenizer,
+    tokenizer: HuggingFaceTokenizer,
     patch_size: int,
     temporal_patch_size: int,
     spatial_merge_size: int,
@@ -297,7 +297,7 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
         self,
         dataset_name: str,
         dataset_path: str | None,
-        tokenizer: MultiModalTokenizer,
+        tokenizer: HuggingFaceTokenizer,
         batch_size: int,
         seq_len: int,
         patch_size: int,
@@ -530,7 +530,7 @@ class MMDataLoader(ParallelAwareDataloader):
         *,
         dp_world_size: int,
         dp_rank: int,
-        tokenizer: MultiModalTokenizer,
+        tokenizer: HuggingFaceTokenizer,
         seq_len: int,
         local_batch_size: int,
         **kwargs,
