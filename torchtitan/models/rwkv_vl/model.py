@@ -34,7 +34,7 @@ from torchtitan.models.rwkv7.model import (
     LayerNorm,
     RWKV7Backbone,
 )
-from torchtitan.models.rwkv7.tokenizer_core import (
+from torchtitan.models.rwkv7.tokenizer import (
     DEFAULT_IMAGE_TOKEN_ID,
     DEFAULT_VISION_END_TOKEN_ID,
     DEFAULT_VISION_START_TOKEN_ID,

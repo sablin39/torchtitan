@@ -26,11 +26,11 @@ from torchtitan.hf_datasets.multimodal.mm_chat_datasets import (
     MMChatDataset,
     normalize_mm_chat_sample,
 )
-from torchtitan.hf_datasets.multimodal.processor_core import (
+from torchtitan.hf_datasets.multimodal.processor import (
     process_images as process_rwkv_vl_images,
     RWKVVLImageProcessorConfig,
 )
-from torchtitan.models.rwkv7.tokenizer_core import CHAT_TEMPLATE
+from torchtitan.models.rwkv7.tokenizer import CHAT_TEMPLATE
 from torchtitan.models.rwkv_vl import _vl_vision_encoder_config
 from transformers import BaseImageProcessor
 
@@ -157,9 +157,7 @@ def _load_exported_remote_code(tmpdir: str):
     module_names = (
         package_name,
         f"{package_name}.tokenizer",
-        f"{package_name}.tokenizer_core",
         f"{package_name}.processor",
-        f"{package_name}.processor_core",
     )
     sys.path.insert(0, str(export_dir.parent))
     try:
@@ -167,17 +165,6 @@ def _load_exported_remote_code(tmpdir: str):
             sys.modules.pop(module_name, None)
         tokenizer_module = importlib.import_module(f"{package_name}.tokenizer")
         processor_module = importlib.import_module(f"{package_name}.processor")
-        tokenizer_core_module = importlib.import_module(
-            f"{package_name}.tokenizer_core"
-        )
-        processor_core_module = importlib.import_module(
-            f"{package_name}.processor_core"
-        )
-        assert (
-            tokenizer_module.RWKVTokenizerCore
-            is tokenizer_core_module.RWKVTokenizerCore
-        )
-        assert processor_module.process_images is processor_core_module.process_images
         return tokenizer_module.RwkvTokenizer, processor_module.ModRWKVProcessor
     finally:
         sys.path.remove(str(export_dir.parent))
@@ -494,9 +481,7 @@ class TestRwkvVLTokenizer(unittest.TestCase):
                 set(os.listdir(output_dir)),
                 {
                     "tokenizer.py",
-                    "tokenizer_core.py",
                     "processor.py",
-                    "processor_core.py",
                 },
             )
 

@@ -14,7 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.hf_datasets.multimodal.processor_core import vision_to_patches
+from torchtitan.hf_datasets.multimodal.processor import vision_to_patches
 from torchtitan.tools.logging import logger
 from .utils.text import pad_batch_dim, pad_seq_len
 

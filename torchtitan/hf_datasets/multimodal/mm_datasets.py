@@ -79,12 +79,12 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 from .mm_collator import MultiModalCollator
-from .processor_core import (
+from .processor import (
+    insert_vision_placeholders,
     process_images as process_rwkv_vl_images,
     RWKVVLImageProcessorConfig,
 )
 from .utils.packing import MMSamplePacker
-from .utils.text import insert_vision_placeholders
 
 
 def _process_mm_sample(

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
-from dataclasses import dataclass
 from typing import Any
+
+from transformers import AddedToken, PreTrainedTokenizer
 
 
 DEFAULT_VOCAB_SIZE = 65536
@@ -38,6 +40,19 @@ DEFAULT_IMAGE_TOKEN_ID = 65532
 DEFAULT_TOOL_CALL_TOKEN_ID = 65533
 DEFAULT_TOOL_RESPONSE_TOKEN_ID = 65534
 DEFAULT_TOOLS_TOKEN_ID = 65535
+
+VOCAB_FILES_NAMES = {
+    "vocab_file": "wr_vocab_v20230424.txt",
+}
+
+DEFAULT_ADDITIONAL_SPECIAL_TOKENS = [
+    DEFAULT_VISION_START_TOKEN,
+    DEFAULT_VISION_END_TOKEN,
+    DEFAULT_IMAGE_TOKEN,
+    DEFAULT_TOOL_CALL_TOKEN,
+    DEFAULT_TOOL_RESPONSE_TOKEN,
+    DEFAULT_TOOLS_TOKEN,
+]
 
 CHAT_TEMPLATE = r"""
 {%- macro render_tools_block(tools) -%}
@@ -154,18 +169,6 @@ SPECIAL_TOKEN_ID_TO_TEXT = {
 }
 
 
-@dataclass(frozen=True)
-class RWKVSpecialTokens:
-    bos_token: str = DEFAULT_BOS_TOKEN
-    eos_token: str = DEFAULT_EOS_TOKEN
-    pad_token: str = DEFAULT_PAD_TOKEN
-    unk_token: str = DEFAULT_UNK_TOKEN
-    image_token: str = DEFAULT_IMAGE_TOKEN
-    vision_start_token: str = DEFAULT_VISION_START_TOKEN
-    vision_end_token: str = DEFAULT_VISION_END_TOKEN
-    image_placeholder_token: str = DEFAULT_IMAGE_PLACEHOLDER_TOKEN
-
-
 class ByteTrie:
     __slots__ = ("children", "token")
 
@@ -275,23 +278,48 @@ def build_chat_template(template: str):
     return env.from_string(template)
 
 
-class RWKVTokenizerCore:
+def _token_content(token):
+    return getattr(token, "content", token)
+
+
+class RwkvTokenizer(PreTrainedTokenizer):
+    vocab_files_names = VOCAB_FILES_NAMES
+    model_input_names = ["input_ids", "attention_mask"]
+
     def __init__(
         self,
-        vocab_file: str,
-        *,
-        vocab_size: int = DEFAULT_VOCAB_SIZE,
-        special_tokens: RWKVSpecialTokens | None = None,
-        add_bos_token: bool = False,
-        add_eos_token: bool = False,
-        chat_template: str | None = None,
-    ) -> None:
+        vocab_file,
+        bos_token=DEFAULT_BOS_TOKEN,
+        eos_token=DEFAULT_EOS_TOKEN,
+        pad_token=DEFAULT_PAD_TOKEN,
+        unk_token=DEFAULT_UNK_TOKEN,
+        chat_template=None,
+        **kwargs,
+    ):
+        if not os.path.isfile(vocab_file):
+            raise ValueError(f"Can't find a vocabulary file at path '{vocab_file}'.")
+
+        bos_token = _token_content(bos_token)
+        eos_token = _token_content(eos_token)
+        pad_token = _token_content(pad_token)
+        unk_token = _token_content(unk_token)
+
         self.vocab_file = vocab_file
-        self.vocab_size = vocab_size
-        self.special_tokens = special_tokens or RWKVSpecialTokens()
-        self.default_add_bos = add_bos_token
-        self.default_add_eos = add_eos_token
+        self._vocab_size = DEFAULT_VOCAB_SIZE
+        self.add_bos_token = bool(kwargs.pop("add_bos_token", False))
+        self.add_eos_token = bool(kwargs.pop("add_eos_token", False))
+        self.chat_template = CHAT_TEMPLATE if chat_template is None else chat_template
+        self.image_token = DEFAULT_IMAGE_TOKEN
+        self.vision_start_token = DEFAULT_VISION_START_TOKEN
+        self.vision_end_token = DEFAULT_VISION_END_TOKEN
+        self.image_placeholder_token = DEFAULT_IMAGE_PLACEHOLDER_TOKEN
+        self.vision_image_token = (
+            f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
+        )
+
         self.idx2token, self.token2idx = load_rwkv_vocab(vocab_file)
+        self.encoder = self.token2idx
+        self.decoder = self.idx2token
         self.root = ByteTrie()
         for token, token_id in self.token2idx.items():
             self.root.add(token, token_id)
@@ -299,23 +327,23 @@ class RWKVTokenizerCore:
         self.special_token_text_to_id = dict(SPECIAL_TOKEN_TEXT_TO_ID)
         self.special_token_id_to_text = dict(SPECIAL_TOKEN_ID_TO_TEXT)
 
-        self.bos_id = self.token_to_id(self.special_tokens.bos_token)
-        self.eos_id = self.token_to_id(self.special_tokens.eos_token)
-        self.pad_id = self.token_to_id(self.special_tokens.pad_token)
-        self.unk_id = self.token_to_id(self.special_tokens.unk_token)
-        self.image_id = self.token_to_id(self.special_tokens.image_token)
-        self.vision_start_id = self.token_to_id(self.special_tokens.vision_start_token)
-        self.vision_end_id = self.token_to_id(self.special_tokens.vision_end_token)
+        self.bos_id = self.token_to_id(bos_token)
+        self.eos_id = self.token_to_id(eos_token)
+        self.pad_id = self.token_to_id(pad_token)
+        self.unk_id = self.token_to_id(unk_token)
+        self.image_id = self.token_to_id(self.image_token)
+        self.vision_start_id = self.token_to_id(self.vision_start_token)
+        self.vision_end_id = self.token_to_id(self.vision_end_token)
 
         pattern_tokens = {
             *self.special_token_text_to_id,
-            self.special_tokens.bos_token,
-            self.special_tokens.eos_token,
-            self.special_tokens.pad_token,
-            self.special_tokens.unk_token,
-            self.special_tokens.image_token,
-            self.special_tokens.vision_start_token,
-            self.special_tokens.vision_end_token,
+            bos_token,
+            eos_token,
+            pad_token,
+            unk_token,
+            self.image_token,
+            self.vision_start_token,
+            self.vision_end_token,
         }
         pattern = "|".join(
             re.escape(token)
@@ -324,55 +352,66 @@ class RWKVTokenizerCore:
         )
         self.special_token_pattern = re.compile(f"({pattern})") if pattern else None
 
-        self._chat_template = None
-        if chat_template is not None:
-            self.set_chat_template(chat_template)
+        self._render_template = build_chat_template(self.chat_template)
 
-    @property
-    def image_token(self) -> str:
-        return self.special_tokens.image_token
+        self._added_tokens_encoder = {}
+        self._added_tokens_decoder = {}
+        for token_text, token_id in self.special_token_text_to_id.items():
+            self._added_tokens_encoder[token_text] = token_id
+            self._added_tokens_decoder[token_id] = AddedToken(token_text, special=True)
+        for token in {bos_token, eos_token, pad_token, unk_token}:
+            if token is None:
+                continue
+            token_id = self.token_to_id(str(token))
+            if token_id is not None:
+                self._added_tokens_encoder[str(token)] = token_id
+                self._added_tokens_decoder[token_id] = AddedToken(
+                    str(token), special=True
+                )
 
-    @property
-    def vision_start_token(self) -> str:
-        return self.special_tokens.vision_start_token
+        additional_special_tokens = kwargs.pop(
+            "additional_special_tokens",
+            DEFAULT_ADDITIONAL_SPECIAL_TOKENS,
+        )
+        kwargs.setdefault("padding_side", "left")
+        super().__init__(
+            bos_token=bos_token,
+            eos_token=eos_token,
+            pad_token=pad_token,
+            unk_token=unk_token,
+            additional_special_tokens=additional_special_tokens,
+            chat_template=self.chat_template,
+            **kwargs,
+        )
+        self.additional_special_tokens = list(additional_special_tokens)
 
-    @property
-    def vision_end_token(self) -> str:
-        return self.special_tokens.vision_end_token
-
-    @property
-    def image_placeholder_token(self) -> str:
-        return self.special_tokens.image_placeholder_token
-
-    @property
-    def vision_image_token(self) -> str:
-        return f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
+        self.image_token_id = self.convert_tokens_to_ids(self.image_token)
+        self.vision_start_token_id = self.convert_tokens_to_ids(self.vision_start_token)
+        self.vision_end_token_id = self.convert_tokens_to_ids(self.vision_end_token)
+        self.image_id = self.image_token_id
+        self.vision_start_id = self.vision_start_token_id
+        self.vision_end_id = self.vision_end_token_id
 
     def template_kwargs(self) -> dict[str, Any]:
         return {
-            "bos_token": self.special_tokens.bos_token,
-            "eos_token": self.special_tokens.eos_token,
-            "pad_token": self.special_tokens.pad_token,
-            "unk_token": self.special_tokens.unk_token,
+            "bos_token": self.bos_token,
+            "eos_token": self.eos_token,
+            "pad_token": self.pad_token,
+            "unk_token": self.unk_token,
             "image_token": self.image_token,
             "vision_start_token": self.vision_start_token,
             "vision_end_token": self.vision_end_token,
             "image_placeholder_token": self.image_placeholder_token,
         }
 
-    def set_chat_template(self, template: str) -> None:
-        self._chat_template = build_chat_template(template)
-
     def render_chat_template(
         self,
         messages: list[dict[str, Any]],
         **kwargs,
     ) -> str:
-        if self._chat_template is None:
-            raise ValueError("No chat template set. Call set_chat_template() first.")
         template_kwargs = self.template_kwargs()
         template_kwargs.update(kwargs)
-        return self._chat_template.render(messages=messages, **template_kwargs)
+        return self._render_template.render(messages=messages, **template_kwargs)
 
     def _encode_bytes(self, data: bytes) -> list[int]:
         idx = 0
@@ -382,7 +421,7 @@ class RWKVTokenizerCore:
             tokens.append(token_id)
         return tokens
 
-    def encode(
+    def _encode_text(
         self,
         text: str,
         *,
@@ -390,9 +429,9 @@ class RWKVTokenizerCore:
         add_eos: bool | None = None,
     ) -> list[int]:
         if add_bos is None:
-            add_bos = self.default_add_bos
+            add_bos = self.add_bos_token
         if add_eos is None:
-            add_eos = self.default_add_eos
+            add_eos = self.add_eos_token
 
         tokens: list[int] = []
         chunks = (
@@ -414,12 +453,6 @@ class RWKVTokenizerCore:
             tokens.append(self.eos_id)
         return tokens
 
-    def decode(self, token_ids: list[int] | tuple[int, ...]) -> str:
-        return b"".join(self.idx2token[int(i)] for i in token_ids).decode(
-            "utf-8",
-            errors="replace",
-        )
-
     def token_to_id(self, token: str | bytes | int) -> int | None:
         if isinstance(token, int):
             return token
@@ -437,18 +470,88 @@ class RWKVTokenizerCore:
         return token.decode("utf-8", errors="replace")
 
     def get_vocab(self) -> dict[str, int]:
-        return {
+        vocab = {
             token.decode("utf-8", errors="replace"): idx
             for idx, token in enumerate(self.idx2token)
             if token
         }
+        vocab.update(getattr(self, "_added_tokens_encoder", {}))
+        return dict(sorted(vocab.items(), key=lambda item: item[1]))
 
-    def save_vocabulary(self, vocab_file: str) -> None:
+    @property
+    def vocab_size(self):
+        return self._vocab_size
+
+    def _tokenize(self, text, split_special_tokens=False):
+        del split_special_tokens
+        return self._encode_text(text, add_bos=False, add_eos=False)
+
+    def _convert_token_to_id(self, token):
+        token_id = self.token_to_id(token)
+        return token_id if token_id is not None else self.unk_token_id
+
+    def _convert_id_to_token(self, index):
+        token = self.id_to_token(int(index))
+        return token if token is not None else self.unk_token
+
+    def convert_tokens_to_string(self, tokens):
+        return "".join(
+            token.decode("utf-8", errors="replace")
+            if isinstance(token, bytes)
+            else str(token)
+            for token in tokens
+        )
+
+    def save_vocabulary(
+        self,
+        save_directory: str,
+        filename_prefix: str | None = None,
+    ) -> tuple[str]:
+        if os.path.isdir(save_directory):
+            vocab_file = os.path.join(
+                save_directory,
+                (filename_prefix + "-" if filename_prefix else "")
+                + VOCAB_FILES_NAMES["vocab_file"],
+            )
+        else:
+            vocab_file = (
+                filename_prefix + "-" if filename_prefix else ""
+            ) + save_directory
         with open(vocab_file, "w", encoding="utf-8") as writer:
             for token_index, token in enumerate(self.idx2token):
                 if not token:
                     continue
                 writer.write(f"{token_index} {repr(token)} {len(token)}\n")
+        return (vocab_file,)
+
+    def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
+        bos_token_ids = [self.bos_token_id] if self.add_bos_token else []
+        output = bos_token_ids + token_ids_0
+        if token_ids_1 is None:
+            return output
+        return output + bos_token_ids + token_ids_1
+
+    def get_special_tokens_mask(
+        self,
+        token_ids_0: list[int],
+        token_ids_1: list[int] | None = None,
+        already_has_special_tokens: bool = False,
+    ) -> list[int]:
+        if already_has_special_tokens:
+            return super().get_special_tokens_mask(
+                token_ids_0=token_ids_0,
+                token_ids_1=token_ids_1,
+                already_has_special_tokens=True,
+            )
+        if not self.add_bos_token:
+            return super().get_special_tokens_mask(
+                token_ids_0=token_ids_0,
+                token_ids_1=token_ids_1,
+                already_has_special_tokens=False,
+            )
+        if token_ids_1 is None:
+            return [1] + ([0] * len(token_ids_0))
+        return [1] + ([0] * len(token_ids_0)) + [1] + ([0] * len(token_ids_1))
 
     def expand_image_placeholders(
         self,
@@ -548,8 +651,11 @@ class RWKVTokenizerCore:
                 add_generation_prompt=False,
                 tools=tools,
             )
-            start = len(self.encode(start_text, add_bos=add_bos, add_eos=False))
-            end = len(self.encode(end_text, add_bos=add_bos, add_eos=False))
+            start = len(self._encode_text(start_text, add_bos=add_bos, add_eos=False))
+            end = len(self._encode_text(end_text, add_bos=add_bos, add_eos=False))
             if start < end:
                 spans.append((start, end))
         return spans
+
+
+RwkvTokenizer.register_for_auto_class("AutoTokenizer")

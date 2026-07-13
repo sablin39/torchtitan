@@ -40,7 +40,7 @@ try:
 except ImportError:
     from configuration_rwkv7 import RWKV7Config
     from modeling_rwkv7 import RWKV7ForCausalLM
-from torchtitan.models.rwkv7.tokenizer_core import (  # noqa: E402
+from torchtitan.models.rwkv7.tokenizer import (  # noqa: E402
     CHAT_TEMPLATE,
     DEFAULT_BOS_TOKEN,
     DEFAULT_BOS_TOKEN_ID,
@@ -125,18 +125,16 @@ def _copy_module_source(module_name: str, destination: Path) -> None:
 
 
 _REMOTE_CODE_ASSETS = {
-    "tokenizer.py": "torchtitan.models.rwkv7.hf_tokenizer",
-    "tokenizer_core.py": "torchtitan.models.rwkv7.tokenizer_core",
-    "processor.py": "torchtitan.hf_datasets.multimodal.hf_processor",
-    "processor_core.py": "torchtitan.hf_datasets.multimodal.processor_core",
+    "tokenizer.py": "torchtitan.models.rwkv7.tokenizer",
+    "processor.py": "torchtitan.hf_datasets.multimodal.processor",
 }
 
 
 def save_remote_code_assets(output: str, *, include_processor: bool = False) -> None:
     output_path = Path(output)
-    filenames = ["tokenizer.py", "tokenizer_core.py"]
+    filenames = ["tokenizer.py"]
     if include_processor:
-        filenames.extend(["processor.py", "processor_core.py"])
+        filenames.append("processor.py")
     for filename in filenames:
         _copy_module_source(_REMOTE_CODE_ASSETS[filename], output_path / filename)
 
@@ -153,7 +151,6 @@ def _remote_code_package(*, include_processor: bool = False):
     module_names = [
         package_name,
         f"{package_name}.tokenizer",
-        f"{package_name}.tokenizer_core",
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         package_dir = Path(tmpdir) / package_name
@@ -161,9 +158,7 @@ def _remote_code_package(*, include_processor: bool = False):
         (package_dir / "__init__.py").write_text("", encoding="utf-8")
         save_remote_code_assets(str(package_dir), include_processor=include_processor)
         if include_processor:
-            module_names.extend(
-                [f"{package_name}.processor", f"{package_name}.processor_core"]
-            )
+            module_names.append(f"{package_name}.processor")
 
         sys.path.insert(0, tmpdir)
         try:

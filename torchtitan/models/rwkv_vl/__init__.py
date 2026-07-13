@@ -14,7 +14,7 @@ from torchtitan.models.common import Linear
 from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
 from torchtitan.models.rwkv7 import rwkv7_backbones
 from torchtitan.models.rwkv7.model import RWKV7Backbone
-from torchtitan.models.rwkv7.tokenizer_core import (
+from torchtitan.models.rwkv7.tokenizer import (
     DEFAULT_IMAGE_TOKEN_ID,
     DEFAULT_VISION_END_TOKEN_ID,
     DEFAULT_VISION_START_TOKEN_ID,

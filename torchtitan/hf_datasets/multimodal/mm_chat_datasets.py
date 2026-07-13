@@ -23,7 +23,7 @@ from torch.utils.data import get_worker_info, IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.hf_datasets.multimodal.processor_core import (
+from torchtitan.hf_datasets.multimodal.processor import (
     flatten_images,
     process_images,
     RWKVVLImageProcessorConfig,

@@ -83,7 +83,7 @@ def build_inputs(hf_model_path, model_flavor, num_samples, image_size=224):
     import einops as E
     from PIL import Image
 
-    from torchtitan.hf_datasets.multimodal.processor_core import (
+    from torchtitan.hf_datasets.multimodal.processor import (
         process_image,
         vision_to_patches,
     )

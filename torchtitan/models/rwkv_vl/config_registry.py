@@ -19,7 +19,7 @@ from torchtitan.config import (
 )
 from torchtitan.hf_datasets.multimodal.mm_chat_datasets import MMChatDataLoader
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMDataLoader
-from torchtitan.models.rwkv7.tokenizer_core import (
+from torchtitan.models.rwkv7.tokenizer import (
     DEFAULT_IMAGE_TOKEN,
     DEFAULT_PAD_TOKEN,
     DEFAULT_VISION_END_TOKEN,
