@@ -22,6 +22,9 @@ torchrun_cmd="torchrun"
 #   3. Train with TorchTitan.
 #   4. Convert the final TorchTitan DCP checkpoint back to HF and copy HF assets.
 #
+# Setting resume_dcp_path below skips steps 1-2 and initializes training from
+# an existing DCP checkpoint instead (weights only; the run starts at step 0).
+#
 # Activate the environment before running:
 #   source .venv/bin/activate
 #
@@ -179,6 +182,22 @@ lr_decay_type="linear"
 lr_min_factor="1.0"
 checkpoint_interval="2000"
 checkpoint_keep_latest_k="0"
+# --- Fine-tune from an existing DCP checkpoint -------------------------------
+# Empty (default): run the full pipeline — export the HF seed checkpoint,
+# convert it to DCP, and train from that seed. Set to a step-N DCP checkpoint
+# directory from a previous run (e.g.
+# outputs/rwkv_vl_train_YYYYmmdd_HHMMSS/train/checkpoint/step-2000) to skip the
+# export/convert steps and initialize training from those weights instead.
+# This starts a fresh run at step 0: only model weights are loaded
+# (checkpoint.initial_load_model_only keeps its default), so the optimizer,
+# LR schedule, and all training configs follow this script, not the checkpoint.
+# The model_flavor and projector_* knobs must match the checkpoint being loaded.
+resume_dcp_path=""
+# HF assets (tokenizer/processor/config/remote code) are still needed for
+# training and for the final HF export. Empty means: reuse the hf_export dir
+# of the run that produced resume_dcp_path (<run_root>/hf_export). Set this to
+# use HF assets from somewhere else. Ignored when resume_dcp_path is empty.
+resume_hf_assets=""
 image_processor=""
 min_pixels="65536"
 max_pixels="3145728"
@@ -228,18 +247,28 @@ if [[ $# -gt 0 ]]; then
     exit 2
 fi
 
-if [[ -z "${rwkv7_path}" || -z "${vision_model}" || -z "${dataset_path}" ]]; then
-    echo "Set rwkv7_path, vision_model, and dataset_path in run_vl_train.sh." >&2
+if [[ -z "${dataset_path}" ]]; then
+    echo "Set dataset_path in run_vl_train.sh." >&2
     exit 2
 fi
 
-if [[ ! -f "${rwkv7_path}" ]]; then
-    echo "RWKV checkpoint does not exist or is not a file: ${rwkv7_path}" >&2
-    exit 1
-fi
-
-if [[ ! -e "${vision_model}" ]]; then
-    echo "Warning: vision model is not a local path; assuming HF can resolve it: ${vision_model}" >&2
+if [[ -n "${resume_dcp_path}" ]]; then
+    if [[ ! -d "${resume_dcp_path}" ]]; then
+        echo "resume_dcp_path does not exist or is not a directory: ${resume_dcp_path}" >&2
+        exit 1
+    fi
+else
+    if [[ -z "${rwkv7_path}" || -z "${vision_model}" ]]; then
+        echo "Set rwkv7_path and vision_model in run_vl_train.sh." >&2
+        exit 2
+    fi
+    if [[ ! -f "${rwkv7_path}" ]]; then
+        echo "RWKV checkpoint does not exist or is not a file: ${rwkv7_path}" >&2
+        exit 1
+    fi
+    if [[ ! -e "${vision_model}" ]]; then
+        echo "Warning: vision model is not a local path; assuming HF can resolve it: ${vision_model}" >&2
+    fi
 fi
 
 if ! [[ "${ngpu}" =~ ^[0-9]+$ ]] || (( ngpu < 1 )); then
@@ -439,8 +468,26 @@ batch_parallel_degree=$((ngpu / context_parallel_degree))
 # here so the user-facing knob is the human-friendly step count, not a raw total.
 global_batch_size=$((batch_size * batch_parallel_degree * gradient_accumulation_steps))
 
-hf_dir="${output_root}/hf_export"
 dcp_dir="${output_root}/dcp_from_hf"
+if [[ -n "${resume_dcp_path}" ]]; then
+    # Reuse the HF assets of the run that produced the checkpoint
+    # (<run_root>/train/checkpoint/step-N -> <run_root>/hf_export) unless
+    # resume_hf_assets overrides them.
+    if [[ -n "${resume_hf_assets}" ]]; then
+        hf_dir="${resume_hf_assets}"
+    else
+        hf_dir="$(realpath -m "$(dirname "$(dirname "$(dirname "${resume_dcp_path}")")")/hf_export")"
+    fi
+    if [[ ! -d "${hf_dir}" ]]; then
+        echo "HF assets dir not found: ${hf_dir}" >&2
+        echo "Set resume_hf_assets to an existing HF export directory." >&2
+        exit 1
+    fi
+    initial_load_dcp="${resume_dcp_path}"
+else
+    hf_dir="${output_root}/hf_export"
+    initial_load_dcp="${dcp_dir}"
+fi
 train_dump_dir="${output_root}/train"
 final_hf_dir="${output_root}/hf_final"
 
@@ -449,10 +496,19 @@ if [[ "${flex_attention_log_file}" == "auto" ]]; then
 fi
 
 if [[ "${overwrite}" == "1" ]]; then
-    rm -rf "${hf_dir}" "${dcp_dir}" "${train_dump_dir}" "${final_hf_dir}"
+    rm -rf "${train_dump_dir}" "${final_hf_dir}"
+    # In resume mode hf_dir is a pre-existing external assets dir and dcp_dir
+    # is not created; never delete them.
+    if [[ -z "${resume_dcp_path}" ]]; then
+        rm -rf "${hf_dir}" "${dcp_dir}"
+    fi
 fi
 
-for path in "${hf_dir}" "${dcp_dir}" "${train_dump_dir}" "${final_hf_dir}"; do
+guard_paths=("${train_dump_dir}" "${final_hf_dir}")
+if [[ -z "${resume_dcp_path}" ]]; then
+    guard_paths=("${hf_dir}" "${dcp_dir}" "${guard_paths[@]}")
+fi
+for path in "${guard_paths[@]}"; do
     if [[ -e "${path}" ]]; then
         echo "Refusing to overwrite existing path: ${path}" >&2
         echo "Set overwrite=1 or choose a new output_root." >&2
@@ -482,10 +538,19 @@ if [[ -n "${nccl_debug_file}" ]]; then
 fi
 
 echo "Artifacts:"
-echo "  HF export:     ${hf_dir}"
-echo "  DCP export:    ${dcp_dir}"
+if [[ -n "${resume_dcp_path}" ]]; then
+    echo "  HF assets:     ${hf_dir} (reused)"
+else
+    echo "  HF export:     ${hf_dir}"
+    echo "  DCP export:    ${dcp_dir}"
+fi
 echo "  Train dump:    ${train_dump_dir}"
 echo "  Final HF:      ${final_hf_dir}"
+if [[ -n "${resume_dcp_path}" ]]; then
+    echo "Resume:"
+    echo "  Init weights:  ${initial_load_dcp}"
+    echo "  Mode:          model weights only; step 0, fresh optimizer/LR schedule"
+fi
 echo "Tracking:"
 echo "  Enabled:       ${tracking} (W&B + SwanLab backup)"
 echo "  Run name:      ${tracking_run_name}"
@@ -560,9 +625,14 @@ if [[ -n "${projector_extra_merge_size}" ]]; then
     export_args+=(--projector-extra-merge-size "${projector_extra_merge_size}")
 fi
 
-echo
-echo "==> Step 1/4: Exporting RWKV-VL HF checkpoint"
-"${python_cmd}" "${export_args[@]}"
+if [[ -z "${resume_dcp_path}" ]]; then
+    echo
+    echo "==> Step 1/4: Exporting RWKV-VL HF checkpoint"
+    "${python_cmd}" "${export_args[@]}"
+else
+    echo
+    echo "==> Steps 1-2/4: Skipped; initializing training from ${resume_dcp_path}"
+fi
 
 convert_proj_args=()
 if [[ -n "${projector_kind}" ]]; then
@@ -584,14 +654,16 @@ if [[ -n "${projector_extra_merge_size}" ]]; then
     convert_proj_args+=(--projector_extra_merge_size "${projector_extra_merge_size}")
 fi
 
-echo
-echo "==> Step 2/4: Converting HF checkpoint to DCP"
-"${python_cmd}" "${repo_root}/scripts/checkpoint_conversion/convert_from_hf.py" \
-    "${hf_dir}" \
-    "${dcp_dir}" \
-    --model_name "${model_name}" \
-    --model_flavor "${model_flavor}" \
-    "${convert_proj_args[@]}"
+if [[ -z "${resume_dcp_path}" ]]; then
+    echo
+    echo "==> Step 2/4: Converting HF checkpoint to DCP"
+    "${python_cmd}" "${repo_root}/scripts/checkpoint_conversion/convert_from_hf.py" \
+        "${hf_dir}" \
+        "${dcp_dir}" \
+        --model_name "${model_name}" \
+        --model_flavor "${model_flavor}" \
+        "${convert_proj_args[@]}"
+fi
 
 train_args=(
     -m torchtitan.train
@@ -624,7 +696,7 @@ train_args=(
     --dataloader.pixel-values-dtype "${dataloader_pixel_values_dtype}"
     --activation-checkpoint.mode "${activation_checkpoint_mode}"
     --checkpoint.enable
-    --checkpoint.initial-load-path "${dcp_dir}"
+    --checkpoint.initial-load-path "${initial_load_dcp}"
     --checkpoint.interval "${checkpoint_interval}"
     --checkpoint.keep-latest-k "${checkpoint_keep_latest_k}"
     --checkpoint.export-dtype "${export_dtype}"
@@ -824,6 +896,10 @@ done < <(find "${hf_dir}" -mindepth 1 -maxdepth 1 -print0)
 echo
 echo "Done."
 echo "  Initial HF checkpoint: ${hf_dir}"
-echo "  Initial DCP checkpoint: ${dcp_dir}"
+if [[ -z "${resume_dcp_path}" ]]; then
+    echo "  Initial DCP checkpoint: ${dcp_dir}"
+else
+    echo "  Resumed from DCP:       ${initial_load_dcp}"
+fi
 echo "  Training outputs:       ${train_dump_dir}"
 echo "  Final HF checkpoint:    ${final_hf_dir}"
