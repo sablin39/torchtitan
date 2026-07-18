@@ -44,13 +44,12 @@ class RWKVVLModuleLRs:
     """
     Per-root RWKV-VL learning rates. ``None`` means use ``optimizer.lr``.
     A value of 0 freezes that root and excludes it from FSDP sharding.
-    ``lm_head`` defaults to the resolved ``llm`` LR when left as ``None``.
+    ``lm_head`` is not configurable; it always follows the resolved ``llm`` LR.
     """
 
     vision_encoder: float | None = None
     proj: float | None = None
     llm: float | None = None
-    lm_head: float | None = None
 
 
 @dataclass(kw_only=True, slots=True)

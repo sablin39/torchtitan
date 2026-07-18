@@ -251,7 +251,6 @@ class TestRWKV7Backend(unittest.TestCase):
             "vision_encoder": 0.0,
             "proj": 1e-4,
             "llm": 0.0,
-            "lm_head": 0.0,
         }
         with torch.device("meta"):
             model = spec.model.build()
@@ -263,7 +262,7 @@ class TestRWKV7Backend(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for p in model.llm.parameters()))
         self.assertTrue(all(not p.requires_grad for p in model.lm_head.parameters()))
 
-    def test_rwkv_vl_module_lrs_lm_head_follows_llm_by_default(self):
+    def test_rwkv_vl_module_lrs_lm_head_follows_llm(self):
         cfg = ConfigManager().parse_args(
             [
                 "--module",
@@ -288,7 +287,6 @@ class TestRWKV7Backend(unittest.TestCase):
                 "vision_encoder": 0.0,
                 "proj": 0.0,
                 "llm": 2e-5,
-                "lm_head": 2e-5,
             },
         )
         with torch.device("meta"):
@@ -321,7 +319,6 @@ class TestRWKV7Backend(unittest.TestCase):
         self.assertEqual(cfg.module_lrs.vision_encoder, 0.0)
         self.assertEqual(cfg.module_lrs.proj, 1e-4)
         self.assertEqual(cfg.module_lrs.llm, 1e-5)
-        self.assertIsNone(cfg.module_lrs.lm_head)
 
         cfg.model_spec.model.update_from_config(trainer_config=cfg)
         groups = {
@@ -329,8 +326,8 @@ class TestRWKV7Backend(unittest.TestCase):
         }
         self.assertNotIn(r"^vision_encoder\.", groups)
         self.assertEqual(groups[r"^proj\."], 10.0)
-        self.assertEqual(groups[r"^llm\."], 1.0)
-        self.assertEqual(groups[r"^lm_head\."], 1.0)
+        # llm and lm_head share one param group (lm_head has no separate LR).
+        self.assertEqual(groups[r"^(llm|lm_head)\."], 1.0)
 
     def test_rwkv_vl_backbone_chunk_size_cli_updates_model_config(self):
         cfg = ConfigManager().parse_args(
@@ -374,7 +371,6 @@ class TestRWKV7Backend(unittest.TestCase):
             "vision_encoder": 0.0,
             "proj": 1e-5,
             "llm": 1e-5,
-            "lm_head": 1e-5,
         }
         with torch.device("meta"):
             model = spec.model.build()

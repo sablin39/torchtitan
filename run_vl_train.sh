@@ -40,6 +40,7 @@ torchrun_cmd="torchrun"
 # Edit this block directly for now. We will replace it with a smarter config
 # system later.
 
+# --- Inputs: checkpoints and datasets ---------------------------------------
 rwkv7_path="${HOME}/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
 vision_model="${HOME}/models/Qwen3-VL-2B-Instruct"
 # W&B remote path: /data/HuggingFaceM4_FineVisionMax
@@ -49,90 +50,43 @@ dataset_path="${HOME}/data/LLaVA-OneVision-Data/ai2d(cauldron,llava_format)"
 text_dataset_path="${HOME}/data/nemotron_cleaned/agentic_v2_cleaned"
 text_split="train"
 text_sample_probability="0.5"
-project_seed="1234"
-# 1.5B-v100M:
-# rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
-# vision_model="/home/molin/models/Qwen3.5-0.8B"
-# model_flavor="1.5B-v100M"
-# train_config="rwkv_vl_1_5b_v100m_chat"
-# 1.5B-v400M:
-# rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
-# vision_model="/home/molin/models/Qwen3-VL-2B-Instruct"
-# model_flavor="1.5B-v400M"
-# train_config="rwkv_vl_1_5b_v400m_chat"
 split="train"
-ngpu="4"
-# Size of each context-parallel group. For context_parallel_degree=2, ngpu=4
-# creates two CP groups of 2 ranks; ngpu=8 creates four CP groups of 2 ranks.
-context_parallel_degree="1"
-# Data parallel layout. The default keeps current FSDP behavior by sharding
-# across all non-CP ranks. For replicated DP on 8 GPUs with CP=1, set:
-#   data_parallel_replicate_degree="8"
-#   data_parallel_shard_degree="1"
-# With CP>1, use data_parallel_replicate_degree=ngpu/context_parallel_degree.
-data_parallel_replicate_degree="1"
-data_parallel_shard_degree="-1"
-seq_len="8192"
-# The recovered 4096-token W&B run used batch_size=24. For 8192-token local
-# stress on this shared 4x96GB workstation, batch_size=8 is the verified default.
-batch_size="8"
-# batch_size is TorchTitan training.local_batch_size. With RWKV/FLA CP it is
-# the number of packed seq_len rows per batch-parallel group. CP shards the
-# flattened tokens inside each row group; it does not multiply batch size.
-# The effective global batch is:
-#   batch_size * (ngpu / context_parallel_degree) * gradient_accumulation_steps
-# which the script derives and passes to TorchTitan as training.global-batch-size
-# (TorchTitan has no dedicated accumulation field; it computes the step count from
-# global_batch_size / (local_batch_size * batch_degree)).
-# Sequence packing is controlled by the multimodal dataloader, not by CP.
-# Gradient accumulation: how many forward/backward microbatches are summed before
-# each optimizer step. Default 1 keeps the pre-accumulation behavior. The trainer
-# buffers all microbatches on the CPU before stepping, so large values with
-# multimodal data raise host RAM use.
-gradient_accumulation_steps="1"
-# packing_buffer_size is the number of tokenized samples kept in a CPU-side
-# buffer before greedily combining them into seq_len rows. Larger values usually
-# improve non-padding token occupancy, but increase preprocessing latency and
-# host memory use. Set to "0" to disable packing and pad each sample normally.
-packing_buffer_size="64"
-# Conservative dataloader overlap for multimodal packing. Each worker can hold
-# prefetched packed batches containing many resized images, so keep this small
-# on RAM-constrained machines. With CP, this is per rank.
-dataloader_num_workers="0"
-dataloader_persistent_workers="1"
-dataloader_prefetch_factor="1"
-dataloader_pin_memory="0"
-# Store preprocessed visual patch tensors in this dtype before worker IPC and
-# H2D transfer. For BF16 training this roughly halves pixel_values host memory
-# and transfer volume compared with float32 while resize/normalize still runs
-# in float32 inside the processor.
-dataloader_pixel_values_dtype="bfloat16"
-# torchrun warns about OMP_NUM_THREADS because every rank and dataloader worker
-# can otherwise spawn a large CPU thread pool. Start at 1 for multimodal CP; if
-# RAM and CPU load look stable, benchmark 2. A rough upper bound is:
-# physical_cores / (ngpu * (1 + dataloader_num_workers)).
-omp_num_threads="1"
-# Set to an integer for a fixed-step run, or "epoch" to run until the finite
-# dataloader is exhausted. With sequence packing, exact epoch steps are not known
-# until samples are filtered, resized, tokenized, and packed.
-steps="epoch"
-max_epoch_steps="1000000000"
-precision="bfloat16"
-export_dtype="bfloat16"
-model_name="rwkv_vl"
-model_flavor="1.5B-v400M"
+
+# --- Fine-tune from an existing DCP checkpoint -------------------------------
+# Empty (default): run the full pipeline — export the HF seed checkpoint,
+# convert it to DCP, and train from that seed. Set to a step-N DCP checkpoint
+# directory from a previous run (e.g.
+# outputs/rwkv_vl_train_YYYYmmdd_HHMMSS/train/checkpoint/step-2000) to skip the
+# export/convert steps and initialize training from those weights instead.
+# This starts a fresh run at step 0: only model weights are loaded
+# (checkpoint.initial_load_model_only keeps its default), so the optimizer,
+# LR schedule, and all training configs follow this script, not the checkpoint.
+# The train_config and projector_* knobs must match the checkpoint being loaded.
+resume_dcp_path=""
+# HF assets (tokenizer/processor/config/remote code) are still needed for
+# training and for the final HF export. Empty means: reuse the hf_export dir
+# of the run that produced resume_dcp_path (<run_root>/hf_export). Set this to
+# use HF assets from somewhere else. Ignored when resume_dcp_path is empty.
+resume_hf_assets=""
+
+# --- Model ----------------------------------------------------------------------
+# train_config picks the model flavor from the registry
+# (torchtitan/models/rwkv_vl/config_registry.py); the checkpoint/vision pairs
+# each config was validated with:
+#   1.5B-v100M:
+#     rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
+#     vision_model="/home/molin/models/Qwen3.5-0.8B"
+#     train_config="rwkv_vl_1_5b_v100m_chat"
+#   1.5B-v400M:
+#     rwkv7_path="/home/molin/models/rwkv7-g1/rwkv7-g1f-1.5b-20260419-ctx8192.pth"
+#     vision_model="/home/molin/models/Qwen3-VL-2B-Instruct"
+#     train_config="rwkv_vl_1_5b_v400m_chat"
 train_config="rwkv_vl_1_5b_v400m_chat"
 # RWKV7 DPLR chunk size for the language backbone. The model default is 64;
 # local long-sequence sweeps favored 32 for packed CP training.
 backbone_chunk_size="64"
-# Per-root learning rates. A value of 0 freezes that root and skips selective
-# FSDP sharding for it. Leave lm_head_lr empty to follow llm_lr.
-vision_encoder_lr="0"
-proj_lr="1e-4"
-llm_lr="1e-5"
-lm_head_lr=""
-projector_seed="1234"
-# --- Visual projector configuration ------------------------------------------
+
+# --- Visual projector ----------------------------------------------------------
 # "mlp" (default) uses the original ReLU/LayerNorm projector and is bit-
 # identical to the pre-refactor checkpoint format. "cross_attn" replaces the
 # additive DeepStack injection with masked cross-attention between
@@ -162,17 +116,52 @@ projector_head_dim=""
 # kernels but may re-compile per shape).
 projector_q_bucket=""
 projector_kv_bucket=""
-activation_checkpoint_mode="full"
-# RWKV-VL selective activation checkpointing is usable with CP on and off when
-# using BF16 model construction, compile, and normal FSDP.
-log_freq="1"
-# Enable W&B + SwanLab together. SwanLab is configured as the backup mirror so
-# runs survive transient W&B connectivity issues.
-tracking="1"
-nvml_metrics="1"
-overwrite="0"
+# Seed for the freshly initialized projector weights at HF export time
+# (distinct from project_seed, which seeds training itself).
+projector_seed="1234"
+
+# --- Training schedule ---------------------------------------------------------
+# Set to an integer for a fixed-step run, or "epoch" to run until the finite
+# dataloader is exhausted. With sequence packing, exact epoch steps are not known
+# until samples are filtered, resized, tokenized, and packed.
+steps="epoch"
+max_epoch_steps="1000000000"
+seq_len="8192"
+# The recovered 4096-token W&B run used batch_size=24. For 8192-token local
+# stress on this shared 4x96GB workstation, batch_size=8 is the verified default.
+batch_size="8"
+# batch_size is TorchTitan training.local_batch_size. With RWKV/FLA CP it is
+# the number of packed seq_len rows per batch-parallel group. CP shards the
+# flattened tokens inside each row group; it does not multiply batch size.
+# The effective global batch is:
+#   batch_size * (ngpu / context_parallel_degree) * gradient_accumulation_steps
+# which the script derives and passes to TorchTitan as training.global-batch-size
+# (TorchTitan has no dedicated accumulation field; it computes the step count from
+# global_batch_size / (local_batch_size * batch_degree)).
+# Sequence packing is controlled by the multimodal dataloader, not by CP.
+# Gradient accumulation: how many forward/backward microbatches are summed before
+# each optimizer step. Default 1 keeps the pre-accumulation behavior. The trainer
+# buffers all microbatches on the CPU before stepping, so large values with
+# multimodal data raise host RAM use.
+gradient_accumulation_steps="1"
+# packing_buffer_size is the number of tokenized samples kept in a CPU-side
+# buffer before greedily combining them into seq_len rows. Larger values usually
+# improve non-padding token occupancy, but increase preprocessing latency and
+# host memory use. Set to "0" to disable packing and pad each sample normally.
+packing_buffer_size="64"
+
+# --- Learning rates --------------------------------------------------------------
+# Per-root learning rates. A value of 0 freezes that root and skips selective
+# FSDP sharding for it. lm_head always follows llm_lr.
+vision_encoder_lr="0"
+proj_lr="1e-4"
+llm_lr="1e-5"
+# --optimizer.lr has no separate knob: it is only the scaling base for the
+# per-root param groups (effective LR = base * root_lr / base == root_lr), so
+# any positive value works. Derive it as the largest root LR so it stays
+# positive whenever at least one root is trainable.
+optimizer_base_lr="$(awk -v a="${vision_encoder_lr}" -v b="${proj_lr}" -v c="${llm_lr}" 'BEGIN{ m=a; if (b>m) m=b; if (c>m) m=c; print m }')"
 optimizer_name="Adam"
-learning_rate="1e-5"
 weight_decay="0"
 lr_warmup_steps="2000"
 # Leave empty to use training_steps. In steps="epoch" mode, set this manually
@@ -180,25 +169,51 @@ lr_warmup_steps="2000"
 lr_total_steps=""
 lr_decay_type="linear"
 lr_min_factor="1.0"
+# Seed for training itself (--debug.seed; distinct from projector_seed).
+project_seed="1234"
+
+# --- Checkpointing -----------------------------------------------------------------
 checkpoint_interval="2000"
 checkpoint_keep_latest_k="0"
-# --- Fine-tune from an existing DCP checkpoint -------------------------------
-# Empty (default): run the full pipeline — export the HF seed checkpoint,
-# convert it to DCP, and train from that seed. Set to a step-N DCP checkpoint
-# directory from a previous run (e.g.
-# outputs/rwkv_vl_train_YYYYmmdd_HHMMSS/train/checkpoint/step-2000) to skip the
-# export/convert steps and initialize training from those weights instead.
-# This starts a fresh run at step 0: only model weights are loaded
-# (checkpoint.initial_load_model_only keeps its default), so the optimizer,
-# LR schedule, and all training configs follow this script, not the checkpoint.
-# The model_flavor and projector_* knobs must match the checkpoint being loaded.
-resume_dcp_path=""
-# HF assets (tokenizer/processor/config/remote code) are still needed for
-# training and for the final HF export. Empty means: reuse the hf_export dir
-# of the run that produced resume_dcp_path (<run_root>/hf_export). Set this to
-# use HF assets from somewhere else. Ignored when resume_dcp_path is empty.
-resume_hf_assets=""
-image_processor=""
+overwrite="0"
+
+# --- Hardware and parallelism --------------------------------------------------------
+ngpu="4"
+# Size of each context-parallel group. For context_parallel_degree=2, ngpu=4
+# creates two CP groups of 2 ranks; ngpu=8 creates four CP groups of 2 ranks.
+context_parallel_degree="1"
+# Data parallel layout. The default keeps current FSDP behavior by sharding
+# across all non-CP ranks. For replicated DP on 8 GPUs with CP=1, set:
+#   data_parallel_replicate_degree="8"
+#   data_parallel_shard_degree="1"
+# With CP>1, use data_parallel_replicate_degree=ngpu/context_parallel_degree.
+data_parallel_replicate_degree="1"
+data_parallel_shard_degree="-1"
+activation_checkpoint_mode="full"
+# RWKV-VL selective activation checkpointing is usable with CP on and off when
+# using BF16 model construction, compile, and normal FSDP.
+# torchrun warns about OMP_NUM_THREADS because every rank and dataloader worker
+# can otherwise spawn a large CPU thread pool. Start at 1 for multimodal CP; if
+# RAM and CPU load look stable, benchmark 2. A rough upper bound is:
+# physical_cores / (ngpu * (1 + dataloader_num_workers)).
+omp_num_threads="1"
+# Correct CUDA allocator knob. The older PYTORCH_ALLOC_CONF name is ignored by
+# PyTorch for CUDA memory management.
+pytorch_cuda_alloc_conf="expandable_segments:True"
+
+# --- Dataloader ----------------------------------------------------------------------
+# Conservative dataloader overlap for multimodal packing. Each worker can hold
+# prefetched packed batches containing many resized images, so keep this small
+# on RAM-constrained machines. With CP, this is per rank.
+dataloader_num_workers="0"
+dataloader_persistent_workers="1"
+dataloader_prefetch_factor="1"
+dataloader_pin_memory="0"
+# Store preprocessed visual patch tensors in this dtype before worker IPC and
+# H2D transfer. For BF16 training this roughly halves pixel_values host memory
+# and transfer volume compared with float32 while resize/normalize still runs
+# in float32 inside the processor.
+dataloader_pixel_values_dtype="bfloat16"
 min_pixels="65536"
 max_pixels="3145728"
 # 0 means no image-count cap. max_pixels is a shared per-sample pixel budget
@@ -211,9 +226,13 @@ max_images_per_batch="0"
 # For a bucket sweep, edit vit_patch_bucket_size and keep
 # torchinductor_cache_dir distinct for each cold-cache run.
 vit_patch_bucket_size="32768"
-# Keep Inductor caches separate across bucket-size sweeps when benchmarking
-# cold compile/autotune behavior. Leave empty to let PyTorch choose the cache.
-torchinductor_cache_dir="/tmp/tt_vit_bucket_${vit_patch_bucket_size}_cp${context_parallel_degree}_bs${batch_size}"
+
+# --- Logging and debugging -------------------------------------------------------------
+# Enable W&B + SwanLab together. SwanLab is configured as the backup mirror so
+# runs survive transient W&B connectivity issues.
+tracking="1"
+nvml_metrics="1"
+log_freq="1"
 # Set to 1 for crash/numerics/compiler debugging. This enables heavyweight
 # asserts and verbose logs. Leave 0 for speed-equivalent runs. FlexAttention
 # autotune stays enabled by the model config either way.
@@ -223,11 +242,23 @@ debugging="0"
 terminal_log_file="auto"
 # FlexAttention autotune choices are useful in both speed and debug runs.
 flex_attention_log_file="auto"
-# Correct CUDA allocator knob. The older PYTORCH_ALLOC_CONF name is ignored by
-# PyTorch for CUDA memory management.
-pytorch_cuda_alloc_conf="expandable_segments:True"
+
+# --- Advanced (rarely touched) ------------------------------------------------------------
+model_name="rwkv_vl"
+# Weight dtype of the initial HF export (step 1).
+precision="bfloat16"
+# Weight dtype of the trained HF export (step 4) and the final DCP checkpoint.
+export_dtype="bfloat16"
+# Optional image processor source for the exported HF checkpoint. Empty means:
+# inherit the preprocessor from vision_model. Training does not read it.
+image_processor=""
 max_position_embeddings=""
 max_shard_size="1000GB"
+# Keep Inductor caches separate across bucket-size sweeps when benchmarking
+# cold compile/autotune behavior. Leave empty to let PyTorch choose the cache.
+torchinductor_cache_dir="/tmp/tt_vit_bucket_${vit_patch_bucket_size}_cp${context_parallel_degree}_bs${batch_size}"
+
+# Derived run identity (not config knobs).
 output_root="${repo_root}/outputs/rwkv_vl_train_${timestamp}"
 tracking_run_name="${WANDB_RUN_NAME:-${train_config}_${timestamp}}"
 
@@ -468,6 +499,18 @@ batch_parallel_degree=$((ngpu / context_parallel_degree))
 # here so the user-facing knob is the human-friendly step count, not a raw total.
 global_batch_size=$((batch_size * batch_parallel_degree * gradient_accumulation_steps))
 
+# model_flavor is implied by train_config: each training config is bound to
+# exactly one flavor in torchtitan/models/rwkv_vl/config_registry.py. The
+# HF <-> DCP converters take the flavor, so resolve it from the registry.
+if ! model_flavor="$("${python_cmd}" -c "
+import importlib
+registry = importlib.import_module('torchtitan.models.${model_name}.config_registry')
+print(getattr(registry, '${train_config}')().model_spec.flavor)
+")"; then
+    echo "Failed to resolve model flavor from train_config: ${train_config}" >&2
+    exit 2
+fi
+
 dcp_dir="${output_root}/dcp_from_hf"
 if [[ -n "${resume_dcp_path}" ]]; then
     # Reuse the HF assets of the run that produced the checkpoint
@@ -676,7 +719,7 @@ train_args=(
     --dataloader.split "${split}"
     --dataloader.text-sample-probability "${text_sample_probability}"
     --optimizer.name "${optimizer_name}"
-    --optimizer.lr "${learning_rate}"
+    --optimizer.lr "${optimizer_base_lr}"
     --optimizer.weight-decay "${weight_decay}"
     --module-lrs.vision-encoder "${vision_encoder_lr}"
     --module-lrs.proj "${proj_lr}"
@@ -714,9 +757,6 @@ if [[ "${run_until_epoch}" == "1" ]]; then
 fi
 if [[ -n "${lr_total_steps}" ]]; then
     train_args+=(--lr-scheduler.total-steps "${lr_total_steps}")
-fi
-if [[ -n "${lm_head_lr}" ]]; then
-    train_args+=(--module-lrs.lm-head "${lm_head_lr}")
 fi
 if [[ -n "${projector_kind}" ]]; then
     train_args+=(--projector-kind "${projector_kind}")

@@ -177,12 +177,12 @@ def _build_norm(kind: NormKind, dim: int, eps: float) -> Module:
     raise ValueError(f"Unknown norm kind: {kind!r}; expected layernorm|rmsnorm")
 
 
-_ROOT_MODULE_NAMES = ("vision_encoder", "proj", "llm", "lm_head")
+_ROOT_MODULE_NAMES = ("vision_encoder", "proj", "llm")
 _ROOT_PARAM_PATTERNS = {
     "vision_encoder": r"^vision_encoder\.",
     "proj": r"^proj\.",
-    "llm": r"^llm\.",
-    "lm_head": r"^lm_head\.",
+    # lm_head shares the llm LR root; it has no separate LR entry.
+    "llm": r"^(llm|lm_head)\.",
 }
 
 
@@ -219,9 +219,6 @@ def _resolve_root_lrs(module_lrs: Any, default_lr: float) -> dict[str, float]:
     for name in _ROOT_MODULE_NAMES:
         value = getattr(module_lrs, name)
         resolved[name] = default_lr if value is None else float(value)
-
-    if getattr(module_lrs, "lm_head") is None:
-        resolved["lm_head"] = resolved["llm"]
 
     return _validate_root_lrs(resolved)
 
@@ -694,7 +691,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             parallelism = trainer_config.parallelism
             training = trainer_config.training
             compile_config = getattr(trainer_config, "compile", None)
-            module_lrs = getattr(trainer_config, "module_lrs")
+            module_lrs = trainer_config.module_lrs
             self.root_lrs = _resolve_root_lrs(module_lrs, trainer_config.optimizer.lr)
             _configure_optimizer_param_groups(
                 trainer_config.optimizer,
@@ -845,14 +842,16 @@ class RWKV7VLForConditionalGeneration(BaseModel):
 
     def _apply_root_lr_selection(self) -> tuple[str, ...]:
         root_lrs = _validate_root_lrs(self.config.root_lrs)
+        # lm_head shares the llm LR root: it trains iff the llm trains.
         module_roots = {
-            "vision_encoder": self.vision_encoder,
-            "proj": self.proj,
-            "llm": self.llm,
-            "lm_head": self.lm_head,
+            "vision_encoder": (self.vision_encoder,),
+            "proj": (self.proj,),
+            "llm": (self.llm, self.lm_head),
         }
-        for name, module in module_roots.items():
-            module.requires_grad_(root_lrs[name] > 0)
+        for name, modules in module_roots.items():
+            trainable = root_lrs[name] > 0
+            for module in modules:
+                module.requires_grad_(trainable)
         return tuple(name for name in _ROOT_MODULE_NAMES if root_lrs[name] > 0)
 
     def set_cp_process_group(self, cp_group) -> None:
