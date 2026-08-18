@@ -212,19 +212,92 @@ class TestRWKV7Backend(unittest.TestCase):
 
     def test_rwkv_vl_production_projector_shapes(self):
         cases = {
-            "0.4B-v100M": (1024, 1024, 0),
-            "1.5B-v100M": (1024, 2048, 0),
-            "1.5B-v400M": (2048, 2048, 3),
+            "0.4B-v100M": (1024, 768, 1024, 12, 6, 3),
+            "1.5B-v100M": (1024, 768, 2048, 12, 6, 3),
+            "1.5B-v400M": (2048, 1024, 2048, 16, 8, 3),
         }
-        for flavor, (encoder_dim, project_dim, num_deepstack) in cases.items():
+        for flavor, (
+            encoder_dim,
+            vision_dim,
+            project_dim,
+            num_query_heads,
+            num_key_value_heads,
+            num_deepstack,
+        ) in cases.items():
             with self.subTest(flavor=flavor):
                 spec = rwkv_vl_model_registry(flavor)
                 self.assertEqual(spec.model.proj.encoder_dim, encoder_dim)
+                self.assertEqual(spec.model.proj.vision_dim, vision_dim)
                 self.assertEqual(spec.model.proj.project_dim, project_dim)
                 self.assertEqual(spec.model.proj.num_deepstack, num_deepstack)
+                self.assertEqual(spec.model.proj.kind, "cross_attn")
+                self.assertEqual(spec.model.proj.extra_merge_size, 2)
+                self.assertTrue(spec.model.proj.tie_qkvo)
                 with torch.device("meta"):
                     model = spec.model.build()
-                self.assertEqual(len(model.proj.deepstack), num_deepstack)
+                head_dim = vision_dim // num_query_heads
+                kv_dim = num_key_value_heads * head_dim
+                self.assertEqual(
+                    model.proj.seed_q_proj.weight.shape, (vision_dim, encoder_dim)
+                )
+                self.assertEqual(
+                    model.proj.rwkv_q_proj.weight.shape, (vision_dim, project_dim)
+                )
+                self.assertEqual(model.proj.k_proj.weight.shape, (kv_dim, vision_dim))
+                self.assertEqual(model.proj.v_proj.weight.shape, (kv_dim, vision_dim))
+                self.assertEqual(
+                    model.proj.o_proj.weight.shape, (project_dim, vision_dim)
+                )
+                self.assertEqual(len(model.proj.query_norms), num_deepstack)
+                self.assertEqual(len(model.proj.query_gate_projs), num_deepstack)
+                self.assertEqual(
+                    model.proj.query_gate_projs[0].weight.shape,
+                    (num_query_heads, project_dim),
+                )
+                self.assertEqual(len(model.proj.memory_norms), num_deepstack + 1)
+
+    def test_rwkv_vl_projector_cli_overrides_build_untied_qkvo(self):
+        cfg = ConfigManager().parse_args(
+            [
+                "--module",
+                "rwkv_vl",
+                "--config",
+                "rwkv_vl_1_5b_v100m_chat",
+                "--projector-visual-layer-indices",
+                "1",
+                "4",
+                "8",
+                "--projector-language-layer-indices",
+                "1",
+                "8",
+                "15",
+                "--projector-num-query-heads",
+                "12",
+                "--projector-num-key-value-heads",
+                "6",
+                "--no-tie-projector-qkvo",
+                "--projector-extra-merge-size",
+                "2",
+            ]
+        )
+        cfg.model_spec.model.update_from_config(trainer_config=cfg)
+        model_config = cfg.model_spec.model
+        self.assertEqual(
+            model_config.vision_encoder.deepstack_visual_indices, [1, 4, 8]
+        )
+        self.assertEqual(model_config.proj.language_layer_indices, (1, 8, 15))
+        self.assertEqual(model_config.proj.num_query_heads, 12)
+        self.assertEqual(model_config.proj.num_key_value_heads, 6)
+        self.assertFalse(model_config.proj.tie_qkvo)
+        self.assertEqual(model_config.processor_spatial_merge_size, 4)
+        self.assertEqual(cfg.dataloader.image_token_merge_size, 4)
+        with torch.device("meta"):
+            model = model_config.build()
+        self.assertEqual(len(model.proj.rwkv_q_projs), 3)
+        self.assertEqual(len(model.proj.k_projs), 4)
+        self.assertEqual(len(model.proj.v_projs), 4)
+        self.assertEqual(len(model.proj.o_projs), 4)
+        self.assertEqual(len(model.proj.query_gate_projs), 3)
 
     def test_visual_adapter_projects_each_stream_without_identity_layout(self):
         with torch.device("meta"):

@@ -501,6 +501,7 @@ class MMChatDataset(IterableDataset, Stateful):
         infinite: bool = False,
         max_aspect_ratio: float = 50.0,
         pixel_values_dtype: str | None = "float32",
+        image_token_merge_size: int | None = None,
     ) -> None:
         if text_dataset is not None and not 0.0 <= text_sample_probability <= 1.0:
             raise ValueError(
@@ -521,6 +522,7 @@ class MMChatDataset(IterableDataset, Stateful):
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
+        self.image_token_merge_size = image_token_merge_size or spatial_merge_size
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.image_mean = image_mean
@@ -619,6 +621,7 @@ class MMChatDataset(IterableDataset, Stateful):
                     patch_size=self.patch_size,
                     temporal_patch_size=self.temporal_patch_size,
                     spatial_merge_size=self.spatial_merge_size,
+                    image_token_merge_size=self.image_token_merge_size,
                     min_pixels=self.min_pixels,
                     max_pixels=self.max_pixels,
                     image_mean=self.image_mean,
@@ -980,6 +983,7 @@ class MMChatDataLoader(ParallelAwareDataloader):
         max_aspect_ratio: float = 50.0
         pixel_values_dtype: str | None = "float32"
         vit_patch_bucket_size: int = 0
+        image_token_merge_size: int | None = None
 
     def __init__(
         self,
@@ -1055,6 +1059,7 @@ class MMChatDataLoader(ParallelAwareDataloader):
             infinite=config.infinite,
             max_aspect_ratio=config.max_aspect_ratio,
             pixel_values_dtype=config.pixel_values_dtype,
+            image_token_merge_size=config.image_token_merge_size,
         )
         collate_fn = MMChatCollator(
             batch_size=local_batch_size,

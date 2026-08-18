@@ -619,6 +619,10 @@ class Qwen3VLVisionEncoder(Module):
 
         # DeepStack: layer indices for extracting intermediate visual features
         deepstack_visual_indices: list[int] = field(default_factory=lambda: [7, 15, 23])
+        # Cross-attention consumers use post-block features at the native ViT
+        # width. In this mode the final post-block feature is appended after
+        # the selected intermediate features and no per-depth merger is built.
+        raw_deepstack_features: bool = False
 
         # Per-layer Linear configs for vision encoder sub-modules
         patch_embed_proj: Linear.Config
@@ -692,8 +696,11 @@ class Qwen3VLVisionEncoder(Module):
             layer_idx: deepstack_idx
             for deepstack_idx, layer_idx in enumerate(config.deepstack_visual_indices)
         }
+        self.raw_deepstack_features = config.raw_deepstack_features
         self.deepstack_merger_list = ModuleList(
-            [
+            []
+            if config.raw_deepstack_features
+            else [
                 PatchMerger(
                     hidden_size=config.dim,
                     out_hidden_size=config.out_hidden_size,
@@ -827,6 +834,7 @@ class Qwen3VLVisionEncoder(Module):
         rope_cache: torch.Tensor,
         attention_mask: BlockMask,
         trim_real_len: int | None,
+        trim_real_patch_len: int | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Run transformer layers and collect DeepStack features.
 
@@ -835,8 +843,13 @@ class Qwen3VLVisionEncoder(Module):
         on the padded path it is ``None``.
         """
 
-        def trim(x: torch.Tensor) -> torch.Tensor:
+        def trim_merged(x: torch.Tensor) -> torch.Tensor:
             return x.squeeze(0)[:trim_real_len] if trim_real_len is not None else x
+
+        def trim_raw(x: torch.Tensor) -> torch.Tensor:
+            if trim_real_patch_len is None:
+                return x
+            return x.squeeze(0)[:trim_real_patch_len]
 
         deepstack_features: list[torch.Tensor] = []
         for layer_idx, layer in self.layers.items():
@@ -847,10 +860,15 @@ class Qwen3VLVisionEncoder(Module):
             )
             idx = self._deepstack_index_by_layer.get(int(layer_idx))
             if idx is not None:
-                deepstack_features.append(
-                    trim(self.deepstack_merger_list[idx](hidden_states))
-                )
-        return trim(self.merger(hidden_states)), deepstack_features
+                if self.raw_deepstack_features:
+                    deepstack_features.append(trim_raw(hidden_states))
+                else:
+                    deepstack_features.append(
+                        trim_merged(self.deepstack_merger_list[idx](hidden_states))
+                    )
+        if self.raw_deepstack_features:
+            deepstack_features.append(trim_raw(hidden_states))
+        return trim_merged(self.merger(hidden_states)), deepstack_features
 
     def _forward_flat(
         self,
@@ -926,6 +944,7 @@ class Qwen3VLVisionEncoder(Module):
             rope_cache=rope_cache,
             attention_mask=attention_mask,
             trim_real_len=real_num_patch // self.spatial_merge_unit,
+            trim_real_patch_len=real_num_patch,
         )
 
     def forward(

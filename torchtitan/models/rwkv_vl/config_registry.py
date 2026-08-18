@@ -75,18 +75,31 @@ class RWKVVLTrainerConfig(Trainer.Config):
     projector_ffn: str | None = None
     """Override ``proj.ffn`` (``relu``, ``gelu``, or ``swiglu``)."""
 
-    projector_num_heads: int | None = None
-    """Number of cross-attention heads (cross_attn projector only)."""
+    projector_num_query_heads: int | None = None
+    """Number of GQA query heads (cross_attn projector only)."""
 
-    projector_head_dim: int | None = None
-    """Cross-attention head dim (cross_attn projector only)."""
+    projector_num_key_value_heads: int | None = None
+    """Number of distinct GQA key/value heads (cross_attn only). Each KV head
+    serves a group of query heads and owns independently learned channels."""
+
+    tie_projector_qkvo: bool = True
+    """Share RWKV Q and visual K/V/output projections across retrieval depths.
+    The TokenPacker seed query projection remains separate because its input
+    width differs; when untied, its K/V/output projections are separate too."""
+
+    projector_visual_layer_indices: list[int] | None = None
+    """Post-block ViT layers exposed as raw DeepStack memories."""
+
+    projector_language_layer_indices: list[int] | None = None
+    """RWKV layers after which the corresponding visual memory is retrieved."""
 
     projector_extra_merge_size: int | None = None
-    """Extra projector-side ``PatchMerger`` ratio. The processor's spatial
-    merge size and the dataloader collator's merge size are both derived from
-    this and the vision encoder's ``spatial_merge_size``
+    """TokenPacker query-grid downsampling ratio. The processor's image-token
+    merge size is derived from this and the vision encoder's native
+    ``spatial_merge_size``
     (``processor_merge = vision_merge * projector_extra_merge_size``).
-    ``1`` (default) keeps the existing ``mlp``-projector behavior. Only
+    ViT patch ordering and collator padding remain at the native merge size.
+    ``1`` keeps the native image-token resolution. Only
     meaningful with ``projector_kind='cross_attn'``."""
 
     projector_q_bucket: int | None = None

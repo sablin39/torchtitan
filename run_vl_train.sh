@@ -87,28 +87,33 @@ train_config="rwkv_vl_1_5b_v400m_chat"
 backbone_chunk_size="64"
 
 # --- Visual projector ----------------------------------------------------------
-# "mlp" (default) uses the original ReLU/LayerNorm projector and is bit-
-# identical to the pre-refactor checkpoint format. "cross_attn" replaces the
-# additive DeepStack injection with masked cross-attention between
-# <image_pad> queries and projected DeepStack K/V (one cross-attn per level,
-# matched to one LLM layer).
-projector_kind="mlp"
+# "cross_attn" uses TokenPacker seed queries followed by masked retrieval from
+# raw ViT DeepStack memories at selected RWKV layers. "mlp" keeps the additive
+# projected-DeepStack variant.
+projector_kind="cross_attn"
 # Norm used inside the projector ("layernorm" or "rmsnorm").
 projector_norm="layernorm"
-# Inner-FFN activation ("relu" / "gelu" / "swiglu"). For cross_attn this picks
-# the post-attention FFN; for mlp it picks the inner activation.
+# Inner-FFN activation for the MLP projector ("relu" / "gelu" / "swiglu").
+# The cross-attention projector does not use an FFN.
 projector_ffn="relu"
-# Extra projector-side PatchMerger ratio. ``1`` (default) keeps the existing
-# additive-DeepStack behavior. Set > 1 to compress the projector main stream
-# so the processor produces fewer <image_pad> tokens per image than vision
-# K/V tokens. The processor and dataloader merge sizes are derived
-# automatically as ``vision_encoder.spatial_merge_size * this``. Only
-# supported with projector_kind=cross_attn.
-projector_extra_merge_size="1"
-# Cross-attention head config (cross_attn only). project_dim must equal
-# num_heads * head_dim; leave head_dim empty to default to project_dim/num_heads.
-projector_num_heads="8"
-projector_head_dim=""
+# Comma-separated post-block ViT memories and corresponding RWKV injection
+# layers. Empty uses the selected flavor defaults: 100M -> 2,6,9 and 400M ->
+# 5,11,17; both 24-layer RWKV flavors inject after layers 2,9,16.
+projector_visual_layer_indices=""
+projector_language_layer_indices=""
+# GQA layout. Empty derives the flavor defaults from the ViT: 12Q/6KV for the
+# 100M encoder and 16Q/8KV for the 400M encoder. This 2:1 GQA layout doubles
+# K/V capacity over the previous 4:1 setting without widening Q attention.
+projector_num_query_heads=""
+projector_num_key_value_heads=""
+# 1 shares RWKV-Q and visual-K/V/output projections across all retrieval depths
+# and the TokenPacker seed K/V/O path. 0 gives every depth its own Q/K/V/O set
+# and gives the seed path its own K/V/O set.
+tie_projector_qkvo="1"
+# TokenPacker query-grid downsampling ratio. The processor inserts image tokens
+# at vision_spatial_merge_size * this ratio while the frozen ViT keeps its native
+# patch order. Only supported with projector_kind=cross_attn when greater than 1.
+projector_extra_merge_size="2"
 # Static FlexAttention buckets for the cross_attn projector (cross_attn only).
 # Each forward pads Q and K/V to exactly these sizes so the compiled FlexAttention
 # kernel sees a single static shape. Pick values >= the largest expected per-batch
@@ -387,7 +392,8 @@ require_bool() {
 }
 
 for bool_name in \
-    debugging; do
+    debugging \
+    tie_projector_qkvo; do
     require_bool "${bool_name}"
 done
 
@@ -511,6 +517,56 @@ print(getattr(registry, '${train_config}')().model_spec.flavor)
     exit 2
 fi
 
+if ! projector_defaults="$("${python_cmd}" -c "
+import importlib
+registry = importlib.import_module('torchtitan.models.${model_name}.config_registry')
+model = getattr(registry, '${train_config}')().model_spec.model
+print(
+    ','.join(str(index) for index in model.vision_encoder.deepstack_visual_indices),
+    ','.join(str(index) for index in model.proj.language_layer_indices),
+    model.proj.num_query_heads,
+    model.proj.num_key_value_heads,
+    sep='\t',
+)
+")"; then
+    echo "Failed to resolve projector defaults from train_config: ${train_config}" >&2
+    exit 2
+fi
+IFS=$'\t' read -r \
+    default_projector_visual_layers \
+    default_projector_language_layers \
+    default_projector_query_heads \
+    default_projector_kv_heads <<< "${projector_defaults}"
+projector_visual_layer_indices="${projector_visual_layer_indices:-${default_projector_visual_layers}}"
+projector_language_layer_indices="${projector_language_layer_indices:-${default_projector_language_layers}}"
+projector_num_query_heads="${projector_num_query_heads:-${default_projector_query_heads}}"
+projector_num_key_value_heads="${projector_num_key_value_heads:-${default_projector_kv_heads}}"
+
+IFS=',' read -r -a projector_visual_layers <<< "${projector_visual_layer_indices}"
+IFS=',' read -r -a projector_language_layers <<< "${projector_language_layer_indices}"
+if (( ${#projector_visual_layers[@]} != ${#projector_language_layers[@]} )); then
+    echo "projector visual and language layer lists must have equal length." >&2
+    exit 2
+fi
+for layer_index in "${projector_visual_layers[@]}" "${projector_language_layers[@]}"; do
+    if ! [[ "${layer_index}" =~ ^[0-9]+$ ]]; then
+        echo "projector layer indices must be non-negative integers, got: ${layer_index}" >&2
+        exit 2
+    fi
+done
+if ! [[ "${projector_num_query_heads}" =~ ^[0-9]+$ ]] || (( projector_num_query_heads < 1 )); then
+    echo "projector_num_query_heads must be a positive integer." >&2
+    exit 2
+fi
+if ! [[ "${projector_num_key_value_heads}" =~ ^[0-9]+$ ]] || (( projector_num_key_value_heads < 1 )); then
+    echo "projector_num_key_value_heads must be a positive integer." >&2
+    exit 2
+fi
+if (( projector_num_query_heads % projector_num_key_value_heads != 0 )); then
+    echo "projector_num_query_heads must be divisible by projector_num_key_value_heads." >&2
+    exit 2
+fi
+
 dcp_dir="${output_root}/dcp_from_hf"
 if [[ -n "${resume_dcp_path}" ]]; then
     # Reuse the HF assets of the run that produced the checkpoint
@@ -609,6 +665,13 @@ echo "Bucketing:"
 echo "  ViT patches:   ${vit_patch_bucket_size} (0 disables)"
 echo "  Inductor dir:  ${torchinductor_cache_dir:-<torch default>}"
 echo "  TORCH_LOGS:    ${torch_logs:-<unset>}"
+echo "Projector:"
+echo "  Kind:          ${projector_kind}"
+echo "  ViT layers:    ${projector_visual_layer_indices}"
+echo "  RWKV layers:   ${projector_language_layer_indices}"
+echo "  Q/KV heads:    ${projector_num_query_heads}/${projector_num_key_value_heads}"
+echo "  Tie QKVO:      ${tie_projector_qkvo}"
+echo "  Extra merge:   ${projector_extra_merge_size}"
 echo "Datasets:"
 echo "  Image-text:    ${dataset_path}"
 echo "  Text:          ${text_dataset_path:-<disabled>}"
@@ -658,11 +721,14 @@ fi
 if [[ -n "${projector_ffn}" ]]; then
     export_args+=(--projector-ffn "${projector_ffn}")
 fi
-if [[ -n "${projector_num_heads}" ]]; then
-    export_args+=(--projector-num-heads "${projector_num_heads}")
-fi
-if [[ -n "${projector_head_dim}" ]]; then
-    export_args+=(--projector-head-dim "${projector_head_dim}")
+export_args+=(--projector-visual-layer-indices "${projector_visual_layer_indices}")
+export_args+=(--projector-language-layer-indices "${projector_language_layer_indices}")
+export_args+=(--projector-num-query-heads "${projector_num_query_heads}")
+export_args+=(--projector-num-key-value-heads "${projector_num_key_value_heads}")
+if [[ "${tie_projector_qkvo}" == "1" ]]; then
+    export_args+=(--tie-projector-qkvo)
+else
+    export_args+=(--no-tie-projector-qkvo)
 fi
 if [[ -n "${projector_extra_merge_size}" ]]; then
     export_args+=(--projector-extra-merge-size "${projector_extra_merge_size}")
@@ -687,11 +753,14 @@ fi
 if [[ -n "${projector_ffn}" ]]; then
     convert_proj_args+=(--projector_ffn "${projector_ffn}")
 fi
-if [[ -n "${projector_num_heads}" ]]; then
-    convert_proj_args+=(--projector_num_heads "${projector_num_heads}")
-fi
-if [[ -n "${projector_head_dim}" ]]; then
-    convert_proj_args+=(--projector_head_dim "${projector_head_dim}")
+convert_proj_args+=(--projector_visual_layer_indices "${projector_visual_layers[@]}")
+convert_proj_args+=(--projector_language_layer_indices "${projector_language_layers[@]}")
+convert_proj_args+=(--projector_num_query_heads "${projector_num_query_heads}")
+convert_proj_args+=(--projector_num_key_value_heads "${projector_num_key_value_heads}")
+if [[ "${tie_projector_qkvo}" == "1" ]]; then
+    convert_proj_args+=(--tie_projector_qkvo)
+else
+    convert_proj_args+=(--no-tie_projector_qkvo)
 fi
 if [[ -n "${projector_extra_merge_size}" ]]; then
     convert_proj_args+=(--projector_extra_merge_size "${projector_extra_merge_size}")
@@ -767,11 +836,14 @@ fi
 if [[ -n "${projector_ffn}" ]]; then
     train_args+=(--projector-ffn "${projector_ffn}")
 fi
-if [[ -n "${projector_num_heads}" ]]; then
-    train_args+=(--projector-num-heads "${projector_num_heads}")
-fi
-if [[ -n "${projector_head_dim}" ]]; then
-    train_args+=(--projector-head-dim "${projector_head_dim}")
+train_args+=(--projector-visual-layer-indices "${projector_visual_layers[@]}")
+train_args+=(--projector-language-layer-indices "${projector_language_layers[@]}")
+train_args+=(--projector-num-query-heads "${projector_num_query_heads}")
+train_args+=(--projector-num-key-value-heads "${projector_num_key_value_heads}")
+if [[ "${tie_projector_qkvo}" == "1" ]]; then
+    train_args+=(--tie-projector-qkvo)
+else
+    train_args+=(--no-tie-projector-qkvo)
 fi
 if [[ -n "${projector_extra_merge_size}" ]]; then
     train_args+=(--projector-extra-merge-size "${projector_extra_merge_size}")

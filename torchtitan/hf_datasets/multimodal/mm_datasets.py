@@ -98,6 +98,7 @@ def _process_mm_sample(
     max_pixels: int,
     image_mean: tuple[float, ...],
     image_std: tuple[float, ...],
+    image_token_merge_size: int | None = None,
     **kwargs,
 ) -> dict[str, Any] | None:
     """Common processing logic for multimodal samples.
@@ -138,6 +139,7 @@ def _process_mm_sample(
                 patch_size=patch_size,
                 temporal_patch_size=temporal_patch_size,
                 spatial_merge_size=spatial_merge_size,
+                image_token_merge_size=(image_token_merge_size or spatial_merge_size),
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
                 image_mean=image_mean,
@@ -157,13 +159,9 @@ def _process_mm_sample(
     processed_text = insert_vision_placeholders(
         texts,
         num_image_tokens,
-        # pyrefly: ignore [missing-attribute]
         vision_start_token=tokenizer.vision_start_token,
-        # pyrefly: ignore [missing-attribute]
         vision_token=tokenizer.image_token,
-        # pyrefly: ignore [missing-attribute]
         vision_end_token=tokenizer.vision_end_token,
-        # pyrefly: ignore [bad-argument-type]
         eos_token=tokenizer.eos_token,
     )
 
@@ -172,11 +170,8 @@ def _process_mm_sample(
     labels = torch.tensor(tokens)
 
     special_ids = [
-        # pyrefly: ignore [missing-attribute]
         tokenizer.vision_start_id,
-        # pyrefly: ignore [missing-attribute]
         tokenizer.vision_end_id,
-        # pyrefly: ignore [missing-attribute]
         tokenizer.image_id,
     ]
     video_id = getattr(tokenizer, "video_id", None)
@@ -217,6 +212,7 @@ def _process_obelics_sample(
         max_pixels=max_pixels,
         image_mean=image_mean,
         image_std=image_std,
+        image_token_merge_size=kwargs.get("image_token_merge_size"),
     )
 
 
@@ -250,6 +246,7 @@ def _process_cc12_wd_sample(
         max_pixels=max_pixels,
         image_mean=image_mean,
         image_std=image_std,
+        image_token_merge_size=kwargs.get("image_token_merge_size"),
     )
 
 
@@ -316,6 +313,7 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
         video_min_frames: int = 4,
         video_max_frames: int = 768,
         dataset_subset: str = "",
+        image_token_merge_size: int | None = None,
     ) -> None:
         dataset_name = dataset_name.lower()
 
@@ -337,6 +335,7 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
+        self.image_token_merge_size = image_token_merge_size or spatial_merge_size
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.image_mean = image_mean
@@ -367,6 +366,7 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
                     patch_size=self.patch_size,
                     temporal_patch_size=self.temporal_patch_size,
                     spatial_merge_size=self.spatial_merge_size,
+                    image_token_merge_size=self.image_token_merge_size,
                     min_pixels=self.min_pixels,
                     max_pixels=self.max_pixels,
                     image_mean=self.image_mean,
@@ -512,6 +512,12 @@ class MMDataLoader(ParallelAwareDataloader):
         image_std: tuple[float, ...]
         """Per-channel std for image normalization."""
 
+        image_token_merge_size: int | None = None
+        """Spatial patch ratio represented by one ``<image_pad>`` token.
+
+        ``spatial_merge_size`` remains the native ViT patch-layout merge.
+        """
+
         video_dir: str = ""
         """Base directory for video files (for datasets with video filename references)."""
 
@@ -544,6 +550,7 @@ class MMDataLoader(ParallelAwareDataloader):
             patch_size=config.patch_size,
             temporal_patch_size=config.temporal_patch_size,
             spatial_merge_size=config.spatial_merge_size,
+            image_token_merge_size=config.image_token_merge_size,
             min_pixels=config.min_pixels,
             max_pixels=config.max_pixels,
             image_mean=config.image_mean,

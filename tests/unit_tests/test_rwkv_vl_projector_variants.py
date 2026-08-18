@@ -22,16 +22,18 @@ from __future__ import annotations
 
 import gc
 import unittest
-from dataclasses import replace
 from functools import partial
 
 import torch
 import torch.nn as nn
+from torchtitan.hf_datasets.multimodal.processor import vision_to_patches
 
 from torchtitan.models.common import Linear
 from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
 from torchtitan.models.rwkv7.model import rwkv7_backbone_config
 from torchtitan.models.rwkv_vl.model import (
+    _query_position_encoding,
+    _tokenpacker_local_ids,
     RWKV7VLForConditionalGeneration,
     VisualAdapter,
 )
@@ -91,7 +93,8 @@ def _make_model_config(
     kind: str,
     extra_merge_size: int = 1,
     processor_merge_size: int = 2,
-    deepstack_indices: tuple[int, ...] = (1, 2, 3),
+    deepstack_indices: tuple[int, ...] = (0, 1, 2),
+    tie_qkvo: bool = True,
 ) -> RWKV7VLForConditionalGeneration.Config:
     vocab_size = 2048
     hidden_size = 256
@@ -121,13 +124,29 @@ def _make_model_config(
         ),
         proj=VisualAdapter.Config(
             encoder_dim=256,
+            vision_dim=128,
             hidden_dim=512,
             project_dim=hidden_size,
             num_deepstack=len(deepstack_indices),
             norm_eps=1e-5,
             kind=kind,
-            num_heads=4 if kind == "cross_attn" else None,
+            language_layer_indices=(0, 1, 2) if kind == "cross_attn" else (),
+            num_query_heads=4 if kind == "cross_attn" else None,
+            num_key_value_heads=1 if kind == "cross_attn" else None,
+            tie_qkvo=tie_qkvo,
+            spatial_merge_size=2,
             extra_merge_size=extra_merge_size,
+            kernel_options=(
+                {
+                    "USE_TMA": False,
+                    "fwd_BLOCK_M": 64,
+                    "fwd_BLOCK_N": 64,
+                    "fwd_num_stages": 3,
+                    "fwd_num_warps": 4,
+                }
+                if kind == "cross_attn"
+                else None
+            ),
         ),
         lm_head=Linear.Config(
             in_features=hidden_size,
@@ -168,7 +187,7 @@ def _make_inputs(
     )
     cursor = 8  # leave some text prefix
     grids = []
-    for (h, w) in images:
+    for h, w in images:
         n_pad = (1 * h * w) // (processor_merge**2)
         tokens[0, cursor : cursor + n_pad] = image_token_id
         cursor += n_pad + 4  # gap between images
@@ -180,6 +199,98 @@ def _make_inputs(
         total_patches, 3 * 2 * 16 * 16, device=device, generator=gen
     )
     return tokens, pixel_values, grid_thw
+
+
+class TestTokenPackerSpatialLayout(unittest.TestCase):
+    def test_native_patch_order_maps_to_aligned_local_regions(self):
+        image = torch.arange(64, dtype=torch.float32).view(1, 8, 8, 1)
+        patches, grid_thw = vision_to_patches(
+            image,
+            patch_size=1,
+            temporal_patch_size=1,
+            merge_size=2,
+        )
+        query_ids, memory_ids = _tokenpacker_local_ids(
+            grid_thw.unsqueeze(0),
+            spatial_merge_size=2,
+            extra_merge_size=2,
+        )
+        values = patches[:, 0].to(torch.long)
+        rows, columns = values // 8, values % 8
+        expected_regions = (rows // 4) * 2 + columns // 4
+        self.assertTrue(torch.equal(memory_ids.cpu(), expected_regions))
+        self.assertTrue(torch.equal(query_ids.cpu(), torch.arange(4)))
+
+    def test_query_position_encoding_breaks_seed_symmetry(self):
+        grid_thw = torch.tensor([[1, 8, 8]])
+        positions = _query_position_encoding(
+            grid_thw,
+            dim=128,
+            spatial_merge_size=2,
+            extra_merge_size=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(torch.unique(positions, dim=0).shape[0], 4)
+
+    def test_gqa_projection_shapes_and_depth_specific_norms(self):
+        adapter = VisualAdapter.Config(
+            encoder_dim=256,
+            vision_dim=128,
+            project_dim=256,
+            num_deepstack=3,
+            kind="cross_attn",
+            extra_merge_size=2,
+            spatial_merge_size=2,
+            language_layer_indices=(0, 1, 2),
+            num_query_heads=4,
+            num_key_value_heads=1,
+        ).build()
+        self.assertEqual(adapter.k_proj.weight.shape, (32, 128))
+        self.assertEqual(adapter.v_proj.weight.shape, (32, 128))
+        self.assertEqual(adapter.rwkv_q_proj.weight.shape, (128, 256))
+        self.assertEqual(adapter.o_proj.weight.shape, (256, 128))
+        self.assertEqual(len(adapter.query_norms), 3)
+        self.assertEqual(len(adapter.query_gate_projs), 3)
+        self.assertEqual(adapter.query_gate_projs[0].weight.shape, (4, 256))
+        self.assertEqual(len(adapter.memory_norms), 4)
+        self.assertEqual(len({id(norm) for norm in adapter.query_norms}), 3)
+        self.assertEqual(len({id(proj) for proj in adapter.query_gate_projs}), 3)
+        self.assertEqual(len({id(norm) for norm in adapter.memory_norms}), 4)
+
+        queries = torch.randn(2, 256)
+        _, gates = adapter._project_query_and_gate(0, queries)
+        self.assertEqual(gates.shape, (2, 4))
+        self.assertTrue(torch.all((gates > 0) & (gates < 1)))
+        self.assertFalse(torch.allclose(gates[0], gates[1]))
+
+    def test_untied_qkvo_are_depth_specific(self):
+        adapter = VisualAdapter.Config(
+            encoder_dim=256,
+            vision_dim=128,
+            project_dim=256,
+            num_deepstack=3,
+            kind="cross_attn",
+            extra_merge_size=2,
+            spatial_merge_size=2,
+            language_layer_indices=(0, 1, 2),
+            num_query_heads=4,
+            num_key_value_heads=2,
+            tie_qkvo=False,
+        ).build()
+        self.assertFalse(hasattr(adapter, "rwkv_q_proj"))
+        self.assertFalse(hasattr(adapter, "k_proj"))
+        self.assertFalse(hasattr(adapter, "v_proj"))
+        self.assertFalse(hasattr(adapter, "o_proj"))
+        self.assertEqual(len(adapter.rwkv_q_projs), 3)
+        self.assertEqual(len(adapter.k_projs), 4)
+        self.assertEqual(len(adapter.v_projs), 4)
+        self.assertEqual(len(adapter.o_projs), 4)
+        self.assertEqual(len(adapter.query_gate_projs), 3)
+        self.assertEqual(adapter.k_projs[0].weight.shape, (64, 128))
+        self.assertEqual(len({id(module) for module in adapter.k_projs}), 4)
+        self.assertEqual(len({id(module) for module in adapter.v_projs}), 4)
+        self.assertEqual(len({id(module) for module in adapter.o_projs}), 4)
 
 
 class TestRwkvVLProjectorVariants(unittest.TestCase):
@@ -231,9 +342,32 @@ class TestRwkvVLProjectorVariants(unittest.TestCase):
         self.assertTrue(torch.isfinite(out).all())
         out.float().mean().backward()
         # K/V projections in the cross-attn projector must receive grad.
-        kp = model.proj.deepstack[0].k_proj.weight
+        kp = model.proj.k_proj.weight
         self.assertIsNotNone(kp.grad)
         self.assertTrue(torch.isfinite(kp.grad).all())
+
+    def test_cross_attn_untied_qkvo_forward_backward(self):
+        model = self._build(kind="cross_attn", tie_qkvo=False)
+        tokens, pixel_values, grid_thw = _make_inputs(
+            device=self.device, image_token_id=model.config.image_token_id
+        )
+        out = model(tokens, pixel_values=pixel_values, grid_thw=grid_thw)
+        self.assertTrue(torch.isfinite(out).all())
+        out.float().mean().backward()
+        for collection_name in (
+            "rwkv_q_projs",
+            "query_gate_projs",
+            "k_projs",
+            "v_projs",
+            "o_projs",
+        ):
+            collection = getattr(model.proj, collection_name)
+            for depth, projection in enumerate(collection):
+                self.assertIsNotNone(
+                    projection.weight.grad,
+                    f"{collection_name}[{depth}] has no gradient",
+                )
+                self.assertTrue(torch.isfinite(projection.weight.grad).all())
 
     def test_cross_attn_with_extra_merge(self):
         """processor_merge=4, vision_merge=2 → extra_merge_size=2."""
@@ -250,9 +384,45 @@ class TestRwkvVLProjectorVariants(unittest.TestCase):
             images=[(8, 8), (8, 8)],
             processor_merge=4,
         )
+        attended_depths = []
+        original_attend = model.proj.attend
+
+        def record_attend(depth, *args, **kwargs):
+            attended_depths.append(depth)
+            return original_attend(depth, *args, **kwargs)
+
+        model.proj.attend = record_attend
         out = model(tokens, pixel_values=pixel_values, grid_thw=grid_thw)
         self.assertEqual(out.shape, (1, tokens.shape[1], model.vocab_size))
         self.assertTrue(torch.isfinite(out).all())
+        self.assertEqual(attended_depths, [0, 1, 2])
+
+    def test_cross_attn_text_only_path_skips_projector(self):
+        model = self._build(kind="cross_attn")
+        tokens = torch.randint(
+            2,
+            2000,
+            (1, 128),
+            dtype=torch.long,
+            device=self.device,
+        )
+        projector_called = []
+        handle = model.proj.register_forward_hook(
+            lambda module, args, output: projector_called.append(True)
+        )
+        try:
+            out = model(tokens)
+        finally:
+            handle.remove()
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertEqual(projector_called, [])
+        out.float().mean().backward()
+        for name, parameter in model.proj.named_parameters():
+            self.assertIsNotNone(parameter.grad, f"{name} has no gradient edge")
+            self.assertTrue(
+                torch.isfinite(parameter.grad).all(),
+                f"{name} gradient is not finite",
+            )
 
     def test_cross_image_attention_is_masked(self):
         """Swapping image B's K/V should not change image A's queries."""
@@ -270,9 +440,7 @@ class TestRwkvVLProjectorVariants(unittest.TestCase):
             patches_a = int((grid_a.prod()).item())
             pixel_values_alt = pixel_values.clone()
             pixel_values_alt[patches_a:].uniform_(-1, 1)
-            out2 = model(
-                tokens, pixel_values=pixel_values_alt, grid_thw=grid_thw
-            )
+            out2 = model(tokens, pixel_values=pixel_values_alt, grid_thw=grid_thw)
         # Image-A image_pad positions span tokens[0, 8:8+n_pad_a].
         n_pad_a = patches_a // (model.processor_spatial_merge_size**2)
         a_slice = (slice(None), slice(8, 8 + n_pad_a))

@@ -57,7 +57,7 @@ ProjectorKind = Literal["mlp", "cross_attn"]
 # (Q_LEN, KV_LEN) pairs. With ``projector_extra_merge_size > 1`` the K/V
 # stream can be ``extra_merge_size**2`` larger than Q for the same image,
 # so we generate the ladder on the fly instead of maintaining a static one.
-_BUCKET_MIN = 64
+_BUCKET_MIN = 128
 # Soft ceiling — values past this almost certainly indicate a config bug
 # (e.g. unbounded ``max_images_per_batch`` with a huge ``max_pixels``) and
 # a single FlexAttention kernel that large would also be a memory hazard.
@@ -407,121 +407,131 @@ class _VisualStreamProjector(Module):
         return x + self.pre_norm(x)
 
 
-class _VisualStreamCrossAttnProjector(Module):
-    """Cross-attention projector for one DeepStack level.
-
-    Forward projects encoder features into ``(k, v)`` tensors of shape
-    ``(N_kv, num_heads, head_dim)``. The actual attention runs inside
-    ``attend()``, which is invoked by the caller from inside the LLM's
-    ``after_layer`` callback (queries come from the per-layer hidden state).
-
-    Queries have **no Linear projection** (per design) — only ``q_norm`` is
-    applied to the gathered ``<image_pad>`` hidden states before the
-    head-axis reshape. ``project_dim`` must equal ``num_heads * head_dim``.
-    """
-
-    def __init__(
-        self,
-        *,
-        encoder_dim: int,
-        project_dim: int,
-        num_heads: int,
-        head_dim: int,
-        norm_eps: float,
-        norm: NormKind = "layernorm",
-        kernel_options: dict | None = None,
-    ):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.project_dim = project_dim
-        self.kv_norm = _build_norm(norm, encoder_dim, norm_eps)
-        self.k_proj = _projector_linear(encoder_dim, num_heads * head_dim, bias=False)
-        self.v_proj = _projector_linear(encoder_dim, num_heads * head_dim, bias=False)
-        self.q_norm = _build_norm(norm, project_dim, norm_eps)
-        self.o_proj = _projector_linear(num_heads * head_dim, project_dim, bias=False)
-        self.kernel_options = dict(_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT)
-        if kernel_options:
-            self.kernel_options.update(kernel_options)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project encoder features to ``(k, v)`` tensors.
-
-        Args:
-            x: ``(N_kv, encoder_dim)`` flat-concatenated deepstack features
-               for this level (post-merge), padded with zero rows if the
-               dataloader bucketed the patch count.
-
-        Returns:
-            ``(k, v)`` each of shape ``(N_kv, num_heads, head_dim)``.
-        """
-        x = self.kv_norm(x)
-        k = self.k_proj(x).reshape(-1, self.num_heads, self.head_dim)
-        v = self.v_proj(x).reshape(-1, self.num_heads, self.head_dim)
-        return k, v
-
-    def attend(
-        self,
-        q_real: torch.Tensor,
-        k_real: torch.Tensor,
-        v_real: torch.Tensor,
-        *,
-        block_mask: BlockMask,
-        q_bucket: int,
-        kv_bucket: int,
-    ) -> torch.Tensor:
-        """Run masked cross-attention for one level and return the per-q delta.
-
-        Args:
-            q_real: ``(Q_real, project_dim)`` query hidden states gathered
-                from ``<image_pad>`` positions (LLM-side, unnormalized).
-            k_real: ``(KV_real, num_heads, head_dim)`` keys.
-            v_real: ``(KV_real, num_heads, head_dim)`` values.
-            block_mask: precomputed FlexAttention mask of shape
-                ``(B=1, H=None, q_bucket, kv_bucket)`` whose ``mask_mod``
-                enforces same-image attention and excludes padding rows.
-            q_bucket / kv_bucket: padded lengths used to build ``block_mask``.
-
-        Returns:
-            ``(Q_real, project_dim)`` delta to ADD into the LLM hidden state
-            at the ``<image_pad>`` positions that produced ``q_real``. The
-            block is intentionally minimal — pre-norm Q, cross-attention,
-            output projection — with no post-attn FFN.
-        """
-        q_real_len = q_real.shape[0]
-        kv_real_len = k_real.shape[0]
-        if q_real_len > q_bucket:
-            raise ValueError(f"q_real_len={q_real_len} exceeds q_bucket={q_bucket}")
-        if kv_real_len > kv_bucket:
-            raise ValueError(f"kv_real_len={kv_real_len} exceeds kv_bucket={kv_bucket}")
-
-        q_in = self.q_norm(q_real)
-        # Pad to bucket lengths along the sequence axis.
-        q_pad = F.pad(q_in, (0, 0, 0, q_bucket - q_real_len))
-        k_pad = F.pad(k_real, (0, 0, 0, 0, 0, kv_bucket - kv_real_len))
-        v_pad = F.pad(v_real, (0, 0, 0, 0, 0, kv_bucket - kv_real_len))
-
-        # flex_attention expects ``(bs, heads, seq, dim)``.
-        q4 = q_pad.reshape(1, q_bucket, self.num_heads, self.head_dim).transpose(1, 2)
-        k4 = k_pad.reshape(1, kv_bucket, self.num_heads, self.head_dim).transpose(1, 2)
-        v4 = v_pad.reshape(1, kv_bucket, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn = _cross_attn_flex(
-            q4,
-            k4,
-            v4,
-            block_mask=block_mask,
-            kernel_options=self.kernel_options,
+def _flatten_visual_features(
+    features: torch.Tensor,
+    counts: torch.Tensor,
+) -> torch.Tensor:
+    """Remove per-image padding while preserving Qwen's native patch order."""
+    count_list = [int(count) for count in counts.tolist()]
+    if features.dim() == 2:
+        return features[: sum(count_list)]
+    if features.dim() != 3 or features.shape[0] != len(count_list):
+        raise ValueError(
+            "Visual features must be flat or padded per image; got "
+            f"shape={tuple(features.shape)} for {len(count_list)} images"
         )
-        # ``attn`` is ``(1, heads, q_bucket, dim)``. Transpose, trim, flatten.
-        attn = attn.transpose(1, 2)[0, :q_real_len].reshape(q_real_len, -1)
-        return self.o_proj(attn)
+    return torch.cat(
+        [features[index, :count] for index, count in enumerate(count_list)], dim=0
+    )
+
+
+def _tokenpacker_query_seeds(
+    merged_features: torch.Tensor,
+    grid_thw: torch.Tensor,
+    *,
+    spatial_merge_size: int,
+    extra_merge_size: int,
+) -> torch.Tensor:
+    """Bilinearly resample native merged ViT features onto the query grid."""
+    merged_counts = grid_thw.prod(-1) // (spatial_merge_size**2)
+    merged_features = _flatten_visual_features(merged_features, merged_counts)
+    chunks = merged_features.split([int(n) for n in merged_counts.tolist()])
+    query_chunks = []
+    for chunk, grid in zip(chunks, grid_thw.tolist(), strict=True):
+        temporal, height, width = (int(value) for value in grid)
+        merged_height = height // spatial_merge_size
+        merged_width = width // spatial_merge_size
+        query_height = merged_height // extra_merge_size
+        query_width = merged_width // extra_merge_size
+        feature_grid = chunk.view(
+            temporal, merged_height, merged_width, chunk.shape[-1]
+        ).permute(0, 3, 1, 2)
+        query_grid = F.interpolate(
+            feature_grid.float(),
+            size=(query_height, query_width),
+            mode="bilinear",
+            align_corners=False,
+        ).to(chunk.dtype)
+        query_chunks.append(query_grid.permute(0, 2, 3, 1).reshape(-1, chunk.shape[-1]))
+    return torch.cat(query_chunks, dim=0)
+
+
+def _query_position_encoding(
+    grid_thw: torch.Tensor,
+    *,
+    dim: int,
+    spatial_merge_size: int,
+    extra_merge_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if dim % 4 != 0:
+        raise ValueError(f"2D query position encoding requires dim % 4 == 0, got {dim}")
+    quarter_dim = dim // 4
+    frequency = torch.exp(
+        -torch.arange(quarter_dim, device=device, dtype=torch.float32)
+        * (torch.log(torch.tensor(10000.0, device=device)) / max(quarter_dim - 1, 1))
+    )
+    chunks = []
+    merge = spatial_merge_size * extra_merge_size
+    for temporal, height, width in grid_thw.tolist():
+        query_height = int(height) // merge
+        query_width = int(width) // merge
+        y = torch.linspace(0.0, 1.0, query_height, device=device)
+        x = torch.linspace(0.0, 1.0, query_width, device=device)
+        y_grid, x_grid = torch.meshgrid(y, x, indexing="ij")
+        y_phase = y_grid.reshape(-1, 1) * (2 * torch.pi) * frequency.reshape(1, -1)
+        x_phase = x_grid.reshape(-1, 1) * (2 * torch.pi) * frequency.reshape(1, -1)
+        spatial = torch.cat(
+            [y_phase.sin(), y_phase.cos(), x_phase.sin(), x_phase.cos()], dim=-1
+        )
+        chunks.append(spatial.repeat(int(temporal), 1))
+    return torch.cat(chunks, dim=0).to(dtype=dtype)
+
+
+def _tokenpacker_local_ids(
+    grid_thw: torch.Tensor,
+    *,
+    spatial_merge_size: int,
+    extra_merge_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return matching query/KV region ids in native Qwen patch order."""
+    device = grid_thw.device
+    query_ids = []
+    memory_ids = []
+    region_offset = 0
+    for temporal, height, width in grid_thw.tolist():
+        temporal, height, width = int(temporal), int(height), int(width)
+        query_height = height // (spatial_merge_size * extra_merge_size)
+        query_width = width // (spatial_merge_size * extra_merge_size)
+        ids = torch.arange(
+            temporal * query_height * query_width, device=device, dtype=torch.long
+        ).view(temporal, query_height, query_width)
+        query_ids.append(ids.reshape(-1) + region_offset)
+        full_grid = ids.repeat_interleave(
+            spatial_merge_size * extra_merge_size, dim=1
+        ).repeat_interleave(spatial_merge_size * extra_merge_size, dim=2)
+        native_order = (
+            full_grid.view(
+                temporal,
+                height // spatial_merge_size,
+                spatial_merge_size,
+                width // spatial_merge_size,
+                spatial_merge_size,
+            )
+            .permute(0, 1, 3, 2, 4)
+            .reshape(-1)
+        )
+        memory_ids.append(native_order + region_offset)
+        region_offset += temporal * query_height * query_width
+    return torch.cat(query_ids), torch.cat(memory_ids)
 
 
 class VisualAdapter(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         encoder_dim: int = 1024
+        vision_dim: int | None = None
         hidden_dim: int | None = None
         project_dim: int = 1024
         num_deepstack: int = 0
@@ -531,20 +541,21 @@ class VisualAdapter(Module):
         kind: ProjectorKind = "mlp"
         norm: NormKind = "layernorm"
         ffn: FFNKind = "relu"
-        # Extra `PatchMerger` applied to the main vision stream when the
-        # processor uses a coarser merge size than the vision encoder
+        # TokenPacker query-grid downsampling ratio when the processor uses a
+        # coarser image-token grid than the vision encoder
         # (image_pad count < K/V token count). The ratio is
         # ``processor_spatial_merge_size / vision_spatial_merge_size`` and
-        # must be a positive integer. ``1`` (default) means the extra
-        # merger is omitted entirely. Only meaningful when
+        # must be a positive integer. ``1`` keeps the native merged-token
+        # resolution. Only meaningful when
         # ``kind == "cross_attn"`` — with ``kind == "mlp"`` the deepstack
         # streams also need to match image_pad length, so we currently
         # require the two merge sizes to be equal in that case.
         extra_merge_size: int = 1
-        # `cross_attn`-only fields. Unused (and required to be left as default)
-        # when ``kind == "mlp"``.
-        num_heads: int | None = None
-        head_dim: int | None = None
+        spatial_merge_size: int = 2
+        language_layer_indices: tuple[int, ...] = ()
+        num_query_heads: int | None = None
+        num_key_value_heads: int | None = None
+        tie_qkvo: bool = True
         # Powers-of-two ladders for FlexAttention Q_LEN / KV_LEN buckets. Each
         # forward picks the smallest bucket that fits the current shape and
         # pads the rest with masked rows. ``None`` -> no bucketing (rebuild
@@ -578,65 +589,208 @@ class VisualAdapter(Module):
         self.num_deepstack = config.num_deepstack
         self.kind = config.kind
         self.extra_merge_size = config.extra_merge_size
-        # Main stream MLP also handles the optional extra spatial merge.
-        # When extra_merge_size>1 the MLP's input dim becomes
-        # ``encoder_dim * extra_merge_size**2`` and ``merge_size`` tokens get
-        # concatenated channel-wise before the MLP (the PatchMerger pattern).
-        self.main = _VisualStreamProjector(
-            encoder_dim=config.encoder_dim,
-            hidden_dim=self.hidden_dim,
-            project_dim=config.project_dim,
-            norm_eps=config.norm_eps,
-            norm=config.norm,
-            ffn=config.ffn,
-            merge_size=config.extra_merge_size,
-        )
-        self.deepstack = ModuleList(
-            [
-                self._build_deepstack_projector(config)
-                for _ in range(config.num_deepstack)
-            ]
-        )
-
-    @staticmethod
-    def _build_deepstack_projector(config: "VisualAdapter.Config") -> Module:
-        hidden_dim = config.hidden_dim or config.project_dim * 4
+        self.language_layer_indices = tuple(config.language_layer_indices)
+        self.tie_qkvo = config.tie_qkvo
         if config.kind == "mlp":
-            return _VisualStreamProjector(
+            self.main = _VisualStreamProjector(
                 encoder_dim=config.encoder_dim,
-                hidden_dim=hidden_dim,
+                hidden_dim=self.hidden_dim,
                 project_dim=config.project_dim,
                 norm_eps=config.norm_eps,
                 norm=config.norm,
                 ffn=config.ffn,
+                merge_size=config.extra_merge_size,
             )
-        if config.kind == "cross_attn":
-            if config.num_heads is None:
-                raise ValueError(
-                    "VisualAdapter.Config.num_heads is required when kind='cross_attn'"
-                )
-            head_dim = config.head_dim or (config.project_dim // config.num_heads)
-            if config.num_heads * head_dim != config.project_dim:
-                raise ValueError(
-                    f"cross_attn projector requires num_heads*head_dim "
-                    f"({config.num_heads}*{head_dim}) == project_dim "
-                    f"({config.project_dim}); queries have no Linear projection."
-                )
-            return _VisualStreamCrossAttnProjector(
-                encoder_dim=config.encoder_dim,
-                project_dim=config.project_dim,
-                num_heads=config.num_heads,
-                head_dim=head_dim,
-                norm_eps=config.norm_eps,
-                norm=config.norm,
-                kernel_options=config.kernel_options,
+            self.deepstack = ModuleList(
+                [
+                    _VisualStreamProjector(
+                        encoder_dim=config.encoder_dim,
+                        hidden_dim=self.hidden_dim,
+                        project_dim=config.project_dim,
+                        norm_eps=config.norm_eps,
+                        norm=config.norm,
+                        ffn=config.ffn,
+                    )
+                    for _ in range(config.num_deepstack)
+                ]
             )
-        raise ValueError(f"Unknown projector kind: {config.kind!r}")
+            return
+        if config.kind != "cross_attn":
+            raise ValueError(f"Unknown projector kind: {config.kind!r}")
+
+        if config.norm != "layernorm":
+            raise ValueError("cross_attn uses separate LayerNorms at every depth")
+        self.vision_dim = config.vision_dim or config.encoder_dim
+        self.num_query_heads = config.num_query_heads or 1
+        self.num_key_value_heads = config.num_key_value_heads or self.num_query_heads
+        if self.vision_dim % self.num_query_heads != 0:
+            raise ValueError(
+                f"vision_dim={self.vision_dim} must be divisible by "
+                f"num_query_heads={self.num_query_heads}"
+            )
+        if self.num_query_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                "num_query_heads must be divisible by num_key_value_heads; got "
+                f"{self.num_query_heads} and {self.num_key_value_heads}"
+            )
+        if len(self.language_layer_indices) != config.num_deepstack:
+            raise ValueError(
+                "language_layer_indices must have one entry per visual depth; got "
+                f"{self.language_layer_indices} for {config.num_deepstack} depths"
+            )
+        if (
+            tuple(sorted(set(self.language_layer_indices)))
+            != self.language_layer_indices
+        ):
+            raise ValueError("language_layer_indices must be unique and increasing")
+
+        self.head_dim = self.vision_dim // self.num_query_heads
+        kv_dim = self.num_key_value_heads * self.head_dim
+        self.seed_query_norm = LayerNorm(config.encoder_dim, eps=config.norm_eps)
+        self.seed_output_norm = LayerNorm(self.vision_dim, eps=config.norm_eps)
+        self.query_norms = ModuleList(
+            [
+                LayerNorm(config.project_dim, eps=config.norm_eps)
+                for _ in range(config.num_deepstack)
+            ]
+        )
+        self.query_gate_projs = ModuleList(
+            [
+                _projector_linear(config.project_dim, self.num_query_heads, bias=False)
+                for _ in range(config.num_deepstack)
+            ]
+        )
+        self.memory_norms = ModuleList(
+            [
+                LayerNorm(self.vision_dim, eps=config.norm_eps)
+                for _ in range(config.num_deepstack + 1)
+            ]
+        )
+        self.seed_q_proj = _projector_linear(
+            config.encoder_dim, self.vision_dim, bias=False
+        )
+        if self.tie_qkvo:
+            # One projection set is reused at every visual/RWKV depth and by
+            # the TokenPacker seed retrieval. GQA independently shares each
+            # KV-head slice among a group of query heads.
+            self.rwkv_q_proj = _projector_linear(
+                config.project_dim, self.vision_dim, bias=False
+            )
+            self.k_proj = _projector_linear(self.vision_dim, kv_dim, bias=False)
+            self.v_proj = _projector_linear(self.vision_dim, kv_dim, bias=False)
+            self.o_proj = _projector_linear(
+                self.vision_dim, config.project_dim, bias=False
+            )
+        else:
+            self.rwkv_q_projs = ModuleList(
+                [
+                    _projector_linear(config.project_dim, self.vision_dim, bias=False)
+                    for _ in range(config.num_deepstack)
+                ]
+            )
+            self.k_projs = ModuleList(
+                [
+                    _projector_linear(self.vision_dim, kv_dim, bias=False)
+                    for _ in range(config.num_deepstack + 1)
+                ]
+            )
+            self.v_projs = ModuleList(
+                [
+                    _projector_linear(self.vision_dim, kv_dim, bias=False)
+                    for _ in range(config.num_deepstack + 1)
+                ]
+            )
+            self.o_projs = ModuleList(
+                [
+                    _projector_linear(self.vision_dim, config.project_dim, bias=False)
+                    for _ in range(config.num_deepstack + 1)
+                ]
+            )
+        self.kernel_options = dict(_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT)
+        if config.kernel_options:
+            self.kernel_options.update(config.kernel_options)
+
+    def _project_memory(
+        self, features: torch.Tensor, *, depth: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.memory_norms[depth](features)
+        k_proj = self.k_proj if self.tie_qkvo else self.k_projs[depth]
+        v_proj = self.v_proj if self.tie_qkvo else self.v_projs[depth]
+        keys = k_proj(features).reshape(-1, self.num_key_value_heads, self.head_dim)
+        values = v_proj(features).reshape(-1, self.num_key_value_heads, self.head_dim)
+        return keys, values
+
+    def _project_query_and_gate(
+        self, depth: int, query_hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query_hidden_states = self.query_norms[depth](query_hidden_states)
+        q_proj = self.rwkv_q_proj if self.tie_qkvo else self.rwkv_q_projs[depth]
+        queries = q_proj(query_hidden_states)
+        gates = torch.sigmoid(self.query_gate_projs[depth](query_hidden_states))
+        return queries, gates
+
+    def _project_output(self, depth: int, attended: torch.Tensor) -> torch.Tensor:
+        o_proj = self.o_proj if self.tie_qkvo else self.o_projs[depth]
+        return o_proj(attended)
+
+    def _attention(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        block_mask: BlockMask,
+        q_bucket: int,
+        kv_bucket: int,
+    ) -> torch.Tensor:
+        q_len, kv_len = queries.shape[0], keys.shape[0]
+        queries = F.pad(queries, (0, 0, 0, 0, 0, q_bucket - q_len))
+        keys = F.pad(keys, (0, 0, 0, 0, 0, kv_bucket - kv_len))
+        values = F.pad(values, (0, 0, 0, 0, 0, kv_bucket - kv_len))
+        query_states = queries.transpose(0, 1).unsqueeze(0)
+        key_states = keys.transpose(0, 1).unsqueeze(0)
+        value_states = values.transpose(0, 1).unsqueeze(0)
+        attended = _cross_attn_flex(
+            query_states,
+            key_states,
+            value_states,
+            block_mask=block_mask,
+            enable_gqa=self.num_query_heads != self.num_key_value_heads,
+            kernel_options=self.kernel_options,
+        )
+        return attended[0, :, :q_len].transpose(0, 1).reshape(q_len, self.vision_dim)
+
+    def attend(
+        self,
+        depth: int,
+        query_hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        block_mask: BlockMask,
+        q_bucket: int,
+        kv_bucket: int,
+    ) -> torch.Tensor:
+        queries, gates = self._project_query_and_gate(depth, query_hidden_states)
+        queries = queries.reshape(-1, self.num_query_heads, self.head_dim)
+        attended = self._attention(
+            queries,
+            keys,
+            values,
+            block_mask=block_mask,
+            q_bucket=q_bucket,
+            kv_bucket=kv_bucket,
+        )
+        attended = attended.reshape(-1, self.num_query_heads, self.head_dim)
+        attended = (attended * gates.unsqueeze(-1)).reshape(-1, self.vision_dim)
+        return self._project_output(depth, attended)
 
     def forward(
         self,
         x: torch.Tensor,
         deepstack_features: list[torch.Tensor] | None = None,
+        *,
+        grid_thw: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[Any]]:
         """Project the main vision stream and prepare each deepstack stream.
 
@@ -648,16 +802,74 @@ class VisualAdapter(Module):
         """
         if deepstack_features is None:
             deepstack_features = []
-        if len(deepstack_features) != self.num_deepstack:
+        expected_features = self.num_deepstack + (self.kind == "cross_attn")
+        if len(deepstack_features) != expected_features:
             raise ValueError(
-                f"Expected {self.num_deepstack} DeepStack feature tensors, "
+                f"Expected {expected_features} visual feature tensors, "
                 f"got {len(deepstack_features)}."
             )
-        projected_deepstack = [
-            projector(feature)
-            for projector, feature in zip(self.deepstack, deepstack_features)
+        if self.kind == "mlp":
+            projected_deepstack = [
+                projector(feature)
+                for projector, feature in zip(self.deepstack, deepstack_features)
+            ]
+            return self.main(x), projected_deepstack
+        if grid_thw is None:
+            raise ValueError("grid_thw is required by the cross_attn projector")
+
+        raw_counts = grid_thw.prod(-1)
+        flat_memories = [
+            _flatten_visual_features(feature, raw_counts)
+            for feature in deepstack_features
         ]
-        return self.main(x), projected_deepstack
+        seed_memory = flat_memories[-1]
+        seed_features = _tokenpacker_query_seeds(
+            x,
+            grid_thw,
+            spatial_merge_size=self.config.spatial_merge_size,
+            extra_merge_size=self.extra_merge_size,
+        )
+        seed_queries = self.seed_q_proj(self.seed_query_norm(seed_features))
+        seed_queries = seed_queries + _query_position_encoding(
+            grid_thw,
+            dim=self.vision_dim,
+            spatial_merge_size=self.config.spatial_merge_size,
+            extra_merge_size=self.extra_merge_size,
+            dtype=seed_queries.dtype,
+            device=seed_queries.device,
+        )
+        seed_keys, seed_values = self._project_memory(
+            seed_memory, depth=self.num_deepstack
+        )
+        _, memory_ids = _tokenpacker_local_ids(
+            grid_thw,
+            spatial_merge_size=self.config.spatial_merge_size,
+            extra_merge_size=self.extra_merge_size,
+        )
+        memory_order = torch.argsort(memory_ids, stable=True)
+        local_length = (self.config.spatial_merge_size * self.extra_merge_size) ** 2
+        seed_keys = seed_keys[memory_order].view(
+            seed_queries.shape[0],
+            local_length,
+            self.num_key_value_heads,
+            self.head_dim,
+        )
+        seed_values = seed_values[memory_order].view_as(seed_keys)
+        local_attention = F.scaled_dot_product_attention(
+            seed_queries.view(-1, self.num_query_heads, 1, self.head_dim),
+            seed_keys.permute(0, 2, 1, 3),
+            seed_values.permute(0, 2, 1, 3),
+            enable_gqa=self.num_query_heads != self.num_key_value_heads,
+        ).reshape(-1, self.vision_dim)
+        refined_queries = seed_queries + local_attention
+        projected_main = self._project_output(
+            self.num_deepstack, self.seed_output_norm(refined_queries)
+        )
+        projected_deepstack = [
+            self._project_memory(feature, depth=depth)
+            for depth, feature in enumerate(flat_memories[:-1])
+        ]
+        return projected_main, projected_deepstack
 
 
 class RWKV7VLForConditionalGeneration(BaseModel):
@@ -681,7 +893,8 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         # (the default), one ``<image_pad>`` token corresponds to exactly one
         # vision feature; when larger, each ``<image_pad>`` token represents
         # ``(processor_merge/vision_merge)**2`` vision features and the
-        # projector compresses the main stream with an extra ``PatchMerger``.
+        # projector constructs a coarser query grid and locally retrieves from
+        # the corresponding native ViT patch regions.
         # Decoupled merge sizes are currently only supported with
         # ``proj.kind == "cross_attn"``.
         processor_spatial_merge_size: int = 2
@@ -726,18 +939,18 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                 if self.lm_head is not None:
                     self.lm_head = replace(self.lm_head, out_features=new_vocab)
 
-            # Optional projector overrides — let the trainer config override
-            # the flavor-baked defaults for projector kind / norm / ffn / heads.
-            # ``projector_extra_merge_size`` is the single user-facing knob for
-            # the merge-size decoupling: the processor merge size and the
-            # dataloader collator's merge size are both derived from it below.
+            # Optional projector overrides let trainer config replace the
+            # flavor-baked projector kind, normalization, FFN, and GQA layout.
+            # ``projector_extra_merge_size`` controls the image-token grid only;
+            # the collator preserves the frozen ViT's native patch layout.
             proj_overrides: dict[str, Any] = {}
             for src_name, dst_name in (
                 ("projector_kind", "kind"),
                 ("projector_norm", "norm"),
                 ("projector_ffn", "ffn"),
-                ("projector_num_heads", "num_heads"),
-                ("projector_head_dim", "head_dim"),
+                ("projector_num_query_heads", "num_query_heads"),
+                ("projector_num_key_value_heads", "num_key_value_heads"),
+                ("tie_projector_qkvo", "tie_qkvo"),
                 ("projector_extra_merge_size", "extra_merge_size"),
             ):
                 value = getattr(trainer_config, src_name, None)
@@ -752,20 +965,44 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             if proj_overrides:
                 self.proj = replace(self.proj, **proj_overrides)
 
-            # Derive processor_spatial_merge_size and dataloader merge size
-            # from the projector's extra_merge_size + the vision encoder's
-            # spatial_merge_size. Both knobs must stay in lockstep — they
-            # govern how many ``<image_pad>`` tokens the processor inserts
-            # and how the dataloader collator pads patches.
+            visual_layers = getattr(
+                trainer_config, "projector_visual_layer_indices", None
+            )
+            if visual_layers is not None:
+                visual_layers = tuple(int(index) for index in visual_layers)
+                self.vision_encoder = replace(
+                    self.vision_encoder,
+                    deepstack_visual_indices=list(visual_layers),
+                )
+                self.proj = replace(self.proj, num_deepstack=len(visual_layers))
+            language_layers = getattr(
+                trainer_config, "projector_language_layer_indices", None
+            )
+            if language_layers is not None:
+                self.proj = replace(
+                    self.proj,
+                    language_layer_indices=tuple(
+                        int(index) for index in language_layers
+                    ),
+                )
+            if self.proj.kind == "cross_attn":
+                self.vision_encoder = replace(
+                    self.vision_encoder, raw_deepstack_features=True
+                )
+
+            # Derive the image-token merge size without changing the native
+            # ViT patch layout used by the collator. This controls how many
+            # ``<image_pad>`` tokens the processor inserts; patch padding and
+            # ordering continue to use the vision encoder's native merge size.
             vision_merge = self.vision_encoder.spatial_merge_size
             extra = self.proj.extra_merge_size
             derived_processor_merge = vision_merge * extra
             self.processor_spatial_merge_size = derived_processor_merge
             dataloader_cfg = getattr(trainer_config, "dataloader", None)
             if dataloader_cfg is not None and hasattr(
-                dataloader_cfg, "spatial_merge_size"
+                dataloader_cfg, "image_token_merge_size"
             ):
-                dataloader_cfg.spatial_merge_size = derived_processor_merge
+                dataloader_cfg.image_token_merge_size = derived_processor_merge
 
             if parallelism.tensor_parallel_degree > 1:
                 raise NotImplementedError(
@@ -816,9 +1053,38 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             )
         extra_merge_size = processor_merge // vision_merge
         if config.proj.extra_merge_size != extra_merge_size:
+            raise ValueError(
+                "proj.extra_merge_size must match processor/vision merge ratio; "
+                f"got projector={config.proj.extra_merge_size}, ratio={extra_merge_size}"
+            )
+        if config.proj.kind == "cross_attn":
+            visual_indices = tuple(config.vision_encoder.deepstack_visual_indices)
+            if tuple(sorted(set(visual_indices))) != visual_indices:
+                raise ValueError(
+                    "deepstack_visual_indices must be unique and increasing"
+                )
+            if any(
+                index < 0 or index >= config.vision_encoder.n_layers
+                for index in visual_indices
+            ):
+                raise ValueError("deepstack_visual_indices select a missing ViT layer")
+            if any(
+                index < 0 or index >= config.llm.num_hidden_layers
+                for index in config.proj.language_layer_indices
+            ):
+                raise ValueError("language_layer_indices select a missing RWKV layer")
             config = replace(
                 config,
-                proj=replace(config.proj, extra_merge_size=extra_merge_size),
+                vision_encoder=replace(
+                    config.vision_encoder, raw_deepstack_features=True
+                ),
+                proj=replace(
+                    config.proj,
+                    encoder_dim=config.vision_encoder.out_hidden_size,
+                    vision_dim=config.vision_encoder.dim,
+                    spatial_merge_size=vision_merge,
+                    num_deepstack=len(visual_indices),
+                ),
             )
         self.config = config
         self.vocab_size = config.vocab_size
@@ -935,11 +1201,10 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             main, deepstack_per_level, num_tokens_per_item, num_kv_per_item
         ).
 
-        ``num_tokens_per_item`` is the per-image ``<image_pad>`` count (set
-        by ``processor_spatial_merge_size``); ``num_kv_per_item`` is the
-        per-image deepstack/vision-merged token count (set by
-        ``vision_encoder.spatial_merge_size``). The two are equal when the
-        processor and vision merge sizes match.
+        ``num_tokens_per_item`` is the per-image ``<image_pad>`` count set by
+        ``processor_spatial_merge_size``. For the cross-attention projector,
+        ``num_kv_per_item`` is the raw ViT patch count; for the MLP projector,
+        it is the native vision-merged token count.
         """
         pixel_values = pixel_values.to(
             self.vision_encoder.patch_embed.proj.weight.dtype
@@ -951,8 +1216,11 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         merged_embeds, deepstack_features = self.proj(
             merged_embeds,
             deepstack_features,
+            grid_thw=grid_thw,
         )
-        num_kv_per_item = grid_thw.prod(-1) // self.vision_encoder.spatial_merge_unit
+        num_kv_per_item = grid_thw.prod(-1)
+        if self.proj.kind == "mlp":
+            num_kv_per_item = num_kv_per_item // self.vision_encoder.spatial_merge_unit
         processor_unit = self.processor_spatial_merge_size**2
         num_tokens_per_item = grid_thw.prod(-1) // processor_unit
         return merged_embeds, deepstack_features, num_tokens_per_item, num_kv_per_item
@@ -1011,11 +1279,37 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         inputs_embeds: torch.Tensor,
     ) -> tuple[torch.Tensor, list[Any]]:
         empty = inputs_embeds.new_zeros((0, self.proj.encoder_dim))
-        empty_deepstack = [
-            inputs_embeds.new_zeros((0, self.proj.encoder_dim))
-            for _ in range(self.proj.num_deepstack)
-        ]
-        return self.proj(empty, empty_deepstack)
+        if self.proj.kind == "mlp":
+            empty_deepstack = [
+                inputs_embeds.new_zeros((0, self.proj.encoder_dim))
+                for _ in range(self.proj.num_deepstack)
+            ]
+            return self.proj(empty, empty_deepstack)
+
+        empty_visual = inputs_embeds.new_zeros((0, self.proj.vision_dim))
+        seed = self.proj.seed_q_proj(self.proj.seed_query_norm(empty))
+        main = self.proj._project_output(
+            self.proj.num_deepstack, self.proj.seed_output_norm(seed)
+        )
+        seed_keys, seed_values = self.proj._project_memory(
+            empty_visual, depth=self.proj.num_deepstack
+        )
+        main = main + (seed_keys.sum() + seed_values.sum()).to(main.dtype) * 0.0
+        deepstack = []
+        for depth in range(self.proj.num_deepstack):
+            keys, values = self.proj._project_memory(empty_visual, depth=depth)
+            query_edge, gate_edge = self.proj._project_query_and_gate(
+                depth,
+                inputs_embeds.new_zeros((0, self.proj.project_dim)),
+            )
+            output_edge = self.proj._project_output(
+                depth, inputs_embeds.new_zeros((0, self.proj.vision_dim))
+            )
+            keys = keys + query_edge.sum().to(keys.dtype) * 0.0
+            keys = keys + gate_edge.sum().to(keys.dtype) * 0.0
+            keys = keys + output_edge.sum().to(keys.dtype) * 0.0
+            deepstack.append((keys, values))
+        return main, deepstack
 
     def _make_mlp_injector(
         self,
@@ -1126,7 +1420,12 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             return _ceil_to_bucket(n, q_ladder) if q_ladder else _next_pow2_bucket(n)
 
         def _bucket_kv(n: int) -> int:
-            return _ceil_to_bucket(n, kv_ladder) if kv_ladder else _next_pow2_bucket(n)
+            required = n + 1
+            return (
+                _ceil_to_bucket(required, kv_ladder)
+                if kv_ladder
+                else _next_pow2_bucket(required)
+            )
 
         # Group local Q ranges by their image_id for fast per-chunk filtering.
         ranges_by_image: dict[int, list[tuple[int, int]]] = {}
@@ -1183,24 +1482,33 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             # Per-chunk closure: mask_mod captures this chunk's id tensors so
             # each chunk gets its own compiled FlexAttention specialisation
             # against (q_bucket_chunk, kv_bucket_chunk).
-            def _make_mask_mod(qid: torch.Tensor, kid: torch.Tensor):
+            def _make_mask_mod(
+                qid: torch.Tensor,
+                kid: torch.Tensor,
+                dummy_index: int,
+            ):
                 def mask_mod(b, h, q_idx, kv_idx):
                     q_id = qid[q_idx]
                     kv_id = kid[kv_idx]
                     valid_q = q_id >= 0
                     valid_kv = kv_id >= 0
                     same_image = q_id == kv_id
-                    padding_self = (~valid_q) & (~valid_kv) & (q_idx == kv_idx)
-                    return (same_image & valid_q & valid_kv) | padding_self
+                    padding_dummy = (~valid_q) & (kv_idx == dummy_index)
+                    return (same_image & valid_q & valid_kv) | padding_dummy
 
                 return mask_mod
 
             block_mask_chunk = _compiled_create_block_mask(
-                _make_mask_mod(q_image_id_chunk, kv_image_id_chunk),
+                _make_mask_mod(
+                    q_image_id_chunk,
+                    kv_image_id_chunk,
+                    kv_real_len_chunk,
+                ),
                 B=None,
                 H=None,
                 Q_LEN=q_bucket_chunk,
                 KV_LEN=kv_bucket_chunk,
+                device=device,
             )
 
             q_index_chunk = torch.empty(
@@ -1228,16 +1536,23 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         if not chunks:
             return lambda idx, h: h
 
+        depth_by_layer = {
+            layer_index: depth
+            for depth, layer_index in enumerate(self.proj.language_layer_indices)
+        }
+
         def inject(idx: int, layer_hidden_states: torch.Tensor) -> torch.Tensor:
-            if idx >= len(deepstack_features):
+            depth = depth_by_layer.get(idx)
+            if depth is None:
                 return layer_hidden_states
-            k_all, v_all = deepstack_features[idx]
+            k_all, v_all = deepstack_features[depth]
             flat = layer_hidden_states.reshape(-1, layer_hidden_states.shape[-1])
             for chunk in chunks:
                 k_chunk = k_all[chunk["kv_start"] : chunk["kv_end"]]
                 v_chunk = v_all[chunk["kv_start"] : chunk["kv_end"]]
                 q_real = flat.index_select(0, chunk["q_index"])
-                delta = self.proj.deepstack[idx].attend(
+                delta = self.proj.attend(
+                    depth,
                     q_real,
                     k_chunk,
                     v_chunk,

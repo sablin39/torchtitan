@@ -151,7 +151,7 @@ def _qwen3vit_v100m_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
         spatial_merge_size=2,
         out_hidden_size=1024,
         num_position_embeddings=2304,
-        deepstack_visual_indices=[],
+        deepstack_visual_indices=[2, 6, 9],
     )
 
 
@@ -177,6 +177,21 @@ def _rwkv_vl_config(
 ) -> RWKV7VLForConditionalGeneration.Config:
     hidden_size = backbone.hidden_size
     vocab_size = backbone.vocab_size
+    if backbone.num_hidden_layers == 24:
+        language_layer_indices = (2, 9, 16)
+    else:
+        last_usable = max(backbone.num_hidden_layers - 2, 0)
+        language_layer_indices = tuple(
+            round(value)
+            for value in (
+                last_usable * 0.15,
+                last_usable * 0.50,
+                last_usable * 0.85,
+            )
+        )
+    num_query_heads = vision_encoder.n_heads
+    num_key_value_heads = max(1, num_query_heads // 2)
+    extra_merge_size = 2
     return RWKV7VLForConditionalGeneration.Config(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
@@ -184,15 +199,26 @@ def _rwkv_vl_config(
         vision_encoder=vision_encoder,
         proj=VisualAdapter.Config(
             encoder_dim=vision_encoder.out_hidden_size,
+            vision_dim=vision_encoder.dim,
             hidden_dim=None,
             project_dim=hidden_size,
             num_deepstack=len(vision_encoder.deepstack_visual_indices),
             norm_eps=1e-5,
+            kind="cross_attn",
+            extra_merge_size=extra_merge_size,
+            spatial_merge_size=vision_encoder.spatial_merge_size,
+            language_layer_indices=language_layer_indices,
+            num_query_heads=num_query_heads,
+            num_key_value_heads=num_key_value_heads,
+            tie_qkvo=True,
         ),
         lm_head=_lm_head_config(hidden_size=hidden_size, vocab_size=vocab_size),
         image_token_id=DEFAULT_IMAGE_TOKEN_ID,
         vision_start_token_id=DEFAULT_VISION_START_TOKEN_ID,
         vision_end_token_id=DEFAULT_VISION_END_TOKEN_ID,
+        processor_spatial_merge_size=(
+            vision_encoder.spatial_merge_size * extra_merge_size
+        ),
     )
 
 

@@ -66,6 +66,7 @@ class RWKVVLImageProcessorConfig:
     patch_size: int = 16
     temporal_patch_size: int = 2
     spatial_merge_size: int = 2
+    image_token_merge_size: int = 2
     min_pixels: int = 65536
     max_pixels: int = 2097152
     image_mean: tuple[float, ...] = (0.5, 0.5, 0.5)
@@ -74,7 +75,7 @@ class RWKVVLImageProcessorConfig:
 
     @property
     def factor(self) -> int:
-        return self.patch_size * self.spatial_merge_size
+        return self.patch_size * self.image_token_merge_size
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,7 +505,7 @@ def process_images(
         processed = process_image(
             image,
             patch_size=config.patch_size,
-            merge_size=config.spatial_merge_size,
+            merge_size=config.image_token_merge_size,
             min_pixels=config.min_pixels,
             max_pixels=config.max_pixels,
             image_mean=config.image_mean,
@@ -518,7 +519,7 @@ def process_images(
             height=processed.shape[1],
             width=processed.shape[2],
             patch_size=config.patch_size,
-            spatial_merge_size=config.spatial_merge_size,
+            spatial_merge_size=config.image_token_merge_size,
             temporal_patch_size=config.temporal_patch_size,
         )
         patches, grid = vision_to_patches(
@@ -567,10 +568,15 @@ def make_image_config_from_processor(
         overrides.pop("temporal_patch_size", None)
         or getattr(image_processor, "temporal_patch_size", 2)
     )
-    merge_size = int(
-        overrides.pop("merge_size", None)
+    vision_merge_size = int(
+        overrides.pop("vision_spatial_merge_size", None)
+        or overrides.pop("merge_size", None)
         or overrides.pop("spatial_merge_size", None)
         or getattr(image_processor, "merge_size", 2)
+    )
+    image_token_merge_size = int(
+        overrides.pop("image_token_merge_size", None)
+        or getattr(image_processor, "image_token_merge_size", vision_merge_size)
     )
     min_pixels = int(
         overrides.pop("min_pixels", None)
@@ -597,7 +603,8 @@ def make_image_config_from_processor(
     return RWKVVLImageProcessorConfig(
         patch_size=patch_size,
         temporal_patch_size=temporal_patch_size,
-        spatial_merge_size=merge_size,
+        spatial_merge_size=vision_merge_size,
+        image_token_merge_size=image_token_merge_size,
         min_pixels=min_pixels,
         max_pixels=max_pixels,
         image_mean=image_mean,
@@ -723,8 +730,13 @@ class ModRWKVProcessor(ProcessorMixin):
             processor_defaults = getattr(self.image_processor, "_defaults", {})
             images_kwargs = dict(processor_defaults.get("images_kwargs", {}))
             images_kwargs.update(kwargs)
-            merge_size = (
-                images_kwargs.get("merge_size", None) or self.image_processor.merge_size
+            merge_size = images_kwargs.get(
+                "image_token_merge_size",
+                getattr(
+                    self.image_processor,
+                    "image_token_merge_size",
+                    self.image_processor.merge_size,
+                ),
             )
 
             num_image_patches = [

@@ -28,15 +28,37 @@ def _apply_rwkv_vl_projector_overrides(model_config, args):
         ("projector_kind", "kind"),
         ("projector_norm", "norm"),
         ("projector_ffn", "ffn"),
-        ("projector_num_heads", "num_heads"),
-        ("projector_head_dim", "head_dim"),
+        ("projector_num_query_heads", "num_query_heads"),
+        ("projector_num_key_value_heads", "num_key_value_heads"),
+        ("tie_projector_qkvo", "tie_qkvo"),
         ("projector_extra_merge_size", "extra_merge_size"),
     ):
         value = getattr(args, src_attr, None)
         if value is not None:
             proj_overrides[dst_attr] = value
+    visual_layers = getattr(args, "projector_visual_layer_indices", None)
+    if visual_layers is not None and hasattr(model_config, "vision_encoder"):
+        visual_layers = tuple(int(index) for index in visual_layers)
+        model_config.vision_encoder = replace(
+            model_config.vision_encoder,
+            deepstack_visual_indices=list(visual_layers),
+        )
+        proj_overrides["num_deepstack"] = len(visual_layers)
+    language_layers = getattr(args, "projector_language_layer_indices", None)
+    if language_layers is not None:
+        proj_overrides["language_layer_indices"] = tuple(
+            int(index) for index in language_layers
+        )
     if proj_overrides and hasattr(model_config, "proj"):
         model_config.proj = replace(model_config.proj, **proj_overrides)
+    if (
+        hasattr(model_config, "proj")
+        and model_config.proj.kind == "cross_attn"
+        and hasattr(model_config, "vision_encoder")
+    ):
+        model_config.vision_encoder = replace(
+            model_config.vision_encoder, raw_deepstack_features=True
+        )
     if hasattr(model_config, "processor_spatial_merge_size") and hasattr(
         model_config, "vision_encoder"
     ):
@@ -128,8 +150,20 @@ if __name__ == "__main__":
     parser.add_argument("--projector_kind", type=str, default=None)
     parser.add_argument("--projector_norm", type=str, default=None)
     parser.add_argument("--projector_ffn", type=str, default=None)
-    parser.add_argument("--projector_num_heads", type=int, default=None)
-    parser.add_argument("--projector_head_dim", type=int, default=None)
+    parser.add_argument(
+        "--projector_visual_layer_indices", type=int, nargs="+", default=None
+    )
+    parser.add_argument(
+        "--projector_language_layer_indices", type=int, nargs="+", default=None
+    )
+    parser.add_argument("--projector_num_query_heads", type=int, default=None)
+    parser.add_argument("--projector_num_key_value_heads", type=int, default=None)
+    parser.add_argument(
+        "--tie_projector_qkvo",
+        "--tie-projector-qkvo",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--projector_extra_merge_size", type=int, default=None)
     args = parser.parse_args()
 

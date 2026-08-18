@@ -605,6 +605,7 @@ def validate_vision_state(
 def build_projector_state_dict(
     *,
     encoder_dim: int,
+    vision_dim: int,
     project_dim: int,
     hidden_dim: int | None,
     num_deepstack: int,
@@ -613,8 +614,11 @@ def build_projector_state_dict(
     kind: str = "mlp",
     norm: str = "layernorm",
     ffn: str = "relu",
-    num_heads: int | None = None,
-    head_dim: int | None = None,
+    language_layer_indices: tuple[int, ...] = (),
+    num_query_heads: int | None = None,
+    num_key_value_heads: int | None = None,
+    tie_projector_qkvo: bool = True,
+    spatial_merge_size: int = 2,
     extra_merge_size: int = 1,
 ) -> dict[str, torch.Tensor]:
     try:
@@ -630,6 +634,7 @@ def build_projector_state_dict(
             torch.manual_seed(seed)
         projector = VisualAdapter(
             encoder_dim=encoder_dim,
+            vision_dim=vision_dim,
             project_dim=project_dim,
             hidden_dim=hidden_dim,
             num_deepstack=num_deepstack,
@@ -637,8 +642,11 @@ def build_projector_state_dict(
             kind=kind,
             norm=norm,
             ffn=ffn,
-            num_heads=num_heads,
-            head_dim=head_dim,
+            language_layer_indices=language_layer_indices,
+            num_query_heads=num_query_heads,
+            num_key_value_heads=num_key_value_heads,
+            tie_qkvo=tie_projector_qkvo,
+            spatial_merge_size=spatial_merge_size,
             extra_merge_size=extra_merge_size,
         )
     return {
@@ -655,8 +663,11 @@ def build_multimodal_config(
     projector_kind: str = "mlp",
     projector_norm: str = "layernorm",
     projector_ffn: str = "relu",
-    projector_num_heads: int | None = None,
-    projector_head_dim: int | None = None,
+    projector_visual_layer_indices: tuple[int, ...] = (),
+    projector_language_layer_indices: tuple[int, ...] = (),
+    projector_num_query_heads: int | None = None,
+    projector_num_key_value_heads: int | None = None,
+    tie_projector_qkvo: bool = True,
     projector_extra_merge_size: int = 1,
     processor_spatial_merge_size: int | None = None,
 ):
@@ -667,14 +678,19 @@ def build_multimodal_config(
 
     projector_config = ModRWKVProjectorConfig(
         encoder_dim=vision_config.out_hidden_size,
+        vision_dim=vision_config.hidden_size,
         project_dim=text_config.hidden_size,
         hidden_dim=projector_hidden_dim,
-        num_deepstack=len(getattr(vision_config, "deepstack_visual_indexes", [])),
+        num_deepstack=len(projector_visual_layer_indices),
         kind=projector_kind,
         norm=projector_norm,
         ffn=projector_ffn,
-        num_heads=projector_num_heads,
-        head_dim=projector_head_dim,
+        visual_layer_indices=projector_visual_layer_indices,
+        language_layer_indices=projector_language_layer_indices,
+        num_query_heads=projector_num_query_heads,
+        num_key_value_heads=projector_num_key_value_heads,
+        tie_qkvo=tie_projector_qkvo,
+        spatial_merge_size=vision_config.spatial_merge_size,
         extra_merge_size=projector_extra_merge_size,
     )
     config = ModRWKVConfig.from_text_vision_configs(
@@ -734,10 +750,7 @@ def save_multimodal_processor(
                 raise ValueError("--max-pixels must be positive when provided.")
             image_processor.size["longest_edge"] = int(max_pixels)
         if processor_spatial_merge_size is not None:
-            # The processor uses ``merge_size`` to compute the number of
-            # ``<image_pad>`` tokens it inserts per image. Override it so a
-            # coarser projector merge keeps text/vision token counts aligned.
-            image_processor.merge_size = int(processor_spatial_merge_size)
+            image_processor.image_token_merge_size = int(processor_spatial_merge_size)
 
         processor = ModRWKVProcessor(
             tokenizer=tokenizer,
@@ -883,12 +896,15 @@ def convert_multimodal(
     image_processor: str | None = None,
     max_pixels: int | None = None,
     verify_model_load: bool = False,
-    projector_kind: str = "mlp",
+    projector_kind: str = "cross_attn",
     projector_norm: str = "layernorm",
     projector_ffn: str = "relu",
-    projector_num_heads: int | None = None,
-    projector_head_dim: int | None = None,
-    projector_extra_merge_size: int = 1,
+    projector_visual_layer_indices: tuple[int, ...] = (2, 6, 9),
+    projector_language_layer_indices: tuple[int, ...] = (2, 9, 16),
+    projector_num_query_heads: int | None = None,
+    projector_num_key_value_heads: int | None = None,
+    tie_projector_qkvo: bool = True,
+    projector_extra_merge_size: int = 2,
 ) -> None:
     output = os.path.realpath(output)
     text_weights = extract_text_weights(torch_load_weights(rwkv7))
@@ -909,6 +925,20 @@ def convert_multimodal(
     # keeps backward-compatible behavior (processor merge == vision merge).
     vision_merge = getattr(vision_config, "spatial_merge_size", 2)
     processor_spatial_merge_size = vision_merge * projector_extra_merge_size
+    if projector_kind == "cross_attn":
+        if projector_num_query_heads is None:
+            projector_num_query_heads = vision_config.num_heads
+        if projector_num_key_value_heads is None:
+            projector_num_key_value_heads = max(1, projector_num_query_heads // 2)
+        if len(projector_visual_layer_indices) != len(projector_language_layer_indices):
+            raise ValueError(
+                "visual and language projector layer lists must have equal length"
+            )
+    else:
+        projector_visual_layer_indices = tuple(
+            getattr(vision_config, "deepstack_visual_indexes", [])
+        )
+        projector_language_layer_indices = ()
     config = build_multimodal_config(
         text_config=text_config,
         vision_config=vision_config,
@@ -916,8 +946,11 @@ def convert_multimodal(
         projector_kind=projector_kind,
         projector_norm=projector_norm,
         projector_ffn=projector_ffn,
-        projector_num_heads=projector_num_heads,
-        projector_head_dim=projector_head_dim,
+        projector_visual_layer_indices=projector_visual_layer_indices,
+        projector_language_layer_indices=projector_language_layer_indices,
+        projector_num_query_heads=projector_num_query_heads,
+        projector_num_key_value_heads=projector_num_key_value_heads,
+        tie_projector_qkvo=tie_projector_qkvo,
         projector_extra_merge_size=projector_extra_merge_size,
         processor_spatial_merge_size=processor_spatial_merge_size,
     )
@@ -928,22 +961,32 @@ def convert_multimodal(
         build_converted_state_dict(text_weights, text_model, dtype)
     )
 
+    if projector_kind == "cross_attn":
+        vision_state = {
+            key: value
+            for key, value in vision_state.items()
+            if not key.startswith("deepstack_merger_list.")
+        }
     vision_state = {
         "model.encoder." + key: value for key, value in vision_state.items()
     }
 
     projector_state = build_projector_state_dict(
         encoder_dim=vision_config.out_hidden_size,
+        vision_dim=vision_config.hidden_size,
         project_dim=text_config.hidden_size,
         hidden_dim=projector_hidden_dim,
-        num_deepstack=len(getattr(vision_config, "deepstack_visual_indexes", [])),
+        num_deepstack=len(projector_visual_layer_indices),
         dtype=dtype,
         seed=projector_seed,
         kind=projector_kind,
         norm=projector_norm,
         ffn=projector_ffn,
-        num_heads=projector_num_heads,
-        head_dim=projector_head_dim,
+        language_layer_indices=projector_language_layer_indices,
+        num_query_heads=projector_num_query_heads,
+        num_key_value_heads=projector_num_key_value_heads,
+        tie_projector_qkvo=tie_projector_qkvo,
+        spatial_merge_size=vision_merge,
         extra_merge_size=projector_extra_merge_size,
     )
 
@@ -979,6 +1022,13 @@ def convert_multimodal(
         verify_model_load=verify_model_load,
     )
     print(f"Export completed successfully: {output}")
+
+
+def parse_layer_indices(value: str) -> tuple[int, ...]:
+    indices = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if tuple(sorted(set(indices))) != indices:
+        raise argparse.ArgumentTypeError("layer indices must be unique and increasing")
+    return indices
 
 
 if __name__ == "__main__":
@@ -1046,7 +1096,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--projector-kind",
         type=str,
-        default="mlp",
+        default="cross_attn",
         choices=["mlp", "cross_attn"],
         help="Visual projector variant.",
     )
@@ -1065,24 +1115,42 @@ if __name__ == "__main__":
         help="FFN activation used inside the visual projector.",
     )
     parser.add_argument(
-        "--projector-num-heads",
-        type=int,
-        default=None,
-        help="Number of attention heads for the cross_attn projector.",
+        "--projector-visual-layer-indices",
+        type=parse_layer_indices,
+        default=(2, 6, 9),
+        help="Comma-separated post-block ViT memory layers.",
     )
     parser.add_argument(
-        "--projector-head-dim",
+        "--projector-language-layer-indices",
+        type=parse_layer_indices,
+        default=(2, 9, 16),
+        help="Comma-separated RWKV layers after which visual retrieval runs.",
+    )
+    parser.add_argument(
+        "--projector-num-query-heads",
         type=int,
         default=None,
-        help="Head dim for the cross_attn projector. Defaults to project_dim // num_heads.",
+        help="Number of GQA query heads; defaults to the ViT head count.",
+    )
+    parser.add_argument(
+        "--projector-num-key-value-heads",
+        type=int,
+        default=None,
+        help="Number of GQA K/V heads; defaults to one half of query heads.",
+    )
+    parser.add_argument(
+        "--tie-projector-qkvo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Share Q/K/V/O projections across retrieval depths.",
     )
     parser.add_argument(
         "--projector-extra-merge-size",
         type=int,
-        default=1,
+        default=2,
         help=(
-            "Extra projector-side PatchMerger ratio. The processor's "
-            "spatial_merge_size is derived as vision_merge_size * this value."
+            "TokenPacker query-grid downsampling ratio. The processor's "
+            "image-token merge is vision_merge_size * this value."
         ),
     )
     args = parser.parse_args()
@@ -1105,8 +1173,11 @@ if __name__ == "__main__":
             projector_kind=args.projector_kind,
             projector_norm=args.projector_norm,
             projector_ffn=args.projector_ffn,
-            projector_num_heads=args.projector_num_heads,
-            projector_head_dim=args.projector_head_dim,
+            projector_visual_layer_indices=args.projector_visual_layer_indices,
+            projector_language_layer_indices=args.projector_language_layer_indices,
+            projector_num_query_heads=args.projector_num_query_heads,
+            projector_num_key_value_heads=args.projector_num_key_value_heads,
+            tie_projector_qkvo=args.tie_projector_qkvo,
             projector_extra_merge_size=args.projector_extra_merge_size,
         )
     else:
