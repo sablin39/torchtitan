@@ -223,7 +223,6 @@ class MoEStateDictAdapter(StateDictAdapter):
                 # Strided shard on non-expert dim, keep in sub-mesh
                 sub_mesh_names.append(name)
                 sub_placements.append(
-                    # pyrefly: ignore [bad-argument-type, unexpected-positional-argument]
                     _StridedShard(placement.dim, placement.split_factor)
                 )
             else:

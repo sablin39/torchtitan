@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.experimental import local_map
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -844,12 +845,18 @@ class Qwen3VLVisionEncoder(Module):
         """
 
         def trim_merged(x: torch.Tensor) -> torch.Tensor:
-            return x.squeeze(0)[:trim_real_len] if trim_real_len is not None else x
+            if trim_real_len is None:
+                return x
+            # FSDP2 installs a pre-backward hook on module outputs. Returning a
+            # view here lets a later in-place consumer silently drop that hook.
+            trimmed = x.squeeze(0)[:trim_real_len]
+            return trimmed.clone() if isinstance(self, FSDPModule) else trimmed
 
         def trim_raw(x: torch.Tensor) -> torch.Tensor:
             if trim_real_patch_len is None:
                 return x
-            return x.squeeze(0)[:trim_real_patch_len]
+            trimmed = x.squeeze(0)[:trim_real_patch_len]
+            return trimmed.clone() if isinstance(self, FSDPModule) else trimmed
 
         deepstack_features: list[torch.Tensor] = []
         for layer_idx, layer in self.layers.items():

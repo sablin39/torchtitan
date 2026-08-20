@@ -18,11 +18,7 @@ from torchtitan.config.manager import ConfigManager
 
 from torchtitan.distributed.context_parallel import _build_flattened_cu_seqlens
 from torchtitan.models.rwkv7 import model_registry as rwkv7_model_registry
-from torchtitan.models.rwkv7.model import (
-    _token_shift_varlen_eager,
-    rwkv7_backbone_config,
-    RWKV7MoEChannelMix,
-)
+from torchtitan.models.rwkv7.model import rwkv7_backbone_config, RWKV7MoEChannelMix
 from torchtitan.models.rwkv7.state_dict_adapter import RWKV7StateDictAdapter
 from torchtitan.models.rwkv_vl import (
     model_registry as rwkv_vl_model_registry,
@@ -165,34 +161,6 @@ class TestRWKV7Backend(unittest.TestCase):
             model.llm.layers["0"].attn.value_dim,
         )
         self.assertEqual(tuple(v_first.shape), (2, 3, 256))
-
-    def test_rwkv7_varlen_token_shift_matches_reference_and_grad(self):
-        def ref_token_shift(
-            x: torch.Tensor,
-            cu_seqlens: torch.Tensor,
-        ) -> torch.Tensor:
-            shifted = torch.empty_like(x)
-            shifted[:, 0, :].zero_()
-            shifted[:, 1:, :].copy_(x[:, :-1, :])
-            shifted.index_fill_(1, cu_seqlens[:-1], 0)
-            return shifted - x
-
-        for cu_seqlens in (
-            torch.tensor([0, 2, 5, 8]),
-            torch.arange(0, 9),
-        ):
-            with self.subTest(cu_seqlens=cu_seqlens.tolist()):
-                x = torch.randn(1, 8, 3, dtype=torch.float32, requires_grad=True)
-                ref_x = x.detach().clone().requires_grad_()
-                grad = torch.randn_like(x)
-
-                y = _token_shift_varlen_eager(x, cu_seqlens)
-                ref_y = ref_token_shift(ref_x, cu_seqlens)
-                self.assertTrue(torch.allclose(y, ref_y))
-
-                y.backward(grad)
-                ref_y.backward(grad)
-                self.assertTrue(torch.allclose(x.grad, ref_x.grad))
 
     def test_rwkv_vl_config_builds_and_satisfies_module_protocol(self):
         spec = rwkv_vl_model_registry("debugmodel")

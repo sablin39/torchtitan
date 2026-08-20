@@ -1150,16 +1150,22 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         grid_thw: torch.Tensor | None,
         *,
         device: torch.device,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, bool]:
         if not dist.is_available() or not dist.is_initialized():
-            return pixel_values, grid_thw
+            return pixel_values, grid_thw, False
 
         group = self._vision_patch_sync_group
         world_size = (
             dist.get_world_size(group) if group is not None else dist.get_world_size()
         )
         if world_size == 1:
-            return pixel_values, grid_thw
+            return pixel_values, grid_thw, False
+        trainable_roots = getattr(self, "_trainable_roots", None)
+        if trainable_roots is not None and not {
+            "vision_encoder",
+            "proj",
+        }.intersection(trainable_roots):
+            return pixel_values, grid_thw, False
 
         has_local = (
             pixel_values is not None
@@ -1172,9 +1178,28 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         dist.all_reduce(max_num_patch, op=dist.ReduceOp.MAX, group=group)
         target_num_patch = int(max_num_patch.item())
         if target_num_patch == 0 or target_num_patch == local_num_patch:
-            return pixel_values, grid_thw
+            return pixel_values, grid_thw, False
         if not has_local:
-            return pixel_values, grid_thw
+            # Every rank must enter the FSDP-wrapped vision encoder when any
+            # rank has visual input. Run a zero-valued dummy image through the
+            # same flat path; the caller discards its features and adds a
+            # zero-valued autograd edge so this rank contributes no vision
+            # signal while still participating in parameter collectives.
+            patch_dim = self.vision_encoder.patch_embed.proj.weight.shape[-1]
+            dummy = torch.zeros(
+                (target_num_patch, patch_dim),
+                device=device,
+                dtype=self.vision_encoder.patch_embed.proj.weight.dtype,
+            )
+            side = max(1, int(target_num_patch**0.5))
+            while side > 1 and target_num_patch % side != 0:
+                side -= 1
+            dummy_grid = torch.tensor(
+                [[1, side, target_num_patch // side]],
+                dtype=torch.long,
+                device=device,
+            )
+            return dummy, dummy_grid, True
         if target_num_patch < local_num_patch:
             raise RuntimeError(
                 f"Rank-synchronized ViT patch bucket target {target_num_patch} "
@@ -1189,7 +1214,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             ],
             dim=0,
         )
-        return pixel_values, grid_thw
+        return pixel_values, grid_thw, False
 
     def _get_vision_embeds(
         self,
@@ -1577,6 +1602,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         special_tokens: dict[str, int] | None,
         fla_cp_global_input_ids: torch.Tensor | None,
         fla_cp_global_start: torch.Tensor | None,
+        vision_is_dummy: bool,
     ) -> tuple[torch.Tensor, list[Any], torch.Tensor | None, torch.Tensor | None, int,]:
         inputs_embeds = self.llm.embeddings(tokens)
         image_token_id = (
@@ -1588,26 +1614,51 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         num_tokens_per_item: torch.Tensor | None = None
         num_kv_per_item: torch.Tensor | None = None
         if pixel_values is not None and grid_thw is not None:
-            (
-                merged_embeds,
-                deepstack_features,
-                num_tokens_per_item,
-                num_kv_per_item,
-            ) = self._get_vision_embeds(
-                pixel_values,
-                grid_thw=grid_thw,
-            )
-            inputs_embeds = self._apply_vision_features(
-                inputs_embeds,
-                features=merged_embeds,
-                num_tokens_per_item=num_tokens_per_item,
-                vision_token_id=image_token_id,
-                global_input_ids=fla_cp_global_input_ids,
-                global_start=fla_cp_global_start,
-                local_tokens=tokens,
-                reduce="set",
-            )
-            if fla_cp_global_input_ids is not None:
+            if vision_is_dummy:
+                pixel_values = pixel_values.to(
+                    self.vision_encoder.patch_embed.proj.weight.dtype
+                )
+                dummy_main, dummy_deepstack = self.vision_encoder(
+                    pixel_values,
+                    grid_thw=grid_thw,
+                )
+                inputs_embeds = self._add_zero_grad_edge(
+                    inputs_embeds, dummy_main, *dummy_deepstack
+                )
+
+                # Exercise every projector parameter without running fake
+                # cross-attention over the dummy image.
+                empty_merged, empty_deepstack = self._empty_projector_outputs(
+                    inputs_embeds
+                )
+                empty_tensors = [empty_merged]
+                for entry in empty_deepstack:
+                    if isinstance(entry, torch.Tensor):
+                        empty_tensors.append(entry)
+                    else:
+                        empty_tensors.extend(entry)
+                inputs_embeds = self._add_zero_grad_edge(inputs_embeds, *empty_tensors)
+            else:
+                (
+                    merged_embeds,
+                    deepstack_features,
+                    num_tokens_per_item,
+                    num_kv_per_item,
+                ) = self._get_vision_embeds(
+                    pixel_values,
+                    grid_thw=grid_thw,
+                )
+                inputs_embeds = self._apply_vision_features(
+                    inputs_embeds,
+                    features=merged_embeds,
+                    num_tokens_per_item=num_tokens_per_item,
+                    vision_token_id=image_token_id,
+                    global_input_ids=fla_cp_global_input_ids,
+                    global_start=fla_cp_global_start,
+                    local_tokens=tokens,
+                    reduce="set",
+                )
+            if fla_cp_global_input_ids is not None and not vision_is_dummy:
                 # CP v1 computes vision redundantly on every rank, but a rank
                 # may own no image placeholder tokens after contiguous sharding.
                 zero_grad_tensors = [merged_embeds]
@@ -1655,7 +1706,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("RWKV-VL video inputs are not implemented yet")
 
-        pixel_values, grid_thw = self._sync_flat_vision_patch_bucket(
+        pixel_values, grid_thw, vision_is_dummy = self._sync_flat_vision_patch_bucket(
             pixel_values,
             grid_thw,
             device=tokens.device,
@@ -1678,6 +1729,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             special_tokens=special_tokens,
             fla_cp_global_input_ids=fla_cp_global_input_ids,
             fla_cp_global_start=fla_cp_global_start,
+            vision_is_dummy=vision_is_dummy,
         )
 
         if self.proj.kind == "cross_attn":

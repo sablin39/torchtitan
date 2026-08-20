@@ -14,6 +14,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -133,6 +134,47 @@ def _feature_tensor(values: list[float], dim: int) -> torch.Tensor:
 
 
 class TestModelVisionInsertion(unittest.TestCase):
+    def test_rwkv_vl_sync_builds_dummy_for_image_free_rank(self):
+        model = object.__new__(RWKV7VLForConditionalGeneration)
+        nn.Module.__init__(model)
+        model._vision_patch_sync_group = None
+        model.vision_encoder = SimpleNamespace(
+            patch_embed=SimpleNamespace(proj=nn.Linear(24, 4, bias=False))
+        )
+
+        def set_global_patch_max(value, **kwargs):
+            del kwargs
+            value.fill_(128)
+
+        with (
+            mock.patch(
+                "torchtitan.models.rwkv_vl.model.dist.is_available",
+                return_value=True,
+            ),
+            mock.patch(
+                "torchtitan.models.rwkv_vl.model.dist.is_initialized",
+                return_value=True,
+            ),
+            mock.patch(
+                "torchtitan.models.rwkv_vl.model.dist.get_world_size",
+                return_value=2,
+            ),
+            mock.patch(
+                "torchtitan.models.rwkv_vl.model.dist.all_reduce",
+                side_effect=set_global_patch_max,
+            ),
+        ):
+            pixels, grid_thw, is_dummy = model._sync_flat_vision_patch_bucket(
+                None,
+                None,
+                device=DEVICE,
+            )
+
+        self.assertTrue(is_dummy)
+        self.assertEqual(tuple(pixels.shape), (128, 24))
+        self.assertEqual(grid_thw.tolist(), [[1, 8, 16]])
+        self.assertEqual(torch.count_nonzero(pixels).item(), 0)
+
     def _make_qwen_fixture(self, features_by_kind):
         dim = 4
         model = object.__new__(Qwen3VLModel)

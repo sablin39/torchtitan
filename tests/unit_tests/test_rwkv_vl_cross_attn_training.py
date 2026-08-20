@@ -103,7 +103,7 @@ def _make_model_config() -> RWKV7VLForConditionalGeneration.Config:
             decay_low_rank_dim=32,
             gate_low_rank_dim=64,
             v_low_rank_dim=32,
-            chunk_size=64,
+            chunk_size=16,
         ),
         vision_encoder=_make_vision_encoder_config(deepstack_indices),
         proj=VisualAdapter.Config(
@@ -183,6 +183,7 @@ class TestCrossAttnTrainingLoop(unittest.TestCase):
         torch.cuda.manual_seed_all(0)
         cfg = _make_model_config()
         model = cfg.build().to(self.device).to(torch.bfloat16)
+        model.init_states(buffer_device=self.device)
         model.train()
         # Trainable: projector + lm_head. Vision encoder and LLM frozen to
         # isolate projector training behavior.

@@ -121,13 +121,13 @@ def _fully_shard_if_trainable(
     module: nn.Module,
     *,
     module_name: str,
-    skipped_frozen_modules: list[str],
+    skipped_modules: list[str],
     **kwargs,
 ) -> None:
     if _has_trainable_params(module):
         fully_shard(module, **kwargs)
     else:
-        skipped_frozen_modules.append(module_name)
+        skipped_modules.append(module_name)
 
 
 def apply_fsdp(
@@ -155,41 +155,42 @@ def apply_fsdp(
         pp_enabled=False,
     )
 
-    skipped_frozen_modules: list[str] = []
+    skipped_modules: list[str] = []
     _fully_shard_if_trainable(
         model.vision_encoder,
         module_name="vision_encoder",
-        skipped_frozen_modules=skipped_frozen_modules,
+        skipped_modules=skipped_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
     # The cross_attn projector is reused inside the LLM forward (gather Q +
-    # cross-attention at every DeepStack layer). Sharding it via FSDP leaves
-    # later attend() calls operating on stale/freed DTensors during backward,
-    # because attend() is invoked as a sub-module method rather than at the
-    # FSDP wrap boundary. The projector is small relative to the LLM, so
-    # skip FSDP and keep its params replicated when kind='cross_attn'.
+    # cross-attention at every DeepStack layer). Do not give it a separate
+    # FSDP boundary: attend() is invoked as a sub-module method, so that
+    # boundary would reshard parameters after the seed forward and leave later
+    # calls without a matching all-gather. The outer model FSDP boundary still
+    # shards these parameters while keeping them materialized for the complete
+    # model forward/backward.
     if getattr(model.proj, "kind", "mlp") == "cross_attn":
-        skipped_frozen_modules.append("proj (cross_attn, replicated)")
+        skipped_modules.append("proj (cross_attn, outer FSDP)")
     else:
         _fully_shard_if_trainable(
             model.proj,
             module_name="proj",
-            skipped_frozen_modules=skipped_frozen_modules,
+            skipped_modules=skipped_modules,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
     _fully_shard_if_trainable(
         model.llm.embeddings,
         module_name="llm.embeddings",
-        skipped_frozen_modules=skipped_frozen_modules,
+        skipped_modules=skipped_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
     _fully_shard_if_trainable(
         model.llm.pre_norm,
         module_name="llm.pre_norm",
-        skipped_frozen_modules=skipped_frozen_modules,
+        skipped_modules=skipped_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward,
     )
@@ -197,28 +198,28 @@ def apply_fsdp(
         _fully_shard_if_trainable(
             block,
             module_name=f"llm.layers.{layer_idx}",
-            skipped_frozen_modules=skipped_frozen_modules,
+            skipped_modules=skipped_modules,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward,
         )
     _fully_shard_if_trainable(
         model.llm.norm,
         module_name="llm.norm",
-        skipped_frozen_modules=skipped_frozen_modules,
+        skipped_modules=skipped_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward_policy == "always",
     )
     _fully_shard_if_trainable(
         model.lm_head,
         module_name="lm_head",
-        skipped_frozen_modules=skipped_frozen_modules,
+        skipped_modules=skipped_modules,
         **fsdp_config,
         reshard_after_forward=reshard_after_forward_policy == "always",
     )
-    if skipped_frozen_modules:
+    if skipped_modules:
         logger.info(
-            "Skipped FSDP wrapping for frozen RWKV-VL modules: %s",
-            skipped_frozen_modules,
+            "Skipped standalone FSDP wrapping for RWKV-VL modules: %s",
+            skipped_modules,
         )
     fully_shard(model.llm, **fsdp_config)
     fully_shard(model, **fsdp_config)

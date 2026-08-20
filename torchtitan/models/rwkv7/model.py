@@ -157,39 +157,6 @@ def _merge_heads(x: torch.Tensor) -> torch.Tensor:
     return x.reshape(batch, seq_len, n_heads * head_dim)
 
 
-# TODO: Remove after FLA gate_output_correction handles >64K-token slices.
-_GATE_OUTPUT_CORRECTION_MAX_TOKENS = 65_536
-
-
-def _gate_output_correction_chunked(
-    ops: Any,
-    o: torch.Tensor,
-    r: torch.Tensor,
-    k: torch.Tensor,
-    r_k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-) -> torch.Tensor:
-    seq_len = o.shape[1]
-    if seq_len <= _GATE_OUTPUT_CORRECTION_MAX_TOKENS:
-        return ops.gate_output_correction(o, r, k, r_k, v, g)
-
-    outputs = []
-    for start in range(0, seq_len, _GATE_OUTPUT_CORRECTION_MAX_TOKENS):
-        end = min(start + _GATE_OUTPUT_CORRECTION_MAX_TOKENS, seq_len)
-        outputs.append(
-            ops.gate_output_correction(
-                o[:, start:end],
-                r[:, start:end],
-                k[:, start:end],
-                r_k,
-                v[:, start:end],
-                g[:, start:end],
-            )
-        )
-    return torch.cat(outputs, dim=1)
-
-
 class _FLAOps:
     def __init__(self) -> None:
         try:
@@ -203,8 +170,9 @@ class _FLAOps:
             from fla.ops.rwkv7.gate_output_correction import gate_output_correction
         except ImportError as exc:
             raise ImportError(
-                "RWKV7 requires flash-linear-attention (FLA). Install a version "
-                "that provides fla.ops.cp, fla.modules.token_shift_cp, and "
+                "RWKV7 requires flash-linear-attention (FLA) >= 0.5.2. Install "
+                "a version that provides packed token_shift, long-context "
+                "gate_output_correction, fla.ops.cp, and "
                 "fla.ops.generalized_delta_rule.dplr."
             ) from exc
 
@@ -228,67 +196,6 @@ def _require_fla_ops() -> _FLAOps:
     return _fla_ops
 
 
-# TODO: Replace this wrapper once FLA exposes a varlen token_shift autograd API.
-class _VarlenTokenShift(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-    ) -> torch.Tensor:
-        if x.dim() != 3:
-            raise ValueError("RWKV7 token shift expects input shape [B, T, D]")
-        if x.shape[0] != 1:
-            raise ValueError(
-                "RWKV7 varlen token shift expects batch size 1 after flattening"
-            )
-
-        starts = cu_seqlens[:-1].to(device=x.device, dtype=torch.long)
-        ctx.save_for_backward(starts)
-
-        y = torch.empty_like(x)
-        if x.shape[1] == 0:
-            return y
-
-        y[:, 0, :].copy_(x[:, 0, :]).neg_()
-        if x.shape[1] > 1:
-            y[:, 1:, :].copy_(x[:, :-1, :])
-            y[:, 1:, :].sub_(x[:, 1:, :])
-
-        boundary_starts = starts[starts > 0]
-        if boundary_starts.numel() > 0:
-            y.index_copy_(
-                1,
-                boundary_starts,
-                x.index_select(1, boundary_starts).neg(),
-            )
-        return y
-
-    @staticmethod
-    def backward(
-        ctx: Any,
-        dy: torch.Tensor,
-    ) -> tuple[torch.Tensor, None]:
-        (starts,) = ctx.saved_tensors
-
-        dx = dy.neg()
-        if dy.shape[1] > 1:
-            dx[:, :-1, :].add_(dy[:, 1:, :])
-
-        boundary_starts = starts[starts > 0]
-        if boundary_starts.numel() > 0:
-            prev = boundary_starts - 1
-            dx.index_add_(1, prev, dy.index_select(1, boundary_starts).neg())
-        return dx, None
-
-
-def _token_shift_varlen_eager(
-    x: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-) -> torch.Tensor:
-    return _VarlenTokenShift.apply(x, cu_seqlens)
-
-
 @torch.compiler.disable
 def _token_shift_eager(
     x: torch.Tensor,
@@ -303,13 +210,8 @@ def _token_shift_eager(
             cp_context=cp_context,
             cu_seqlens=cp_context.cu_seqlens,
         )
-    if cu_seqlens is not None:
-        # FLA's varlen token_shift long kernel autotunes a 3D launch from the
-        # number of chunks and sequence spans. Packed batches with many short
-        # spans can trip invalid launches during activation checkpointing.
-        return _token_shift_varlen_eager(x, cu_seqlens)
     ops = _require_fla_ops()
-    return ops.token_shift(x, cu_seqlens)
+    return ops.token_shift(x, cu_seqlens=cu_seqlens)
 
 
 class RWKVLoRA(Module):
@@ -601,15 +503,7 @@ class RWKV7TimeMix(Module):
 
         o = self.g_norm(_merge_heads(o).view(batch_size * seq_len, self.value_dim))
         o = o.view(batch_size, seq_len, self.value_dim)
-        o = _gate_output_correction_chunked(
-            ops,
-            o,
-            r_heads,
-            k_heads,
-            self.r_k,
-            v_heads,
-            g,
-        )
+        o = ops.gate_output_correction(o, r_heads, k_heads, self.r_k, v_heads, g)
         return self.o_proj(o), layer_v
 
 

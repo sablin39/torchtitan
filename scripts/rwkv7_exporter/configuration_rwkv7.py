@@ -1,7 +1,10 @@
-try:
-    from fla.models.rwkv7.configuration_rwkv7 import RWKV7Config as _FLARWKV7Config
-except ImportError:
-    from fla.models.rwkv7.configuration_rwkv7 import RWKV7Config as _FLARWKV7Config
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from fla.models.rwkv7.configuration_rwkv7 import RWKV7Config as _FLARWKV7Config
 
 
 class RWKV7Config(_FLARWKV7Config):

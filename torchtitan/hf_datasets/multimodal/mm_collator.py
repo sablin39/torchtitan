@@ -84,7 +84,6 @@ class MultiModalCollator:
         input_ids = pad_sequence(
             [s["input_ids"] for s in batch],
             batch_first=True,
-            # pyrefly: ignore [missing-attribute]
             padding_value=self.tokenizer.pad_id,
         )
         labels = pad_sequence(
@@ -102,7 +101,6 @@ class MultiModalCollator:
             input_ids,
             labels,
             self.seq_len + 1,
-            # pyrefly: ignore [missing-attribute]
             padding_idx=self.tokenizer.pad_id,
             ignore_idx=IGNORE_INDEX,
         )
@@ -120,7 +118,6 @@ class MultiModalCollator:
             input_ids,
             labels,
             self.batch_size,
-            # pyrefly: ignore [missing-attribute]
             padding_idx=self.tokenizer.pad_id,
             ignore_idx=IGNORE_INDEX,
         )

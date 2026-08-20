@@ -117,7 +117,7 @@ def _make_model_config(
             decay_low_rank_dim=32,
             gate_low_rank_dim=64,
             v_low_rank_dim=32,
-            chunk_size=64,
+            chunk_size=16,
         ),
         vision_encoder=_make_vision_encoder_config(
             deepstack_indices=list(deepstack_indices)
@@ -314,6 +314,7 @@ class TestRwkvVLProjectorVariants(unittest.TestCase):
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
         model = cfg.build().to(self.device).to(torch.bfloat16)
+        model.init_states(buffer_device=self.device)
         return model
 
     def test_mlp_projector_forward_backward(self):
@@ -425,30 +426,97 @@ class TestRwkvVLProjectorVariants(unittest.TestCase):
             )
 
     def test_cross_image_attention_is_masked(self):
-        """Swapping image B's K/V should not change image A's queries."""
+        """Changing image B's K/V must not affect image A's queries."""
         model = self._build(kind="cross_attn")
         model.eval()
         tokens, pixel_values, grid_thw = _make_inputs(
             device=self.device, image_token_id=model.config.image_token_id
         )
         with torch.no_grad():
-            out1 = model(tokens, pixel_values=pixel_values, grid_thw=grid_thw)
-            # Build a new pixel batch where image-A patches are identical
-            # but image-B patches are scrambled. Image-A token positions
-            # in the output must be unchanged.
-            grid_a = grid_thw[0]
-            patches_a = int((grid_a.prod()).item())
+            (
+                _,
+                deepstack,
+                num_tokens_per_item,
+                num_kv_per_item,
+            ) = model._get_vision_embeds(pixel_values, grid_thw=grid_thw)
+            patches_a = int(num_kv_per_item[0].item())
             pixel_values_alt = pixel_values.clone()
             pixel_values_alt[patches_a:].uniform_(-1, 1)
-            out2 = model(tokens, pixel_values=pixel_values_alt, grid_thw=grid_thw)
-        # Image-A image_pad positions span tokens[0, 8:8+n_pad_a].
-        n_pad_a = patches_a // (model.processor_spatial_merge_size**2)
-        a_slice = (slice(None), slice(8, 8 + n_pad_a))
-        diff = (out1[a_slice] - out2[a_slice]).abs().max().item()
-        # With per-image masking, image-A outputs should be unaffected.
-        # Allow tiny noise from numerical broadcasting through unrelated
-        # text-stream computations.
-        self.assertLess(diff, 1e-2)
+            (
+                _,
+                deepstack_alt,
+                num_tokens_per_item_alt,
+                num_kv_per_item_alt,
+            ) = model._get_vision_embeds(pixel_values_alt, grid_thw=grid_thw)
+
+            torch.testing.assert_close(
+                num_tokens_per_item, num_tokens_per_item_alt, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                num_kv_per_item, num_kv_per_item_alt, rtol=0, atol=0
+            )
+            for (keys, values), (keys_alt, values_alt) in zip(deepstack, deepstack_alt):
+                torch.testing.assert_close(
+                    keys[:patches_a], keys_alt[:patches_a], rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    values[:patches_a], values_alt[:patches_a], rtol=0, atol=0
+                )
+
+            injector = model._make_cross_attn_injector(
+                deepstack_features=deepstack,
+                num_tokens_per_item=num_tokens_per_item,
+                num_kv_per_item=num_kv_per_item,
+                vision_token_id=model.config.image_token_id,
+                global_input_ids=None,
+                global_start=None,
+                local_tokens=tokens,
+            )
+            injector_alt = model._make_cross_attn_injector(
+                deepstack_features=deepstack_alt,
+                num_tokens_per_item=num_tokens_per_item_alt,
+                num_kv_per_item=num_kv_per_item_alt,
+                vision_token_id=model.config.image_token_id,
+                global_input_ids=None,
+                global_start=None,
+                local_tokens=tokens,
+            )
+
+            generator = torch.Generator(device=self.device).manual_seed(123)
+            hidden_states = torch.randn(
+                1,
+                tokens.shape[1],
+                model.hidden_size,
+                dtype=torch.bfloat16,
+                device=self.device,
+                generator=generator,
+            )
+            image_positions = torch.nonzero(
+                tokens[0] == model.config.image_token_id, as_tuple=False
+            ).flatten()
+            num_a_queries = int(num_tokens_per_item[0].item())
+            image_a_positions = image_positions[:num_a_queries]
+            image_b_positions = image_positions[num_a_queries:]
+
+            for layer_index in model.proj.language_layer_indices:
+                injected = injector(layer_index, hidden_states)
+                injected_alt = injector_alt(layer_index, hidden_states)
+                torch.testing.assert_close(
+                    injected[0, image_a_positions],
+                    injected_alt[0, image_a_positions],
+                    rtol=0,
+                    atol=0,
+                )
+                self.assertGreater(
+                    (
+                        injected[0, image_b_positions]
+                        - injected_alt[0, image_b_positions]
+                    )
+                    .abs()
+                    .max()
+                    .item(),
+                    0,
+                )
 
 
 if __name__ == "__main__":
