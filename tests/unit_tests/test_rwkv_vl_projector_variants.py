@@ -136,17 +136,6 @@ def _make_model_config(
             tie_qkvo=tie_qkvo,
             spatial_merge_size=2,
             extra_merge_size=extra_merge_size,
-            kernel_options=(
-                {
-                    "USE_TMA": False,
-                    "fwd_BLOCK_M": 64,
-                    "fwd_BLOCK_N": 64,
-                    "fwd_num_stages": 3,
-                    "fwd_num_warps": 4,
-                }
-                if kind == "cross_attn"
-                else None
-            ),
         ),
         lm_head=Linear.Config(
             in_features=hidden_size,
@@ -180,7 +169,7 @@ def _make_inputs(
     image matches ``(1*h*w) // processor_merge**2``.
     """
     if images is None:
-        images = [(8, 8), (8, 8)]  # 64 + 64 = 128 patches (FlexAttn TMA)
+        images = [(8, 8), (8, 8)]
     gen = torch.Generator(device=device).manual_seed(42)
     tokens = torch.randint(
         2, 2000, (1, seq_len), dtype=torch.long, device=device, generator=gen
@@ -377,8 +366,7 @@ class TestRwkvVLProjectorVariants(unittest.TestCase):
             extra_merge_size=2,
             processor_merge_size=4,
         )
-        # Need image patches divisible by processor_merge**2 = 16, and
-        # total divisible by 128 for the vision FlexAttention TMA path.
+        # Need image patches divisible by processor_merge**2 = 16.
         tokens, pixel_values, grid_thw = _make_inputs(
             device=self.device,
             image_token_id=model.config.image_token_id,
@@ -517,6 +505,89 @@ class TestRwkvVLProjectorVariants(unittest.TestCase):
                     .item(),
                     0,
                 )
+
+    def test_cross_attn_cp_partial_image_segments_use_asymmetric_varlen(self):
+        model = self._build(kind="cross_attn")
+        tokens, _, _ = _make_inputs(
+            device=self.device, image_token_id=model.config.image_token_id
+        )
+        shard_start = 16
+        shard_end = 36
+        local_tokens = tokens[:, shard_start:shard_end]
+        num_tokens_per_item = torch.tensor([16, 16], device=self.device)
+        num_kv_per_item = torch.tensor([64, 64], device=self.device)
+        fake_deepstack = [
+            (
+                torch.randn(
+                    128,
+                    model.proj.num_key_value_heads,
+                    model.proj.head_dim,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                ),
+                torch.randn(
+                    128,
+                    model.proj.num_key_value_heads,
+                    model.proj.head_dim,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                ),
+            )
+            for _ in range(model.proj.num_deepstack)
+        ]
+        calls = []
+
+        def record_attend(
+            depth,
+            query_hidden_states,
+            keys,
+            values,
+            *,
+            attention_metadata,
+        ):
+            del values
+            calls.append(
+                (
+                    depth,
+                    query_hidden_states.shape[0],
+                    keys.shape[0],
+                    attention_metadata,
+                )
+            )
+            return torch.zeros_like(query_hidden_states)
+
+        model.proj.attend = record_attend
+        injector = model._make_cross_attn_injector(
+            deepstack_features=fake_deepstack,
+            num_tokens_per_item=num_tokens_per_item,
+            num_kv_per_item=num_kv_per_item,
+            vision_token_id=model.config.image_token_id,
+            global_input_ids=tokens,
+            global_start=torch.tensor(shard_start, device=self.device),
+            local_tokens=local_tokens,
+        )
+        hidden_states = torch.randn(
+            1,
+            local_tokens.shape[1],
+            model.hidden_size,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        actual = injector(model.proj.language_layer_indices[0], hidden_states)
+        torch.testing.assert_close(actual, hidden_states)
+        self.assertEqual(len(calls), 1)
+        depth, num_queries, num_keys, metadata = calls[0]
+        self.assertEqual(depth, 0)
+        self.assertEqual(num_queries, 16)
+        self.assertEqual(num_keys, 128)
+        torch.testing.assert_close(
+            metadata.cu_seq_q,
+            torch.tensor([0, 8, 16], dtype=torch.int32, device=self.device),
+        )
+        torch.testing.assert_close(
+            metadata.cu_seq_k,
+            torch.tensor([0, 64, 128], dtype=torch.int32, device=self.device),
+        )
 
 
 if __name__ == "__main__":

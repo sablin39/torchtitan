@@ -558,9 +558,9 @@ class TestCudaVisionEncoderParity(unittest.TestCase):
             "merger.linear_fc1.weight",
         ]
 
-        def run_flat():
+        def run_flat(source_pixels):
             encoder.zero_grad(set_to_none=True)
-            pixel_values = bucketed_pixels.detach().clone().requires_grad_(True)
+            pixel_values = source_pixels.detach().clone().requires_grad_(True)
             merged, deepstack = encoder(pixel_values, grid_thw=grid_thw)
             loss = merged.float().square().mean()
             for feature in deepstack:
@@ -601,8 +601,23 @@ class TestCudaVisionEncoderParity(unittest.TestCase):
                 {name: params[name].grad.detach().clone() for name in param_names},
             )
 
-        flat = run_flat()
+        flat = run_flat(bucketed_pixels)
+        flat_full = run_flat(flat_pixels)
         padded = run_padded()
+        torch.testing.assert_close(flat[0], flat_full[0], rtol=5e-4, atol=5e-4)
+        for flat_feature, full_feature in zip(flat[1], flat_full[1]):
+            torch.testing.assert_close(flat_feature, full_feature, rtol=5e-4, atol=5e-4)
+        torch.testing.assert_close(
+            flat[2][:real_patches], flat_full[2], rtol=1e-3, atol=1e-3
+        )
+        for name in param_names:
+            torch.testing.assert_close(
+                flat[3][name],
+                flat_full[3][name],
+                rtol=1e-3,
+                atol=1e-3,
+                msg=lambda msg, name=name: f"{name} full-prefix gradient mismatch:\n{msg}",
+            )
         torch.testing.assert_close(flat[0], padded[0], rtol=5e-4, atol=5e-4)
         for flat_feature, padded_feature in zip(flat[1], padded[1]):
             torch.testing.assert_close(

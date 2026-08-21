@@ -6,7 +6,8 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import ClassVar, NamedTuple
+from functools import cache
+from typing import cast, ClassVar, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -47,6 +48,9 @@ __all__ = [
     "ScaledDotProductAttention",
     "VarlenAttention",
     "VarlenMetadata",
+    "build_varlen_metadata",
+    "configure_flash_attention_backend",
+    "flash_attention_varlen",
     "create_attention_mask",
     "create_varlen_metadata_for_document",
     "get_causal_mask_mod",
@@ -68,6 +72,119 @@ class VarlenMetadata(NamedTuple):
     max_k: int
 
 
+def build_varlen_metadata(
+    q_lengths: torch.Tensor,
+    k_lengths: torch.Tensor | None = None,
+) -> VarlenMetadata:
+    """Build cumulative sequence lengths for native FlashAttention varlen.
+
+    ``q_lengths`` and ``k_lengths`` contain one entry per independent
+    attention segment.  Keeping this helper separate from ``VarlenAttention``
+    makes it usable by bidirectional encoder and cross-attention callers,
+    which do not use the decoder's causal mask.
+    """
+    if q_lengths.dim() != 1:
+        raise ValueError(f"q_lengths must be 1D, got shape={tuple(q_lengths.shape)}")
+    if k_lengths is None:
+        k_lengths = q_lengths
+    if k_lengths.dim() != 1:
+        raise ValueError(f"k_lengths must be 1D, got shape={tuple(k_lengths.shape)}")
+    if q_lengths.numel() != k_lengths.numel():
+        raise ValueError(
+            "q_lengths and k_lengths must have the same number of segments; "
+            f"got {q_lengths.numel()} and {k_lengths.numel()}"
+        )
+    if q_lengths.numel() == 0:
+        raise ValueError("varlen attention requires at least one segment")
+    if (q_lengths < 0).any() or (k_lengths < 0).any():
+        raise ValueError("varlen sequence lengths must be non-negative")
+
+    q_lengths = q_lengths.to(dtype=torch.int32)
+    k_lengths = k_lengths.to(device=q_lengths.device, dtype=torch.int32)
+    cu_seq_q = torch.zeros(
+        q_lengths.numel() + 1, dtype=torch.int32, device=q_lengths.device
+    )
+    cu_seq_k = torch.zeros(
+        k_lengths.numel() + 1, dtype=torch.int32, device=k_lengths.device
+    )
+    cu_seq_q[1:] = q_lengths.cumsum(0)
+    cu_seq_k[1:] = k_lengths.cumsum(0)
+    return VarlenMetadata(
+        cu_seq_q=cu_seq_q,
+        cu_seq_k=cu_seq_k,
+        max_q=int(q_lengths.max().item()),
+        max_k=int(k_lengths.max().item()),
+    )
+
+
+@cache
+def configure_flash_attention_backend() -> str | None:
+    """Select FA3 on Hopper when installed, otherwise retain native FA2.
+
+    PyTorch's native varlen operator has the same call shape for FA2 and FA3;
+    the implementation is selected through the attention registry.  Do not
+    infer FA3 from ``capability >= 9`` because that also matches Blackwell,
+    where FA4 or the native fallback may be the appropriate implementation.
+    """
+    active = current_flash_attention_impl()
+    if active is not None or not torch.cuda.is_available():
+        return active
+    if torch.cuda.get_device_capability()[0] != 9:
+        return active
+    try:
+        activate_flash_attention_impl("FA3")
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return None
+    return current_flash_attention_impl()
+
+
+def flash_attention_varlen(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    metadata: VarlenMetadata,
+    *,
+    scale: float | None = None,
+    causal: bool = False,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
+    """Run bidirectional or causal FlashAttention through PyTorch's varlen API.
+
+    The wrapper deliberately uses a project-specific name instead of either
+    vendor package's ``flash_attn_varlen_func`` name.  It therefore works with
+    the native FA2 implementation and the optional FA3 implementation without
+    importing or depending on either package's Python-level API.
+    """
+    output_dtype = query.dtype
+    if output_dtype not in (torch.bfloat16, torch.float16):
+        query = query.to(torch.bfloat16)
+        key = key.to(torch.bfloat16)
+        value = value.to(torch.bfloat16)
+    window_size = (-1, 0) if causal else (-1, -1)
+    num_splits = (
+        1
+        if is_in_batch_invariant_mode() and current_flash_attention_impl() == "FA3"
+        else None
+    )
+    output = cast(
+        torch.Tensor,
+        varlen_attn(
+            query,
+            key,
+            value,
+            metadata.cu_seq_q,
+            metadata.cu_seq_k,
+            metadata.max_q,
+            metadata.max_k,
+            scale=scale,
+            window_size=window_size,
+            enable_gqa=enable_gqa,
+            num_splits=num_splits,
+        ),
+    )
+    return output.to(output_dtype)
+
+
 AttentionMasksType = dict[str, BlockMask] | BlockMask | VarlenMetadata
 
 
@@ -78,13 +195,7 @@ class VarlenAttention(Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-
-        from torchtitan.tools.utils import has_cuda_capability
-
-        # Hopper (SM 9.0) uses FA3
-        if has_cuda_capability(9, 0):
-            if current_flash_attention_impl() != "FA3":
-                activate_flash_attention_impl("FA3")
+        configure_flash_attention_backend()
 
     def forward(
         self,
@@ -100,11 +211,6 @@ class VarlenAttention(Module):
             attention_masks, VarlenMetadata
         ), f"attention_masks must be instance of VarlenMetadata but got {type(attention_masks)}"
 
-        cu_seq_q = attention_masks.cu_seq_q
-        cu_seq_k = attention_masks.cu_seq_k
-        max_q = attention_masks.max_q
-        max_k = attention_masks.max_k
-
         batch_size, seq_len, _, head_dim = xq.shape
 
         # varlen attention expects (bs*seqlen, n_heads, head_dim)
@@ -119,40 +225,14 @@ class VarlenAttention(Module):
         xk_packed = xk_packed.to(torch.bfloat16)
         xv_packed = xv_packed.to(torch.bfloat16)
 
-        varlen_kwargs = dict()
-
-        if is_in_batch_invariant_mode():
-            if current_flash_attention_impl() == "FA3":
-                # Fix split count to 1 to prevent non-deterministic split-k
-                # reductions that vary with batch composition.
-                # Only needed for FA3; FA2 is automatically batch-invariant.
-                varlen_kwargs["num_splits"] = 1
-
-        # Forward enable_gqa from GQAttention when Q and KV head counts differ
-        if kwargs.get("enable_gqa", False):
-            varlen_kwargs["enable_gqa"] = True
-
-        out_packed = varlen_attn(
+        out_packed = flash_attention_varlen(
             xq_packed,
             xk_packed,
             xv_packed,
-            cu_seq_q,
-            cu_seq_k,
-            max_q,
-            max_k,
+            attention_masks,
             scale=scale,
-            # window_size=(left, right) controls the attention window relative to each
-            # query position. 'left' is how many tokens before the query to attend to,
-            # and 'right' is how many tokens after. A value of -1 means unlimited.
-            #
-            # This replaces the is_causal flag:
-            #   - (-1, 0): Causal attention - each token attends to all previous tokens
-            #              and itself, but no future tokens. Equivalent to is_causal=True.
-            #   - (-1, -1): Full bidirectional attention (no masking). Equivalent to
-            #               is_causal=False.
-            #   - (W, 0): Sliding window causal - attend to at most W previous tokens.
-            window_size=(-1, 0),
-            **varlen_kwargs,  # pyrefly: ignore [bad-argument-type]
+            causal=True,
+            enable_gqa=kwargs.get("enable_gqa", False),
         )
         assert isinstance(out_packed, torch.Tensor)
         # Reshape back to the format expected by GQAttention.forward()

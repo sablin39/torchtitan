@@ -1561,7 +1561,7 @@ class TestMMChatDataset(unittest.TestCase):
             self.assertGreater((labels[1] != IGNORE_INDEX).sum().item(), 0)
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for FlexAttention")
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for FlashAttention")
 class TestQwen3VLVisionBucketing(unittest.TestCase):
     def test_bucketed_flat_path_matches_unbucketed_with_trainable_vit(self):
         torch.manual_seed(1234)

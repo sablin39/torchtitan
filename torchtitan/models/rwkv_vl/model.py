@@ -15,14 +15,14 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch.nn.attention.flex_attention import (
-    BlockMask,
-    create_block_mask,
-    flex_attention,
-)
-
 from torchtitan.components.optimizer import ParamGroupConfig
 from torchtitan.models.common import Linear, RMSNorm
+from torchtitan.models.common.attention import (
+    build_varlen_metadata,
+    configure_flash_attention_backend,
+    flash_attention_varlen,
+    VarlenMetadata,
+)
 from torchtitan.models.common.vision_features import (
     _find_vision_spans,
     apply_vision_slices,
@@ -50,123 +50,6 @@ GELU = Module.from_nn_module(nn.GELU)
 NormKind = Literal["layernorm", "rmsnorm"]
 FFNKind = Literal["relu", "gelu", "swiglu"]
 ProjectorKind = Literal["mlp", "cross_attn"]
-
-
-# Projector cross-attn shapes are bucketed so ``_cross_attn_flex``
-# (compiled with ``dynamic=False``) sees at most O(log N_max) distinct
-# (Q_LEN, KV_LEN) pairs. With ``projector_extra_merge_size > 1`` the K/V
-# stream can be ``extra_merge_size**2`` larger than Q for the same image,
-# so we generate the ladder on the fly instead of maintaining a static one.
-_BUCKET_MIN = 128
-# Soft ceiling — values past this almost certainly indicate a config bug
-# (e.g. unbounded ``max_images_per_batch`` with a huge ``max_pixels``) and
-# a single FlexAttention kernel that large would also be a memory hazard.
-_BUCKET_MAX = 1 << 24  # 16,777,216
-
-# Target K/V tokens per chunked cross-attn call. Images are packed greedily
-# into chunks of at most this many K/V tokens so each FlexAttention call
-# allocates Q/K/V padded to ``next_pow2(<= this)`` regardless of how many
-# images the batch holds. Matches ``vit_patch_bucket_size`` so the encoder
-# and projector see similar per-call shapes on Hopper.
-_CROSS_ATTN_CHUNK_KV_TARGET = 65536
-
-
-def _next_pow2_bucket(n: int) -> int:
-    """Round ``n`` up to the next power of two, clamped to ``[_BUCKET_MIN, _BUCKET_MAX]``.
-
-    Raises ``ValueError`` past ``_BUCKET_MAX`` so a runaway config surfaces
-    before flex_attention attempts a multi-million-row compile.
-    """
-    if n <= _BUCKET_MIN:
-        return _BUCKET_MIN
-    if n > _BUCKET_MAX:
-        raise ValueError(
-            f"Value {n} exceeds the projector FlexAttention bucket ceiling "
-            f"{_BUCKET_MAX}; check max_pixels / max_images_per_batch / "
-            "projector_extra_merge_size or pin q_buckets/kv_buckets explicitly."
-        )
-    return 1 << (n - 1).bit_length()
-
-
-def _ceil_to_bucket(n: int, ladder: tuple[int, ...]) -> int:
-    """Return the smallest ladder entry >= ``n``.
-
-    Only used when ``q_buckets`` / ``kv_buckets`` is explicitly pinned on the
-    projector config. Auto-bucketing uses :func:`_next_pow2_bucket`.
-    """
-    for b in ladder:
-        if b >= n:
-            return b
-    raise ValueError(
-        f"Value {n} exceeds the largest configured FlexAttention bucket "
-        f"{ladder[-1]}; widen projector q_buckets/kv_buckets or leave them "
-        "unset to use auto power-of-two bucketing."
-    )
-
-
-def _pack_images_into_chunks(
-    num_kv_per_item: list[int], target_kv: int
-) -> list[tuple[int, int]]:
-    """Greedily pack images into contiguous ``[img_lo, img_hi)`` ranges whose
-    K/V token sum stays within ``target_kv`` whenever possible.
-
-    A single image larger than ``target_kv`` forms its own chunk (it can't be
-    split since per-image attention must stay intact).
-    """
-    if not num_kv_per_item:
-        return []
-    chunks: list[tuple[int, int]] = []
-    cur_lo = 0
-    cur_count = 0
-    for i, n in enumerate(num_kv_per_item):
-        if cur_count > 0 and cur_count + n > target_kv:
-            chunks.append((cur_lo, i))
-            cur_lo = i
-            cur_count = 0
-        cur_count += n
-    chunks.append((cur_lo, len(num_kv_per_item)))
-    return chunks
-
-
-_compiled_create_block_mask = create_block_mask
-
-# Dedicated ``torch.compile`` of ``flex_attention`` for the cross-attn
-# projector. Kept separate from ``FlexAttention._compiled_flex_attn`` (used
-# by the vision encoder and the LLM) so the projector's distinct (Q_LEN,
-# KV_LEN) shapes don't poison the shared compile cache. ``dynamic=False``
-# requires the caller to pad Q/K/V to fixed bucket sizes
-# (``q_buckets`` / ``kv_buckets`` on the projector config) so each invocation
-# specialises against a single shape. Inductor options mirror the vision
-# encoder's FlexAttention settings (max-autotune, coordinate descent
-# tuning, TMA descriptors) — safe here because the static buckets give a
-# single shape to specialise against.
-_cross_attn_flex = torch.compile(
-    flex_attention,
-    dynamic=False,
-    options={
-        "max_autotune": True,
-        "coordinate_descent_tuning": True,
-        "triton.cudagraphs": False,
-        "assume_aligned_inputs": True,
-    },
-)
-
-
-# Default per-call kernel options forwarded to ``flex_attention`` for the
-# cross-attn projector. The vision encoder pins these for ViT bucketing on
-# H800; we reuse the same starting point here. Users can override via the
-# projector config's ``kernel_options`` field (currently unset by default).
-_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT: dict[str, object] = {
-    "USE_TMA": True,
-    "ROWS_GUARANTEED_SAFE": False,
-    "IS_DIVISIBLE": True,
-    # Block sizes / stages / warps are left for Inductor's autotune to pick;
-    # the supported cross_attn production flavors use head_dim>=128 where
-    # autotune finds valid choices. Smaller smoke configs (head_dim=64) hit
-    # a Triton "Cannot broadcast" issue with TMA; those callers should
-    # override ``kernel_options={"USE_TMA": False, "fwd_BLOCK_M": 64, ...}``
-    # via the projector config.
-}
 
 
 def _build_norm(kind: NormKind, dim: int, eps: float) -> Module:
@@ -556,17 +439,6 @@ class VisualAdapter(Module):
         num_query_heads: int | None = None
         num_key_value_heads: int | None = None
         tie_qkvo: bool = True
-        # Powers-of-two ladders for FlexAttention Q_LEN / KV_LEN buckets. Each
-        # forward picks the smallest bucket that fits the current shape and
-        # pads the rest with masked rows. ``None`` -> no bucketing (rebuild
-        # block_mask per shape).
-        q_buckets: tuple[int, ...] | None = None
-        kv_buckets: tuple[int, ...] | None = None
-        # Optional overrides for the per-call FlexAttention ``kernel_options``.
-        # Merged on top of ``_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT``. Pass
-        # ``{"USE_TMA": False}`` to disable TMA on small head_dim shapes that
-        # trip Triton autotune; pass empty dict to keep defaults.
-        kernel_options: dict[str, Any] | None = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -645,6 +517,7 @@ class VisualAdapter(Module):
             raise ValueError("language_layer_indices must be unique and increasing")
 
         self.head_dim = self.vision_dim // self.num_query_heads
+        configure_flash_attention_backend()
         kv_dim = self.num_key_value_heads * self.head_dim
         self.seed_query_norm = LayerNorm(config.encoder_dim, eps=config.norm_eps)
         self.seed_output_norm = LayerNorm(self.vision_dim, eps=config.norm_eps)
@@ -706,9 +579,6 @@ class VisualAdapter(Module):
                     for _ in range(config.num_deepstack + 1)
                 ]
             )
-        self.kernel_options = dict(_CROSS_ATTN_KERNEL_OPTIONS_DEFAULT)
-        if config.kernel_options:
-            self.kernel_options.update(config.kernel_options)
 
     def _project_memory(
         self, features: torch.Tensor, *, depth: int
@@ -733,33 +603,6 @@ class VisualAdapter(Module):
         o_proj = self.o_proj if self.tie_qkvo else self.o_projs[depth]
         return o_proj(attended)
 
-    def _attention(
-        self,
-        queries: torch.Tensor,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        *,
-        block_mask: BlockMask,
-        q_bucket: int,
-        kv_bucket: int,
-    ) -> torch.Tensor:
-        q_len, kv_len = queries.shape[0], keys.shape[0]
-        queries = F.pad(queries, (0, 0, 0, 0, 0, q_bucket - q_len))
-        keys = F.pad(keys, (0, 0, 0, 0, 0, kv_bucket - kv_len))
-        values = F.pad(values, (0, 0, 0, 0, 0, kv_bucket - kv_len))
-        query_states = queries.transpose(0, 1).unsqueeze(0)
-        key_states = keys.transpose(0, 1).unsqueeze(0)
-        value_states = values.transpose(0, 1).unsqueeze(0)
-        attended = _cross_attn_flex(
-            query_states,
-            key_states,
-            value_states,
-            block_mask=block_mask,
-            enable_gqa=self.num_query_heads != self.num_key_value_heads,
-            kernel_options=self.kernel_options,
-        )
-        return attended[0, :, :q_len].transpose(0, 1).reshape(q_len, self.vision_dim)
-
     def attend(
         self,
         depth: int,
@@ -767,19 +610,16 @@ class VisualAdapter(Module):
         keys: torch.Tensor,
         values: torch.Tensor,
         *,
-        block_mask: BlockMask,
-        q_bucket: int,
-        kv_bucket: int,
+        attention_metadata: VarlenMetadata,
     ) -> torch.Tensor:
         queries, gates = self._project_query_and_gate(depth, query_hidden_states)
         queries = queries.reshape(-1, self.num_query_heads, self.head_dim)
-        attended = self._attention(
+        attended = flash_attention_varlen(
             queries,
             keys,
             values,
-            block_mask=block_mask,
-            q_bucket=q_bucket,
-            kv_bucket=kv_bucket,
+            attention_metadata,
+            enable_gqa=self.num_query_heads != self.num_key_value_heads,
         )
         attended = attended.reshape(-1, self.num_query_heads, self.head_dim)
         attended = (attended * gates.unsqueeze(-1)).reshape(-1, self.vision_dim)
@@ -956,12 +796,6 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                 value = getattr(trainer_config, src_name, None)
                 if value is not None:
                     proj_overrides[dst_name] = value
-            q_bucket = getattr(trainer_config, "projector_q_bucket", None)
-            if q_bucket is not None:
-                proj_overrides["q_buckets"] = (int(q_bucket),)
-            kv_bucket = getattr(trainer_config, "projector_kv_bucket", None)
-            if kv_bucket is not None:
-                proj_overrides["kv_buckets"] = (int(kv_bucket),)
             if proj_overrides:
                 self.proj = replace(self.proj, **proj_overrides)
 
@@ -1377,22 +1211,14 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         global_start: torch.Tensor | None,
         local_tokens: torch.Tensor,
     ):
-        """Build an ``after_layer`` callback that runs masked cross-attention
+        """Build an ``after_layer`` callback that runs varlen cross-attention
         between local ``<image_pad>`` queries and projected deepstack K/V.
 
-        The block-diagonal mask (each image_pad attends only to its own
-        image's K/V) and bucketed lengths are computed **once per forward**
-        and reused across all deepstack levels.
+        Each image is one independent FlashAttention segment. Query/KV
+        cumulative lengths and gather indices are computed once per forward
+        and reused across all DeepStack levels.
         """
         device = local_tokens.device
-        empty_callback = self._make_mlp_injector(
-            deepstack_features=deepstack_features,
-            num_tokens_per_item=num_tokens_per_item,
-            vision_token_id=vision_token_id,
-            global_input_ids=global_input_ids,
-            global_start=global_start,
-            local_tokens=local_tokens,
-        )
         if (
             num_tokens_per_item is None
             or num_kv_per_item is None
@@ -1414,9 +1240,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
 
         # Gather local Q metadata: contiguous slice ranges in the flat local
         # token stream + per-row image_id label.
-        local_ranges: list[
-            tuple[int, int, int]
-        ] = []  # (local_start, local_end, image_id)
+        local_ranges: list[tuple[int, int, int]] = []
         for span in spans:
             span_end = span.start + span.length
             overlap_start = max(span.start, shard_start)
@@ -1432,134 +1256,29 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             )
 
         if not local_ranges:
-            # No image_pad falls on this rank's shard — fall back to a no-op
-            # but still consume deepstack features for the autograd edge in
-            # the CP zero-grad path.
-            del empty_callback
+            # No image_pad falls on this rank's shard. The CP path adds a
+            # separate zero-valued autograd edge for the vision features.
             return lambda idx, h: h
-
-        q_ladder = self.proj.config.q_buckets
-        kv_ladder = self.proj.config.kv_buckets
-
-        def _bucket_q(n: int) -> int:
-            return _ceil_to_bucket(n, q_ladder) if q_ladder else _next_pow2_bucket(n)
-
-        def _bucket_kv(n: int) -> int:
-            required = n + 1
-            return (
-                _ceil_to_bucket(required, kv_ladder)
-                if kv_ladder
-                else _next_pow2_bucket(required)
-            )
-
-        # Group local Q ranges by their image_id for fast per-chunk filtering.
-        ranges_by_image: dict[int, list[tuple[int, int]]] = {}
-        for start, end, image_id in local_ranges:
-            ranges_by_image.setdefault(image_id, []).append((start, end))
 
         num_kv_list = [int(n) for n in num_kv_per_item.tolist()]
-        chunk_image_ranges = _pack_images_into_chunks(
-            num_kv_list, _CROSS_ATTN_CHUNK_KV_TARGET
+        q_lengths = torch.tensor(
+            [end - start for start, end, _ in local_ranges],
+            dtype=torch.int32,
+            device=device,
         )
-        # Cumulative K/V offset per image, so chunk [img_lo, img_hi) maps to
-        # a contiguous K/V slice [kv_cum[img_lo], kv_cum[img_hi]).
-        kv_cum = [0]
-        for n in num_kv_list:
-            kv_cum.append(kv_cum[-1] + n)
+        active_image_ids = [image_id for _, _, image_id in local_ranges]
+        kv_lengths = torch.tensor(
+            [num_kv_list[image_id] for image_id in active_image_ids],
+            dtype=torch.int32,
+            device=device,
+        )
+        attention_metadata = build_varlen_metadata(q_lengths, kv_lengths)
+        q_index = torch.cat(
+            [torch.arange(start, end, device=device) for start, end, _ in local_ranges]
+        )
 
-        chunks: list[dict] = []
-        for img_lo, img_hi in chunk_image_ranges:
-            kv_start = kv_cum[img_lo]
-            kv_end = kv_cum[img_hi]
-            kv_real_len_chunk = kv_end - kv_start
-
-            chunk_ranges: list[tuple[int, int, int]] = []
-            for image_id in range(img_lo, img_hi):
-                for start, end in ranges_by_image.get(image_id, ()):
-                    chunk_ranges.append((start, end, image_id - img_lo))
-
-            if not chunk_ranges:
-                # No Q rows on this rank touch images in this chunk; skip.
-                continue
-
-            q_real_len_chunk = sum(end - start for start, end, _ in chunk_ranges)
-            q_bucket_chunk = _bucket_q(q_real_len_chunk)
-            kv_bucket_chunk = _bucket_kv(kv_real_len_chunk)
-
-            q_image_id_chunk = torch.full(
-                (q_bucket_chunk,), -1, dtype=torch.int32, device=device
-            )
-            cursor = 0
-            for start, end, rel_id in chunk_ranges:
-                length = end - start
-                q_image_id_chunk[cursor : cursor + length] = rel_id
-                cursor += length
-
-            kv_image_id_chunk = torch.full(
-                (kv_bucket_chunk,), -1, dtype=torch.int32, device=device
-            )
-            kv_cursor = 0
-            for image_id in range(img_lo, img_hi):
-                length = num_kv_list[image_id]
-                kv_image_id_chunk[kv_cursor : kv_cursor + length] = image_id - img_lo
-                kv_cursor += length
-
-            # Per-chunk closure: mask_mod captures this chunk's id tensors so
-            # each chunk gets its own compiled FlexAttention specialisation
-            # against (q_bucket_chunk, kv_bucket_chunk).
-            def _make_mask_mod(
-                qid: torch.Tensor,
-                kid: torch.Tensor,
-                dummy_index: int,
-            ):
-                def mask_mod(b, h, q_idx, kv_idx):
-                    q_id = qid[q_idx]
-                    kv_id = kid[kv_idx]
-                    valid_q = q_id >= 0
-                    valid_kv = kv_id >= 0
-                    same_image = q_id == kv_id
-                    padding_dummy = (~valid_q) & (kv_idx == dummy_index)
-                    return (same_image & valid_q & valid_kv) | padding_dummy
-
-                return mask_mod
-
-            block_mask_chunk = _compiled_create_block_mask(
-                _make_mask_mod(
-                    q_image_id_chunk,
-                    kv_image_id_chunk,
-                    kv_real_len_chunk,
-                ),
-                B=None,
-                H=None,
-                Q_LEN=q_bucket_chunk,
-                KV_LEN=kv_bucket_chunk,
-                device=device,
-            )
-
-            q_index_chunk = torch.empty(
-                q_real_len_chunk, dtype=torch.long, device=device
-            )
-            cursor = 0
-            for start, end, _ in chunk_ranges:
-                length = end - start
-                q_index_chunk[cursor : cursor + length] = torch.arange(
-                    start, end, device=device
-                )
-                cursor += length
-
-            chunks.append(
-                {
-                    "kv_start": kv_start,
-                    "kv_end": kv_end,
-                    "q_bucket": q_bucket_chunk,
-                    "kv_bucket": kv_bucket_chunk,
-                    "block_mask": block_mask_chunk,
-                    "q_index": q_index_chunk,
-                }
-            )
-
-        if not chunks:
-            return lambda idx, h: h
+        kv_start = sum(num_kv_list[: active_image_ids[0]])
+        kv_end = sum(num_kv_list[: active_image_ids[-1] + 1])
 
         depth_by_layer = {
             layer_index: depth
@@ -1572,23 +1291,18 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                 return layer_hidden_states
             k_all, v_all = deepstack_features[depth]
             flat = layer_hidden_states.reshape(-1, layer_hidden_states.shape[-1])
-            for chunk in chunks:
-                k_chunk = k_all[chunk["kv_start"] : chunk["kv_end"]]
-                v_chunk = v_all[chunk["kv_start"] : chunk["kv_end"]]
-                q_real = flat.index_select(0, chunk["q_index"])
-                delta = self.proj.attend(
-                    depth,
-                    q_real,
-                    k_chunk,
-                    v_chunk,
-                    block_mask=chunk["block_mask"],
-                    q_bucket=chunk["q_bucket"],
-                    kv_bucket=chunk["kv_bucket"],
-                )
-                # ``index_add`` (non-inplace) returns a fresh tensor; the in-place
-                # variant would overwrite ``layer_hidden_states`` while the previous
-                # LLM block's autograd graph still references it as a saved input.
-                flat = flat.index_add(0, chunk["q_index"], delta.to(flat.dtype))
+            q_real = flat.index_select(0, q_index)
+            delta = self.proj.attend(
+                depth,
+                q_real,
+                k_all[kv_start:kv_end],
+                v_all[kv_start:kv_end],
+                attention_metadata=attention_metadata,
+            )
+            # ``index_add`` (non-inplace) returns a fresh tensor; the in-place
+            # variant would overwrite ``layer_hidden_states`` while the previous
+            # LLM block's autograd graph still references it as a saved input.
+            flat = flat.index_add(0, q_index, delta.to(flat.dtype))
             return flat.view_as(layer_hidden_states)
 
         return inject

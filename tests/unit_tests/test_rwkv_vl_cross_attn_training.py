@@ -119,17 +119,6 @@ def _make_model_config() -> RWKV7VLForConditionalGeneration.Config:
             num_key_value_heads=2,
             spatial_merge_size=2,
             extra_merge_size=2,
-            # head_dim=64 here is below what the default TMA kernels handle
-            # cleanly. Production cross_attn flavors (1.5B-v400M+) use
-            # head_dim>=128 and keep TMA on. Pin the BLOCK / stages / warps
-            # explicitly to skip autotune (which trips at small head_dim).
-            kernel_options={
-                "USE_TMA": False,
-                "fwd_BLOCK_M": 64,
-                "fwd_BLOCK_N": 64,
-                "fwd_num_stages": 3,
-                "fwd_num_warps": 4,
-            },
         ),
         lm_head=Linear.Config(
             in_features=hidden_size,
@@ -149,7 +138,7 @@ def _make_batch(model, device, *, seq_len: int = 256):
     """Build a packed token + pixel batch for one forward step.
 
     Two images of (8, 8) patches (T=1, H=8, W=8) → 64 patches each → 128
-    total patches (satisfies the vision FlexAttention TMA constraint).
+    total patches.
     With processor_spatial_merge_size=8, each image contributes
     64 // 64 = 1 image_pad token to the text stream.
     """

@@ -12,51 +12,19 @@ import torch.nn.functional as F
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor, Replicate
 from torch.distributed.tensor.experimental import local_map
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from torchtitan.models.common import Linear
-from torchtitan.models.common.attention import FlexAttention
+from torchtitan.models.common.attention import (
+    build_varlen_metadata,
+    configure_flash_attention_backend,
+    flash_attention_varlen,
+    VarlenMetadata,
+)
 from torchtitan.models.common.rope import apply_rotary_emb_cos_sin
 from torchtitan.protocols.module import Module, ModuleDict, ModuleList
 
 LayerNorm = Module.from_nn_module(nn.LayerNorm)
 GELU = Module.from_nn_module(nn.GELU)
-
-_compiled_create_block_mask = torch.compile(create_block_mask)
-
-
-def get_vision_block_mask_mod(num_patch: torch.Tensor, max_num_patch: int):
-    """Create a mask modifier for block-diagonal attention.
-
-    Each image only attends to its own patches.
-
-    Args:
-        num_patch: (num_vision,) actual number of patches per visual item
-        max_num_patch: Maximum number of patches (padded length)
-    """
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        valid_q = q_idx < num_patch[b]
-        valid_kv = kv_idx < num_patch[b]
-        padding_self = (~valid_q) & (~valid_kv) & (q_idx == kv_idx)
-        return (valid_q & valid_kv) | padding_self
-
-    return mask_mod
-
-
-def get_flat_vision_block_mask_mod(patch_to_item: torch.Tensor):
-    """Create a block-diagonal mask for flat concatenated visual patches."""
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        q_item = patch_to_item[q_idx]
-        kv_item = patch_to_item[kv_idx]
-        valid_q = q_item >= 0
-        valid_kv = kv_item >= 0
-        same_item = q_item == kv_item
-        padding_self = (~valid_q) & (~valid_kv) & (q_idx == kv_idx)
-        return (same_item & valid_q & valid_kv) | padding_self
-
-    return mask_mod
 
 
 def _group_grid_by_hw(grid_thw: torch.Tensor) -> dict[tuple[int, int], list[int]]:
@@ -459,7 +427,7 @@ class PatchMerger(Module):
 
 
 class VisionAttention(Module):
-    """Multi-head attention with FlexAttention for efficient batched processing."""
+    """Multi-head vision attention using native varlen FlashAttention."""
 
     def __init__(
         self, dim: int, n_heads: int, *, qkv: Linear.Config, proj: Linear.Config
@@ -472,51 +440,27 @@ class VisionAttention(Module):
         self.dim = dim
         self.num_heads = n_heads
         self.head_dim = self.dim // self.num_heads
-        if dim % 8 != 0 or self.head_dim % 8 != 0:
-            raise ValueError(
-                "Vision FlexAttention TMA assumes packed QKV offsets and head "
-                "strides are 16-byte aligned for fp16/bf16 tensors; got "
-                f"dim={dim}, n_heads={n_heads}, head_dim={self.head_dim}"
-            )
 
         self.qkv = qkv.build()
         self.proj = proj.build()
-        # Padding rows self-attend, so every query row has at least one valid key
-        # globally. Still keep ROWS_GUARANTEED_SAFE disabled: with partial
-        # boundary blocks, a row can see an all-masked KV block before the block
-        # containing its valid keys, and FlexAttention's online softmax needs its
-        # per-block masked-row guard for that case. Do not claim
-        # BLOCKS_ARE_CONTIGUOUS either: PyTorch's partial-block index list can be
-        # non-contiguous even when the logical item span is contiguous.
-        vision_kernel_options = {
-            "USE_TMA": True,
-            "ROWS_GUARANTEED_SAFE": False,
-            "IS_DIVISIBLE": True,
-            # H800 ViT FlexAttention autotune favored this forward config for
-            # the observed RWKV-VL patch buckets. Keep it forward-scoped so a
-            # future unfrozen ViT backward path can tune independently.
-            "fwd_BLOCK_M": 64,
-            "fwd_BLOCK_N": 64,
-            "fwd_num_stages": 3,
-            "fwd_num_warps": 4,
-        }
-        self.flex_attention = FlexAttention.Config(
-            kernel_options=vision_kernel_options
-        ).build()
+        configure_flash_attention_backend()
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         *,
         rope_cache: torch.Tensor,
-        attention_mask: BlockMask,
+        attention_metadata: VarlenMetadata,
+        attention_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         """Apply multi-head attention with 2D RoPE.
 
         Args:
             hidden_states: (num_vision, max_num_patch, dim)
             rope_cache: (num_vision, max_num_patch, 1, head_dim*2) precomputed cos/sin
-            attention_mask: BlockMask for attention
+            attention_metadata: Per-image cumulative patch lengths
+            attention_indices: Valid rows in flattened padded storage, or
+                ``None`` when every storage row is valid
 
         Returns:
             (num_vision, max_num_patch, dim)
@@ -532,14 +476,36 @@ class VisionAttention(Module):
 
         q, k = apply_rotary_emb_cos_sin(q, k, rope_cache)
 
-        if max_num_patch % 128 != 0:
-            raise ValueError(
-                "Vision FlexAttention TMA expects the ViT sequence length to "
-                f"be divisible by 128; got max_num_patch={max_num_patch}. "
-                "Enable flat ViT patch bucketing or use a bucket size that is "
-                "a multiple of 128."
+        q = q.flatten(0, 1)
+        k = k.flatten(0, 1)
+        v = v.flatten(0, 1)
+        if attention_indices is None:
+            packed_q, packed_k, packed_v = q, k, v
+        elif num_vision == 1:
+            valid_length = attention_indices.shape[0]
+            packed_q = q[:valid_length]
+            packed_k = k[:valid_length]
+            packed_v = v[:valid_length]
+        else:
+            packed_q = q.index_select(0, attention_indices)
+            packed_k = k.index_select(0, attention_indices)
+            packed_v = v.index_select(0, attention_indices)
+        packed_output = flash_attention_varlen(
+            packed_q,
+            packed_k,
+            packed_v,
+            attention_metadata,
+        )
+        if attention_indices is None:
+            attn_output = packed_output
+        elif num_vision == 1:
+            pad_length = num_vision * max_num_patch - packed_output.shape[0]
+            attn_output = F.pad(packed_output, (0, 0, 0, 0, 0, pad_length))
+        else:
+            attn_output = packed_output.new_zeros(
+                (num_vision * max_num_patch, self.num_heads, self.head_dim)
             )
-        attn_output = self.flex_attention(q, k, v, attention_masks=attention_mask)
+            attn_output = attn_output.index_copy(0, attention_indices, packed_output)
         attn_output = attn_output.reshape(num_vision, max_num_patch, -1)
         return self.proj(attn_output)
 
@@ -582,19 +548,21 @@ class VisionTransformerBlock(Module):
         hidden_states: torch.Tensor,
         *,
         rope_cache: torch.Tensor,
-        attention_mask: BlockMask,
+        attention_metadata: VarlenMetadata,
+        attention_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             rope_cache=rope_cache,
-            attention_mask=attention_mask,
+            attention_metadata=attention_metadata,
+            attention_indices=attention_indices,
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
 
 class Qwen3VLVisionEncoder(Module):
-    """Qwen3-VL Vision Encoder with FlexAttention.
+    """Qwen3-VL Vision Encoder with varlen FlashAttention.
 
     Uses padded batches (N, L, D) format for efficient processing.
     """
@@ -833,7 +801,8 @@ class Qwen3VLVisionEncoder(Module):
         hidden_states: torch.Tensor,
         *,
         rope_cache: torch.Tensor,
-        attention_mask: BlockMask,
+        attention_metadata: VarlenMetadata,
+        attention_indices: torch.Tensor | None,
         trim_real_len: int | None,
         trim_real_patch_len: int | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -863,7 +832,8 @@ class Qwen3VLVisionEncoder(Module):
             hidden_states = layer(
                 hidden_states,
                 rope_cache=rope_cache,
-                attention_mask=attention_mask,
+                attention_metadata=attention_metadata,
+                attention_indices=attention_indices,
             )
             idx = self._deepstack_index_by_layer.get(int(layer_idx))
             if idx is not None:
@@ -921,35 +891,19 @@ class Qwen3VLVisionEncoder(Module):
             rope_cache = torch.cat([rope_cache, identity_rope], dim=1)
         hidden_states = hidden_states + learned_pos.unsqueeze(0)
 
-        patch_to_item = torch.repeat_interleave(
-            torch.arange(grid_thw.shape[0], device=grid_thw.device),
-            num_patch,
-        )
-        if pad_len > 0:
-            patch_to_item = torch.cat(
-                [
-                    patch_to_item,
-                    torch.full(
-                        (pad_len,),
-                        -1,
-                        dtype=patch_to_item.dtype,
-                        device=patch_to_item.device,
-                    ),
-                ]
+        attention_metadata = build_varlen_metadata(num_patch)
+        attention_indices = (
+            None
+            if real_num_patch == total_num_patch
+            else torch.arange(
+                real_num_patch, dtype=torch.long, device=hidden_states.device
             )
-        mask_mod = get_flat_vision_block_mask_mod(patch_to_item)
-        attention_mask = _compiled_create_block_mask(
-            mask_mod,
-            1,
-            None,
-            total_num_patch,
-            total_num_patch,
-            device=hidden_states.device,
         )
         return self._run_layers_with_deepstack(
             hidden_states,
             rope_cache=rope_cache,
-            attention_mask=attention_mask,
+            attention_metadata=attention_metadata,
+            attention_indices=attention_indices,
             trim_real_len=real_num_patch // self.spatial_merge_unit,
             trim_real_patch_len=real_num_patch,
         )
@@ -986,18 +940,17 @@ class Qwen3VLVisionEncoder(Module):
         )
         hidden_states = hidden_states + learned_pos
 
-        mask_mod = get_vision_block_mask_mod(num_patch, max_num_patch)
-        attention_mask = _compiled_create_block_mask(
-            mask_mod,
-            num_vision,
-            None,
-            max_num_patch,
-            max_num_patch,
-            device=hidden_states.device,
-        )
+        attention_metadata = build_varlen_metadata(num_patch)
+        valid_rows = torch.arange(max_num_patch, device=hidden_states.device).unsqueeze(
+            0
+        ) < num_patch.unsqueeze(1)
+        attention_indices = torch.nonzero(
+            valid_rows.flatten(), as_tuple=False
+        ).flatten()
         return self._run_layers_with_deepstack(
             hidden_states,
             rope_cache=rope_cache,
-            attention_mask=attention_mask,
+            attention_metadata=attention_metadata,
+            attention_indices=attention_indices,
             trim_real_len=None,
         )

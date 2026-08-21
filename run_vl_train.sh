@@ -114,13 +114,6 @@ tie_projector_qkvo="1"
 # at vision_spatial_merge_size * this ratio while the frozen ViT keeps its native
 # patch order. Only supported with projector_kind=cross_attn when greater than 1.
 projector_extra_merge_size="2"
-# Static FlexAttention buckets for the cross_attn projector (cross_attn only).
-# Each forward pads Q and K/V to exactly these sizes so the compiled FlexAttention
-# kernel sees a single static shape. Pick values >= the largest expected per-batch
-# image_pad / vision token counts. Leave empty to use the dynamic ladder (faster
-# kernels but may re-compile per shape).
-projector_q_bucket=""
-projector_kv_bucket=""
 # Seed for the freshly initialized projector weights at HF export time
 # (distinct from project_seed, which seeds training itself).
 projector_seed="1234"
@@ -225,8 +218,9 @@ max_pixels="3145728"
 # across all images in one chat example; set a positive image cap only as an
 # emergency batch-memory guard.
 max_images_per_batch="0"
-# Flat ViT patch bucketing stabilizes FlexAttention sequence shapes for image
-# patch streams. 0 disables bucketing and preserves the exact old data path.
+# Flat ViT patch bucketing stabilizes compiled encoder storage shapes for image
+# patch streams. Varlen attention still packs only real patches. 0 disables
+# bucketing and preserves the exact unbucketed data path.
 # Useful benchmark sweep values: 0, 16384, 32768, 65536.
 # For a bucket sweep, edit vit_patch_bucket_size and keep
 # torchinductor_cache_dir distinct for each cold-cache run.
@@ -239,14 +233,11 @@ tracking="1"
 nvml_metrics="1"
 log_freq="1"
 # Set to 1 for crash/numerics/compiler debugging. This enables heavyweight
-# asserts and verbose logs. Leave 0 for speed-equivalent runs. FlexAttention
-# autotune stays enabled by the model config either way.
+# asserts and verbose logs. Leave 0 for speed-equivalent runs.
 debugging="0"
 # Set to "auto" to capture the full shell/torchrun terminal stream in the train
 # artifact directory. Set empty to disable shell-level tee logging.
 terminal_log_file="auto"
-# FlexAttention autotune choices are useful in both speed and debug runs.
-flex_attention_log_file="auto"
 
 # --- Advanced (rarely touched) ------------------------------------------------------------
 model_name="rwkv_vl"
@@ -590,10 +581,6 @@ fi
 train_dump_dir="${output_root}/train"
 final_hf_dir="${output_root}/hf_final"
 
-if [[ "${flex_attention_log_file}" == "auto" ]]; then
-    flex_attention_log_file="${output_root}/flex_attention_autotune"
-fi
-
 if [[ "${overwrite}" == "1" ]]; then
     rm -rf "${train_dump_dir}" "${final_hf_dir}"
     # In resume mode hf_dir is a pre-existing external assets dir and dcp_dir
@@ -628,9 +615,6 @@ if [[ -n "${terminal_log_file}" ]]; then
     fi
     export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
     echo "Terminal log: ${terminal_log_file}"
-fi
-if [[ -n "${flex_attention_log_file}" ]]; then
-    mkdir -p "$(dirname "${flex_attention_log_file}")"
 fi
 if [[ -n "${nccl_debug_file}" ]]; then
     mkdir -p "$(dirname "${nccl_debug_file}")"
@@ -686,7 +670,6 @@ echo "  Triton debug:  ${triton_debug}"
 echo "  C++ stacks:    ${torch_show_cpp_stacktraces}"
 echo "  NaN asserts:   ${torchinductor_nan_asserts}/${torchinductor_runtime_triton_nan_asserts}"
 echo "  addr2line:     $([[ "${torch_disable_addr2line}" == "1" ]] && echo disabled || echo enabled)"
-echo "  FlexAttn log:  ${flex_attention_log_file:-<unset>}"
 echo "  NCCL debug:    ${nccl_debug:-<unset>}"
 echo "  NCCL flight:   ${torch_nccl_flight_recorder}"
 
@@ -848,12 +831,6 @@ fi
 if [[ -n "${projector_extra_merge_size}" ]]; then
     train_args+=(--projector-extra-merge-size "${projector_extra_merge_size}")
 fi
-if [[ -n "${projector_q_bucket}" ]]; then
-    train_args+=(--projector-q-bucket "${projector_q_bucket}")
-fi
-if [[ -n "${projector_kv_bucket}" ]]; then
-    train_args+=(--projector-kv-bucket "${projector_kv_bucket}")
-fi
 if [[ "${tracking}" == "1" ]]; then
     # SwanLab mirrors W&B as a connectivity backup; enable them together.
     train_args+=(--metrics.enable-wandb)
@@ -929,9 +906,6 @@ if [[ -n "${torch_cpp_log_level}" ]]; then
 fi
 if [[ -n "${torch_distributed_debug}" ]]; then
     train_env+=("TORCH_DISTRIBUTED_DEBUG=${torch_distributed_debug}")
-fi
-if [[ -n "${flex_attention_log_file}" ]]; then
-    train_env+=("TORCHINDUCTOR_FLEX_ATTENTION_LOGGING_FILE=${flex_attention_log_file}")
 fi
 if [[ -n "${nccl_debug}" ]]; then
     train_env+=("NCCL_DEBUG=${nccl_debug}")

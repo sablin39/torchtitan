@@ -102,17 +102,6 @@ class RWKVVLTrainerConfig(Trainer.Config):
     ``1`` keeps the native image-token resolution. Only
     meaningful with ``projector_kind='cross_attn'``."""
 
-    projector_q_bucket: int | None = None
-    """Static Q_LEN bucket for the cross-attn projector's FlexAttention call.
-    When set, Q is always padded to exactly this length, avoiding dynamic-shape
-    recompilation. Should be >= the largest expected ``<image_pad>`` count per
-    forward."""
-
-    projector_kv_bucket: int | None = None
-    """Static KV_LEN bucket for the cross-attn projector's FlexAttention call.
-    When set, K/V are always padded to exactly this length. Should be >= the
-    largest expected per-batch vision token count."""
-
 
 def _rwkv_vl_dataloader(dataset: str, **kwargs) -> MMDataLoader.Config:
     return MMDataLoader.Config(
