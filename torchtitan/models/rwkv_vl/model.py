@@ -11,7 +11,6 @@ from functools import partial
 from typing import Any, Literal
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -22,18 +21,12 @@ from torch.nn.attention.flex_attention import (
 )
 
 from torchtitan.components.optimizer import ParamGroupConfig
-from torchtitan.models.common import Linear, RMSNorm
+from torchtitan.models.common import GELU, LayerNorm, Linear, ReLU, RMSNorm
 from torchtitan.models.common.vision_features import (
     _find_vision_spans,
     apply_vision_slices,
 )
-from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
-from torchtitan.models.rwkv7.model import (
-    _output_linear_init,
-    _zero_,
-    LayerNorm,
-    RWKV7Backbone,
-)
+from torchtitan.models.rwkv7.model import _output_linear_init, _zero_, RWKV7Backbone
 from torchtitan.models.rwkv7.tokenizer import (
     DEFAULT_IMAGE_TOKEN_ID,
     DEFAULT_VISION_END_TOKEN_ID,
@@ -42,9 +35,7 @@ from torchtitan.models.rwkv7.tokenizer import (
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleList, Sequential
 
-
-ReLU = Module.from_nn_module(nn.ReLU)
-GELU = Module.from_nn_module(nn.GELU)
+from .vision_encoder import RWKVVisionEncoder
 
 
 NormKind = Literal["layernorm", "rmsnorm"]
@@ -66,8 +57,7 @@ _BUCKET_MAX = 1 << 24  # 16,777,216
 # Target K/V tokens per chunked cross-attn call. Images are packed greedily
 # into chunks of at most this many K/V tokens so each FlexAttention call
 # allocates Q/K/V padded to ``next_pow2(<= this)`` regardless of how many
-# images the batch holds. Matches ``vit_patch_bucket_size`` so the encoder
-# and projector see similar per-call shapes on Hopper.
+# images the batch holds.
 _CROSS_ATTN_CHUNK_KV_TARGET = 65536
 
 
@@ -171,7 +161,7 @@ _CROSS_ATTN_KERNEL_OPTIONS_DEFAULT: dict[str, object] = {
 
 def _build_norm(kind: NormKind, dim: int, eps: float) -> Module:
     if kind == "layernorm":
-        return LayerNorm(dim, eps=eps)
+        return LayerNorm.Config(normalized_shape=dim, eps=eps).build()
     if kind == "rmsnorm":
         return RMSNorm.Config(normalized_shape=dim, eps=eps).build()
     raise ValueError(f"Unknown norm kind: {kind!r}; expected layernorm|rmsnorm")
@@ -212,7 +202,8 @@ def _validate_root_lrs(root_lrs: dict[str, float]) -> dict[str, float]:
 def _resolve_root_lrs(module_lrs: Any, default_lr: float) -> dict[str, float]:
     if default_lr <= 0:
         raise ValueError(
-            "RWKV-VL module LR config requires --optimizer.lr to be greater than 0"
+            "RWKV-VL module LR config requires the default optimizer parameter "
+            "group LR to be greater than 0"
         )
 
     resolved = {}
@@ -227,16 +218,22 @@ def _configure_optimizer_param_groups(
     optimizer_config: Any,
     root_lrs: dict[str, float],
 ):
-    base_lr = float(optimizer_config.lr)
+    if not optimizer_config.param_groups:
+        raise ValueError("RWKV-VL requires at least one optimizer parameter group")
+    default_group = optimizer_config.param_groups[-1]
+    default_kwargs = dict(default_group.optimizer_kwargs)
+    base_lr = float(default_kwargs.get("lr", 0.0))
     if base_lr <= 0:
         raise ValueError(
-            "RWKV-VL module LR config requires --optimizer.lr to be greater than 0"
+            "RWKV-VL module LR config requires the default optimizer learning "
+            "rate to be greater than 0"
         )
 
     optimizer_config.param_groups = [
         ParamGroupConfig(
             pattern=_ROOT_PARAM_PATTERNS[name],
-            lr_multiplier=lr / base_lr,
+            optimizer_name=default_group.optimizer_name,
+            optimizer_kwargs={**default_kwargs, "lr": lr},
         )
         for name, lr in root_lrs.items()
         if lr > 0
@@ -332,13 +329,13 @@ def _build_ffn(
     if kind == "relu":
         return Sequential(
             _projector_linear(in_dim, hidden_dim, bias=bias),
-            ReLU(),
+            ReLU.Config().build(),
             _projector_linear(hidden_dim, out_dim, bias=bias),
         )
     if kind == "gelu":
         return Sequential(
             _projector_linear(in_dim, hidden_dim, bias=bias),
-            GELU(),
+            GELU.Config().build(),
             _projector_linear(hidden_dim, out_dim, bias=bias),
         )
     if kind == "swiglu":
@@ -355,7 +352,7 @@ class _VisualStreamProjector(Module):
     inputs are pre-shuffle-normalized, ``merge_size**2`` adjacent tokens are
     concatenated along the channel axis, then the MLP maps the merged
     ``encoder_dim * merge_size**2`` channels to ``project_dim``. This is the
-    same structure as ``Qwen3VLVisionModel.PatchMerger`` and removes the
+    same structure as Qwen's ``PatchMerger`` and removes the
     need for a separate ``extra_merger`` module on the projector main path.
     """
 
@@ -449,8 +446,7 @@ class _VisualStreamCrossAttnProjector(Module):
 
         Args:
             x: ``(N_kv, encoder_dim)`` flat-concatenated deepstack features
-               for this level (post-merge), padded with zero rows if the
-               dataloader bucketed the patch count.
+               for this level (post-merge).
 
         Returns:
             ``(k, v)`` each of shape ``(N_kv, num_heads, head_dim)``.
@@ -547,8 +543,8 @@ class VisualAdapter(Module):
         head_dim: int | None = None
         # Powers-of-two ladders for FlexAttention Q_LEN / KV_LEN buckets. Each
         # forward picks the smallest bucket that fits the current shape and
-        # pads the rest with masked rows. ``None`` -> no bucketing (rebuild
-        # block_mask per shape).
+        # pads the rest with masked rows. ``None`` uses automatic power-of-two
+        # bucketing.
         q_buckets: tuple[int, ...] | None = None
         kv_buckets: tuple[int, ...] | None = None
         # Optional overrides for the per-call FlexAttention ``kernel_options``.
@@ -668,7 +664,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         vocab_size: int = 65536
         hidden_size: int = 1024
         llm: RWKV7Backbone.Config
-        vision_encoder: Qwen3VLVisionEncoder.Config
+        vision_encoder: RWKVVisionEncoder.Config
         proj: VisualAdapter.Config
         lm_head: Linear.Config | None = None
         image_token_id: int = DEFAULT_IMAGE_TOKEN_ID
@@ -687,44 +683,30 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         processor_spatial_merge_size: int = 2
         root_lrs: dict[str, float] = field(default_factory=_default_root_lrs)
 
-        def update_from_config(self, *, trainer_config, **kwargs) -> None:
-            parallelism = trainer_config.parallelism
-            training = trainer_config.training
-            compile_config = getattr(trainer_config, "compile", None)
-            module_lrs = trainer_config.module_lrs
-            self.root_lrs = _resolve_root_lrs(module_lrs, trainer_config.optimizer.lr)
+        def update_from_config(self, *, config, **kwargs) -> None:
+            del kwargs
+            parallelism = config.parallelism
+            training = config.training
+            compile_config = getattr(config, "compile", None)
+            module_lrs = config.module_lrs
+            if not config.optimizer.param_groups:
+                raise ValueError(
+                    "RWKV-VL requires at least one optimizer parameter group"
+                )
+            default_lr = float(
+                config.optimizer.param_groups[-1].optimizer_kwargs.get("lr", 0.0)
+            )
+            self.root_lrs = _resolve_root_lrs(module_lrs, default_lr)
             _configure_optimizer_param_groups(
-                trainer_config.optimizer,
+                config.optimizer,
                 self.root_lrs,
             )
             self.llm = replace(
                 self.llm,
                 chunk_size=_validate_backbone_chunk_size(
-                    getattr(trainer_config, "backbone_chunk_size", self.llm.chunk_size)
+                    getattr(config, "backbone_chunk_size", self.llm.chunk_size)
                 ),
             )
-
-            # Snap vocab_size to the paired tokenizer (rounded up for matmul
-            # alignment). image / vision_start / vision_end token ids are
-            # intentionally not auto-synced from the tokenizer here — the VL
-            # special-token IDs must be set explicitly per-flavor.
-            from torchtitan.models.common.config_utils import (
-                align_vocab_size_to_tokenizer,
-            )
-
-            tokenizer = kwargs.get("tokenizer")
-            new_vocab = align_vocab_size_to_tokenizer(
-                declared_vocab_size=self.vocab_size, tokenizer=tokenizer
-            )
-            if new_vocab != self.vocab_size:
-                self.vocab_size = new_vocab
-                self.llm = replace(
-                    self.llm,
-                    vocab_size=new_vocab,
-                    embeddings=replace(self.llm.embeddings, num_embeddings=new_vocab),
-                )
-                if self.lm_head is not None:
-                    self.lm_head = replace(self.lm_head, out_features=new_vocab)
 
             # Optional projector overrides — let the trainer config override
             # the flavor-baked defaults for projector kind / norm / ffn / heads.
@@ -740,13 +722,13 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                 ("projector_head_dim", "head_dim"),
                 ("projector_extra_merge_size", "extra_merge_size"),
             ):
-                value = getattr(trainer_config, src_name, None)
+                value = getattr(config, src_name, None)
                 if value is not None:
                     proj_overrides[dst_name] = value
-            q_bucket = getattr(trainer_config, "projector_q_bucket", None)
+            q_bucket = getattr(config, "projector_q_bucket", None)
             if q_bucket is not None:
                 proj_overrides["q_buckets"] = (int(q_bucket),)
-            kv_bucket = getattr(trainer_config, "projector_kv_bucket", None)
+            kv_bucket = getattr(config, "projector_kv_bucket", None)
             if kv_bucket is not None:
                 proj_overrides["kv_buckets"] = (int(kv_bucket),)
             if proj_overrides:
@@ -761,8 +743,11 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             extra = self.proj.extra_merge_size
             derived_processor_merge = vision_merge * extra
             self.processor_spatial_merge_size = derived_processor_merge
-            dataloader_cfg = getattr(trainer_config, "dataloader", None)
-            if dataloader_cfg is not None and hasattr(
+            dataloader_cfg = getattr(config, "dataloader", None)
+            collator_cfg = getattr(dataloader_cfg, "collator", None)
+            if collator_cfg is not None and hasattr(collator_cfg, "spatial_merge_size"):
+                collator_cfg.spatial_merge_size = derived_processor_merge
+            elif dataloader_cfg is not None and hasattr(
                 dataloader_cfg, "spatial_merge_size"
             ):
                 dataloader_cfg.spatial_merge_size = derived_processor_merge
@@ -780,10 +765,11 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                     raise ValueError(
                         "RWKV-VL CP requires --parallelism.context_parallel_load_balancer None"
                     )
-                total_tokens = training.local_batch_size * training.seq_len
+                total_tokens = training.num_tokens_per_microbatch_per_dp_rank
                 if total_tokens % parallelism.context_parallel_degree != 0:
                     raise ValueError(
-                        f"RWKV-VL CP requires local_batch_size * seq_len "
+                        "RWKV-VL CP requires "
+                        "num_tokens_per_microbatch_per_dp_rank "
                         f"({total_tokens}) to be divisible by context_parallel_degree "
                         f"({parallelism.context_parallel_degree})"
                     )
@@ -837,7 +823,6 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             )
         ).build()
         self._cp_group = None
-        self._vision_patch_sync_group = None
         self._trainable_roots = self._apply_root_lr_selection()
 
     def _apply_root_lr_selection(self) -> tuple[str, ...]:
@@ -857,9 +842,6 @@ class RWKV7VLForConditionalGeneration(BaseModel):
     def set_cp_process_group(self, cp_group) -> None:
         self._cp_group = cp_group
 
-    def set_vision_patch_sync_process_group(self, group) -> None:
-        self._vision_patch_sync_group = group
-
     def _build_cp_context(
         self,
         cu_seqlens_global: torch.Tensor | None,
@@ -878,53 +860,6 @@ class RWKV7VLForConditionalGeneration(BaseModel):
             cu_seqlens_cpu=cu_seqlens_global_cpu,
         )
 
-    def _sync_flat_vision_patch_bucket(
-        self,
-        pixel_values: torch.Tensor | None,
-        grid_thw: torch.Tensor | None,
-        *,
-        device: torch.device,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if not dist.is_available() or not dist.is_initialized():
-            return pixel_values, grid_thw
-
-        group = self._vision_patch_sync_group
-        world_size = (
-            dist.get_world_size(group) if group is not None else dist.get_world_size()
-        )
-        if world_size == 1:
-            return pixel_values, grid_thw
-
-        has_local = (
-            pixel_values is not None
-            and grid_thw is not None
-            and pixel_values.dim() == 2
-        )
-        local_num_patch = int(pixel_values.shape[0]) if has_local else 0
-
-        max_num_patch = torch.tensor(local_num_patch, dtype=torch.long, device=device)
-        dist.all_reduce(max_num_patch, op=dist.ReduceOp.MAX, group=group)
-        target_num_patch = int(max_num_patch.item())
-        if target_num_patch == 0 or target_num_patch == local_num_patch:
-            return pixel_values, grid_thw
-        if not has_local:
-            return pixel_values, grid_thw
-        if target_num_patch < local_num_patch:
-            raise RuntimeError(
-                f"Rank-synchronized ViT patch bucket target {target_num_patch} "
-                f"is smaller than local patch count {local_num_patch}."
-            )
-
-        pad_len = target_num_patch - local_num_patch
-        pixel_values = torch.cat(
-            [
-                pixel_values,
-                pixel_values.new_zeros((pad_len, pixel_values.shape[1])),
-            ],
-            dim=0,
-        )
-        return pixel_values, grid_thw
-
     def _get_vision_embeds(
         self,
         pixel_values: torch.Tensor,
@@ -941,9 +876,7 @@ class RWKV7VLForConditionalGeneration(BaseModel):
         ``vision_encoder.spatial_merge_size``). The two are equal when the
         processor and vision merge sizes match.
         """
-        pixel_values = pixel_values.to(
-            self.vision_encoder.patch_embed.proj.weight.dtype
-        )
+        pixel_values = pixel_values.to(self.vision_encoder.patch_embed.weight.dtype)
         merged_embeds, deepstack_features = self.vision_encoder(
             pixel_values,
             grid_thw=grid_thw,
@@ -1190,8 +1123,8 @@ class RWKV7VLForConditionalGeneration(BaseModel):
                     valid_q = q_id >= 0
                     valid_kv = kv_id >= 0
                     same_image = q_id == kv_id
-                    padding_self = (~valid_q) & (~valid_kv) & (q_idx == kv_idx)
-                    return (same_image & valid_q & valid_kv) | padding_self
+                    padding_safe = (~valid_q) & (kv_idx == 0)
+                    return (same_image & valid_q & valid_kv) | padding_safe
 
                 return mask_mod
 
@@ -1339,12 +1272,6 @@ class RWKV7VLForConditionalGeneration(BaseModel):
     ) -> torch.Tensor:
         if pixel_values_videos is not None or grid_thw_videos is not None:
             raise NotImplementedError("RWKV-VL video inputs are not implemented yet")
-
-        pixel_values, grid_thw = self._sync_flat_vision_patch_bucket(
-            pixel_values,
-            grid_thw,
-            device=tokens.device,
-        )
 
         cp_context = self._build_cp_context(cu_seqlens_global, cu_seqlens_global_cpu)
         cu_seqlens = (

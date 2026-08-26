@@ -23,31 +23,18 @@ import torch
 import torch.nn as nn
 
 from torchtitan.models.common import Linear
-from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
 from torchtitan.models.rwkv7.model import rwkv7_backbone_config
+from torchtitan.models.rwkv_vl import _vl_vision_encoder_config
 from torchtitan.models.rwkv_vl.model import (
     RWKV7VLForConditionalGeneration,
     VisualAdapter,
 )
+from torchtitan.models.rwkv_vl.vision_encoder import RWKVVisionEncoder
 
 
-_LINEAR_INIT = {
-    "weight": partial(nn.init.trunc_normal_, std=0.02),
-    "bias": nn.init.zeros_,
-}
-_POS_EMBED_INIT = {"pos_embed": partial(nn.init.trunc_normal_, std=0.02)}
-
-
-def _linear_cfg(in_features: int, out_features: int) -> Linear.Config:
-    return Linear.Config(
-        in_features=in_features,
-        out_features=out_features,
-        bias=True,
-        param_init=_LINEAR_INIT,
-    )
-
-
-def _make_vision_encoder_config(deepstack_indices: list[int]) -> Qwen3VLVisionEncoder.Config:
+def _make_vision_encoder_config(
+    deepstack_indices: list[int],
+) -> RWKVVisionEncoder.Config:
     dim = 128
     ffn_dim = 512
     patch_size = 16
@@ -55,9 +42,7 @@ def _make_vision_encoder_config(deepstack_indices: list[int]) -> Qwen3VLVisionEn
     in_channels = 3
     out_hidden_size = 256
     spatial_merge_size = 2
-    patch_dim = in_channels * temporal_patch_size * patch_size * patch_size
-    merged_hidden_size = dim * (spatial_merge_size**2)
-    return Qwen3VLVisionEncoder.Config(
+    return _vl_vision_encoder_config(
         dim=dim,
         ffn_dim=ffn_dim,
         n_layers=4,
@@ -68,14 +53,7 @@ def _make_vision_encoder_config(deepstack_indices: list[int]) -> Qwen3VLVisionEn
         out_hidden_size=out_hidden_size,
         num_position_embeddings=1024,
         deepstack_visual_indices=deepstack_indices,
-        patch_embed_proj=_linear_cfg(patch_dim, dim),
-        attn_qkv=_linear_cfg(dim, dim * 3),
-        attn_proj=_linear_cfg(dim, dim),
-        mlp_fc1=_linear_cfg(dim, ffn_dim),
-        mlp_fc2=_linear_cfg(ffn_dim, dim),
-        merger_fc1=_linear_cfg(merged_hidden_size, merged_hidden_size),
-        merger_fc2=_linear_cfg(merged_hidden_size, out_hidden_size),
-        param_init=_POS_EMBED_INIT,
+        in_channels=in_channels,
     )
 
 
@@ -178,6 +156,7 @@ class TestCrossAttnTrainingLoop(unittest.TestCase):
         torch.cuda.manual_seed_all(0)
         cfg = _make_model_config()
         model = cfg.build().to(self.device).to(torch.bfloat16)
+        model.init_states(buffer_device=self.device)
         model.train()
         # Trainable: projector + lm_head. Vision encoder and LLM frozen to
         # isolate projector training behavior.
@@ -188,16 +167,12 @@ class TestCrossAttnTrainingLoop(unittest.TestCase):
         trainable = [p for p in model.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(trainable, lr=1e-3)
 
-        tokens, pixel_values, grid_thw, labels = _make_batch(
-            model, self.device
-        )
+        tokens, pixel_values, grid_thw, labels = _make_batch(model, self.device)
 
         losses = []
         for step in range(5):
             opt.zero_grad()
-            logits = model(
-                tokens, pixel_values=pixel_values, grid_thw=grid_thw
-            )
+            logits = model(tokens, pixel_values=pixel_values, grid_thw=grid_thw)
             # Simple next-token CE on a few positions.
             shift_logits = logits[:, :-1].float()
             shift_labels = labels[:, 1:]

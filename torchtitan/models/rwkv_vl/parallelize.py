@@ -12,14 +12,13 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 
 from torchtitan.config import (
-    ActivationCheckpointConfig,
     CompileConfig,
     ParallelismConfig,
     TORCH_DTYPE_MAP,
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import apply_ac
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import (
     disable_fsdp_gradient_division,
@@ -36,7 +35,7 @@ def parallelize_rwkv_vl(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
-    ac_config: ActivationCheckpointConfig,
+    ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
     trainable_roots = getattr(model, "_trainable_roots", None)
@@ -64,31 +63,29 @@ def parallelize_rwkv_vl(
                 "RWKV-VL CP with torch.compile is experimental. TorchTitan will "
                 "compile the vision encoder while leaving RWKV/FLA blocks eager."
             )
-        total_tokens = training.local_batch_size * training.seq_len
+        total_tokens = training.num_tokens_per_microbatch_per_dp_rank
         if total_tokens % parallel_dims.cp != 0:
             raise ValueError(
-                f"RWKV-VL CP requires local_batch_size * seq_len ({total_tokens}) "
+                "RWKV-VL CP requires num_tokens_per_microbatch_per_dp_rank "
+                f"({total_tokens}) "
                 f"to be divisible by CP degree ({parallel_dims.cp})"
             )
         model.set_cp_process_group(parallel_dims.get_mesh("cp").get_group())
 
-    vision_patch_sync_mesh = parallel_dims.get_optional_mesh("loss")
-    if vision_patch_sync_mesh is not None:
-        model.set_vision_patch_sync_process_group(vision_patch_sync_mesh.get_group())
-
     model_compile_enabled = (
         compile_config.enable and "model" in compile_config.components
     )
-    if ac_config.mode != "none":
-        apply_ac(
-            model.llm,
-            ac_config,
-            model_compile_enabled=False,
-            base_folder=dump_folder,
-        )
+    if ac_config is not None:
+        ac_policy = ac_config.build(dump_folder=dump_folder)
+        ac_policy.apply(model.llm)
+        ac_policy.apply(model.vision_encoder)
 
     if model_compile_enabled:
-        apply_compile(model.vision_encoder, compile_config)
+        apply_compile(
+            model.vision_encoder,
+            compile_config=compile_config,
+            parallel_dims=parallel_dims,
+        )
         logger.info("Compiled RWKV-VL vision encoder with torch.compile")
 
     if parallel_dims.fsdp_enabled or parallel_dims.dp_replicate_enabled:

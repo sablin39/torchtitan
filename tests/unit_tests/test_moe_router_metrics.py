@@ -36,11 +36,19 @@ class TestTokenChoiceTopKRouterMetrics(unittest.TestCase):
             ]
         )
 
-        _, _, num_tokens_per_expert = router(x)
-
-        torch.testing.assert_close(
-            num_tokens_per_expert, torch.tensor([2.0, 3.0, 2.0, 1.0])
+        _, topk_expert_ids, scores = router(x)
+        routing_map = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+            -1,
+            topk_expert_ids,
+            True,
         )
+        num_tokens_per_expert = routing_map.sum(dim=0)
+        router._record_router_metrics(
+            scores=scores,
+            num_tokens_per_expert=num_tokens_per_expert,
+        )
+
+        torch.testing.assert_close(num_tokens_per_expert, torch.tensor([2, 3, 2, 1]))
         metrics = router.consume_router_metrics()
 
         self.assertIn("token_entropy", metrics)
@@ -127,6 +135,9 @@ class TestTokenChoiceTopKRouterMetrics(unittest.TestCase):
                 self.llm.layers = nn.ModuleDict({"1": FakeBlock()})
 
         class FakeParallelDims:
+            ep_enabled = False
+            tp = 1
+
             def get_optional_mesh(self, name):
                 del name
                 return None

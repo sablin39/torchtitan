@@ -40,6 +40,18 @@ class TestFindVisionSpans(unittest.TestCase):
         num_tokens = torch.tensor([], dtype=torch.long)
         self.assertEqual(_find_vision_spans(tokens, num_tokens, vision_token_id=9), [])
 
+    def test_rejects_placeholder_count_mismatch(self):
+        tokens = torch.tensor([[0, 9, 9, 0]])
+        num_tokens = torch.tensor([2, 1])
+        with self.assertRaisesRegex(ValueError, "1 contiguous run"):
+            _find_vision_spans(tokens, num_tokens, vision_token_id=9)
+
+    def test_rejects_placeholder_length_mismatch(self):
+        tokens = torch.tensor([[0, 9, 9, 0]])
+        num_tokens = torch.tensor([1])
+        with self.assertRaisesRegex(ValueError, "spans 2 token"):
+            _find_vision_spans(tokens, num_tokens, vision_token_id=9)
+
 
 class TestApplyVisionSlicesPadded(unittest.TestCase):
     def _padded_features(

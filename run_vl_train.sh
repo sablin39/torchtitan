@@ -156,7 +156,7 @@ packing_buffer_size="64"
 vision_encoder_lr="0"
 proj_lr="1e-4"
 llm_lr="1e-5"
-# --optimizer.lr has no separate knob: it is only the scaling base for the
+# The default optimizer group LR has no separate knob: it is only the base for the
 # per-root param groups (effective LR = base * root_lr / base == root_lr), so
 # any positive value works. Derive it as the largest root LR so it stays
 # positive whenever at least one root is trainable.
@@ -220,12 +220,8 @@ max_pixels="3145728"
 # across all images in one chat example; set a positive image cap only as an
 # emergency batch-memory guard.
 max_images_per_batch="0"
-# Flat ViT patch bucketing stabilizes FlexAttention sequence shapes for image
-# patch streams. 0 disables bucketing and preserves the exact old data path.
-# Useful benchmark sweep values: 0, 16384, 32768, 65536.
-# For a bucket sweep, edit vit_patch_bucket_size and keep
-# torchinductor_cache_dir distinct for each cold-cache run.
-vit_patch_bucket_size="32768"
+# Qwen3.5 uses exact packed patch sequences. Nonzero padding is unsupported.
+vit_patch_bucket_size="0"
 
 # --- Logging and debugging -------------------------------------------------------------
 # Enable W&B + SwanLab together. SwanLab is configured as the backup mirror so
@@ -254,8 +250,8 @@ export_dtype="bfloat16"
 image_processor=""
 max_position_embeddings=""
 max_shard_size="1000GB"
-# Keep Inductor caches separate across bucket-size sweeps when benchmarking
-# cold compile/autotune behavior. Leave empty to let PyTorch choose the cache.
+# Keep Inductor caches separate across parallelism and batch configurations.
+# Leave empty to let PyTorch choose the cache.
 torchinductor_cache_dir="/tmp/tt_vit_bucket_${vit_patch_bucket_size}_cp${context_parallel_degree}_bs${batch_size}"
 
 # Derived run identity (not config knobs).
@@ -372,8 +368,8 @@ if ! [[ "${packing_buffer_size}" =~ ^[0-9]+$ ]]; then
     echo "packing_buffer_size must be a non-negative integer, got: ${packing_buffer_size}" >&2
     exit 2
 fi
-if ! [[ "${vit_patch_bucket_size}" =~ ^[0-9]+$ ]]; then
-    echo "vit_patch_bucket_size must be a non-negative integer, got: ${vit_patch_bucket_size}" >&2
+if [[ "${vit_patch_bucket_size}" != "0" ]]; then
+    echo "vit_patch_bucket_size must be 0 for exact Qwen3.5 packed inputs, got: ${vit_patch_bucket_size}" >&2
     exit 2
 fi
 
@@ -498,6 +494,8 @@ batch_parallel_degree=$((ngpu / context_parallel_degree))
 # excluded since it shards the sequence, not the batch). Derive global_batch_size
 # here so the user-facing knob is the human-friendly step count, not a raw total.
 global_batch_size=$((batch_size * batch_parallel_degree * gradient_accumulation_steps))
+num_tokens_per_microbatch=$((batch_size * seq_len))
+num_tokens_per_train_step=$((global_batch_size * seq_len))
 
 # model_flavor is implied by train_config: each training config is bound to
 # exactly one flavor in torchtitan/models/rwkv_vl/config_registry.py. The
@@ -605,8 +603,8 @@ echo "  DP shard:      ${data_parallel_shard_degree} (effective ${effective_data
 echo "  Batch groups:  ${batch_parallel_degree}"
 echo "  Grad accum:    ${gradient_accumulation_steps} step(s)/update"
 echo "  Global batch:  ${global_batch_size} (local ${batch_size} x ${batch_parallel_degree} x ${gradient_accumulation_steps})"
-echo "Bucketing:"
-echo "  ViT patches:   ${vit_patch_bucket_size} (0 disables)"
+echo "Vision input:"
+echo "  Packed patches: exact (no padding)"
 echo "  Inductor dir:  ${torchinductor_cache_dir:-<torch default>}"
 echo "  TORCH_LOGS:    ${torch_logs:-<unset>}"
 echo "Datasets:"
@@ -715,12 +713,9 @@ train_args=(
     --hf-assets-path "${hf_dir}"
     --dump-folder "${train_dump_dir}"
     --metrics.log-freq "${log_freq}"
-    --dataloader.dataset-path "${dataset_path}"
-    --dataloader.split "${split}"
-    --dataloader.text-sample-probability "${text_sample_probability}"
-    --optimizer.name "${optimizer_name}"
-    --optimizer.lr "${optimizer_base_lr}"
-    --optimizer.weight-decay "${weight_decay}"
+    --optimizer.param-groups.0.optimizer-name "${optimizer_name}"
+    --optimizer.param-groups.0.optimizer-kwargs.lr "${optimizer_base_lr}"
+    --optimizer.param-groups.0.optimizer-kwargs.weight-decay "${weight_decay}"
     --module-lrs.vision-encoder "${vision_encoder_lr}"
     --module-lrs.proj "${proj_lr}"
     --module-lrs.llm "${llm_lr}"
@@ -728,32 +723,36 @@ train_args=(
     --lr-scheduler.warmup-steps "${lr_warmup_steps}"
     --lr-scheduler.decay-type "${lr_decay_type}"
     --lr-scheduler.min-lr-factor "${lr_min_factor}"
-    --training.seq-len "${seq_len}"
+    --training.max-context-length "${seq_len}"
+    --training.num-tokens-per-microbatch-per-dp-rank "${num_tokens_per_microbatch}"
+    --training.num-tokens-per-train-step "${num_tokens_per_train_step}"
     --training.steps "${training_steps}"
-    --training.local-batch-size "${batch_size}"
-    --training.global-batch-size "${global_batch_size}"
-    --dataloader.packing-buffer-size "${packing_buffer_size}"
-    --dataloader.vit-patch-bucket-size "${vit_patch_bucket_size}"
-    --dataloader.num-workers "${dataloader_num_workers}"
-    --dataloader.prefetch-factor "${dataloader_prefetch_factor}"
-    --dataloader.pixel-values-dtype "${dataloader_pixel_values_dtype}"
-    --activation-checkpoint.mode "${activation_checkpoint_mode}"
     --checkpoint.enable
     --checkpoint.initial-load-path "${initial_load_dcp}"
     --checkpoint.interval "${checkpoint_interval}"
     --checkpoint.keep-latest-k "${checkpoint_keep_latest_k}"
     --checkpoint.export-dtype "${export_dtype}"
 )
+dataloader_args=(
+    --dataloader.dataset-path "${dataset_path}"
+    --dataloader.split "${split}"
+    --dataloader.text-sample-probability "${text_sample_probability}"
+    --dataloader.packing-buffer-size "${packing_buffer_size}"
+    --dataloader.vit-patch-bucket-size "${vit_patch_bucket_size}"
+    --dataloader.num-workers "${dataloader_num_workers}"
+    --dataloader.prefetch-factor "${dataloader_prefetch_factor}"
+    --dataloader.pixel-values-dtype "${dataloader_pixel_values_dtype}"
+)
 
 if [[ -n "${text_dataset_path}" ]]; then
-    train_args+=(--dataloader.text-dataset-path "${text_dataset_path}")
-    train_args+=(--dataloader.text-split "${text_split}")
+    dataloader_args+=(--dataloader.text-dataset-path "${text_dataset_path}")
+    dataloader_args+=(--dataloader.text-split "${text_split}")
 fi
 if [[ -n "${project_seed}" ]]; then
     train_args+=(--debug.seed "${project_seed}")
 fi
 if [[ "${run_until_epoch}" == "1" ]]; then
-    train_args+=(--dataloader.no-infinite)
+    dataloader_args+=(--dataloader.no-infinite)
 fi
 if [[ -n "${lr_total_steps}" ]]; then
     train_args+=(--lr-scheduler.total-steps "${lr_total_steps}")
@@ -791,25 +790,30 @@ if [[ "${nvml_metrics}" == "1" ]]; then
     train_args+=(--metrics.enable-nvml-metrics)
 fi
 if [[ -n "${min_pixels}" ]]; then
-    train_args+=(--dataloader.min-pixels "${min_pixels}")
+    dataloader_args+=(--dataloader.min-pixels "${min_pixels}")
 fi
 if [[ -n "${max_pixels}" ]]; then
-    train_args+=(--dataloader.max-pixels "${max_pixels}")
+    dataloader_args+=(--dataloader.max-pixels "${max_pixels}")
 fi
 if [[ -n "${max_images_per_batch}" ]]; then
-    train_args+=(--dataloader.max-images-per-batch "${max_images_per_batch}")
+    dataloader_args+=(--dataloader.max-images-per-batch "${max_images_per_batch}")
 fi
 if [[ "${dataloader_persistent_workers}" == "1" ]]; then
-    train_args+=(--dataloader.persistent-workers)
+    dataloader_args+=(--dataloader.persistent-workers)
 else
-    train_args+=(--dataloader.no-persistent-workers)
+    dataloader_args+=(--dataloader.no-persistent-workers)
 fi
 if [[ "${dataloader_pin_memory}" == "1" ]]; then
-    train_args+=(--dataloader.pin-memory)
+    dataloader_args+=(--dataloader.pin-memory)
 else
-    train_args+=(--dataloader.no-pin-memory)
+    dataloader_args+=(--dataloader.no-pin-memory)
 fi
 train_args+=("${train_extra_args[@]}")
+train_args+=(
+    "dataloader:config"
+    "${dataloader_args[@]}"
+    "activation-checkpoint:${activation_checkpoint_mode}"
+)
 
 echo
 echo "==> Step 3/4: Training"

@@ -10,8 +10,14 @@ from functools import partial
 import torch.nn as nn
 
 from torchtitan.components.quantization import QuantizationConverter
-from torchtitan.models.common import Linear
-from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
+from torchtitan.models.common import Linear, ScaledBiasRowwiseLinear
+from torchtitan.models.common.nn_modules import LayerNorm
+from torchtitan.models.common.vision_encoder import (
+    VisionAttention,
+    VisionMLP,
+    VisionTransformerBlock,
+)
+from torchtitan.models.qwen3_5.vision_encoder import PatchMerger, VisionRotaryEmbedding
 from torchtitan.models.rwkv7 import rwkv7_backbones
 from torchtitan.models.rwkv7.model import RWKV7Backbone
 from torchtitan.models.rwkv7.tokenizer import (
@@ -24,6 +30,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .model import RWKV7VLForConditionalGeneration, VisualAdapter
 from .parallelize import parallelize_rwkv_vl
 from .state_dict_adapter import RWKVVLStateDictAdapter
+from .vision_encoder import RWKVVisionEncoder
 
 __all__ = [
     "RWKV7VLForConditionalGeneration",
@@ -47,8 +54,14 @@ _LINEAR_INIT = {
 _POS_EMBED_INIT = {"pos_embed": partial(nn.init.trunc_normal_, mean=0.0, std=0.02)}
 
 
-def _vl_linear(in_features: int, out_features: int) -> Linear.Config:
-    return Linear.Config(
+def _vl_linear(
+    in_features: int,
+    out_features: int,
+    *,
+    rowwise: bool = False,
+) -> Linear.Config:
+    linear = ScaledBiasRowwiseLinear if rowwise else Linear
+    return linear.Config(
         in_features=in_features,
         out_features=out_features,
         bias=True,
@@ -69,27 +82,65 @@ def _vl_vision_encoder_config(
     num_position_embeddings: int,
     deepstack_visual_indices: list[int],
     in_channels: int = 3,
-) -> Qwen3VLVisionEncoder.Config:
+) -> RWKVVisionEncoder.Config:
     patch_dim = in_channels * temporal_patch_size * patch_size * patch_size
     merged_hidden_size = dim * (spatial_merge_size**2)
-    return Qwen3VLVisionEncoder.Config(
+    head_dim = dim // n_heads
+    norm = LayerNorm.Config(normalized_shape=dim, eps=1e-6)
+    merger = PatchMerger.Config(
+        spatial_merge_size=spatial_merge_size,
+        merged_hidden_size=merged_hidden_size,
+        norm=norm,
+        fc1=_vl_linear(merged_hidden_size, merged_hidden_size),
+        fc2=_vl_linear(merged_hidden_size, out_hidden_size, rowwise=True),
+    )
+    return RWKVVisionEncoder.Config(
         dim=dim,
-        ffn_dim=ffn_dim,
-        n_layers=n_layers,
-        n_heads=n_heads,
+        num_layers=n_layers,
+        num_heads=n_heads,
         patch_size=patch_size,
         temporal_patch_size=temporal_patch_size,
+        in_channels=in_channels,
         spatial_merge_size=spatial_merge_size,
-        out_hidden_size=out_hidden_size,
         num_position_embeddings=num_position_embeddings,
         deepstack_visual_indices=deepstack_visual_indices,
         patch_embed_proj=_vl_linear(patch_dim, dim),
-        attn_qkv=_vl_linear(dim, dim * 3),
-        attn_proj=_vl_linear(dim, dim),
-        mlp_fc1=_vl_linear(dim, ffn_dim),
-        mlp_fc2=_vl_linear(ffn_dim, dim),
-        merger_fc1=_vl_linear(merged_hidden_size, merged_hidden_size),
-        merger_fc2=_vl_linear(merged_hidden_size, out_hidden_size),
+        block=VisionTransformerBlock.Config(
+            norm1=norm,
+            norm2=norm,
+            attn=VisionAttention.Config(
+                dim=dim,
+                num_heads=n_heads,
+                wq=_vl_linear(dim, dim),
+                wk=_vl_linear(dim, dim),
+                wv=_vl_linear(dim, dim),
+                proj=_vl_linear(dim, dim, rowwise=True),
+            ),
+            mlp=VisionMLP.Config(
+                fc1=_vl_linear(dim, ffn_dim),
+                fc2=_vl_linear(ffn_dim, dim, rowwise=True),
+            ),
+        ),
+        rotary_pos_emb=VisionRotaryEmbedding.Config(dim=head_dim // 2),
+        merger=merger,
+        deepstack_merger=(
+            PatchMerger.Config(
+                spatial_merge_size=spatial_merge_size,
+                merged_hidden_size=merged_hidden_size,
+                norm=LayerNorm.Config(
+                    normalized_shape=merged_hidden_size,
+                    eps=1e-6,
+                ),
+                fc1=_vl_linear(merged_hidden_size, merged_hidden_size),
+                fc2=_vl_linear(
+                    merged_hidden_size,
+                    out_hidden_size,
+                    rowwise=True,
+                ),
+            )
+            if deepstack_visual_indices
+            else None
+        ),
         param_init=_POS_EMBED_INIT,
     )
 
@@ -140,7 +191,7 @@ def _debugmodel() -> RWKV7VLForConditionalGeneration.Config:
     )
 
 
-def _qwen3vit_v100m_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
+def _qwen3vit_v100m_vision_encoder_config() -> RWKVVisionEncoder.Config:
     return _vl_vision_encoder_config(
         dim=768,
         ffn_dim=3072,
@@ -155,7 +206,7 @@ def _qwen3vit_v100m_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
     )
 
 
-def _qwen3vit_v400m_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
+def _qwen3vit_v400m_vision_encoder_config() -> RWKVVisionEncoder.Config:
     return _vl_vision_encoder_config(
         dim=1024,
         ffn_dim=4096,
@@ -173,7 +224,7 @@ def _qwen3vit_v400m_vision_encoder_config() -> Qwen3VLVisionEncoder.Config:
 def _rwkv_vl_config(
     *,
     backbone: RWKV7Backbone.Config,
-    vision_encoder: Qwen3VLVisionEncoder.Config,
+    vision_encoder: RWKVVisionEncoder.Config,
 ) -> RWKV7VLForConditionalGeneration.Config:
     hidden_size = backbone.hidden_size
     vocab_size = backbone.vocab_size
@@ -183,7 +234,7 @@ def _rwkv_vl_config(
         llm=backbone,
         vision_encoder=vision_encoder,
         proj=VisualAdapter.Config(
-            encoder_dim=vision_encoder.out_hidden_size,
+            encoder_dim=vision_encoder.merger.fc2.out_features,
             hidden_dim=None,
             project_dim=hidden_size,
             num_deepstack=len(vision_encoder.deepstack_visual_indices),
@@ -198,7 +249,7 @@ def _rwkv_vl_config(
 
 def _vl_config(
     llm_flavor: str,
-    vision_encoder_factory: Callable[[], Qwen3VLVisionEncoder.Config],
+    vision_encoder_factory: Callable[[], RWKVVisionEncoder.Config],
 ) -> Callable[[], RWKV7VLForConditionalGeneration.Config]:
     return lambda: _rwkv_vl_config(
         backbone=rwkv7_backbones[llm_flavor](),

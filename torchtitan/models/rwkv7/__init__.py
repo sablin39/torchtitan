@@ -215,13 +215,7 @@ def model_registry(
     flavor: str,
     quantization: list[QuantizationConverter.Config] | None = None,
 ) -> ModelSpec:
-    """Build a ``ModelSpec`` for a registered RWKV7 flavor.
-
-    The model's ``vocab_size`` defaults to 65536 (RWKV-World) but is snapped
-    to the paired tokenizer at trainer-build time via the
-    ``update_from_config(tokenizer=...)`` hook, so registering a flavor
-    here does not commit to a tokenizer.
-    """
+    """Build a ``ModelSpec`` for a registered RWKV7 flavor."""
     config = rwkv7_configs[flavor]()
     if quantization is not None:
         for q in quantization:

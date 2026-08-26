@@ -4,21 +4,22 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedCELoss
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.config import (
-    ActivationCheckpointConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
+from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
+from torchtitan.components.tokenizer import HuggingFaceTokenizer, MultiModalTokenizer
+from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.multimodal.mm_chat_datasets import MMChatDataLoader
-from torchtitan.hf_datasets.multimodal.mm_datasets import MMDataLoader
+from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
+from torchtitan.hf_datasets.multimodal.mm_datasets import (
+    MM_DATASETS,
+    MultiModalProcessor,
+)
 from torchtitan.models.rwkv7.tokenizer import (
     DEFAULT_IMAGE_TOKEN,
     DEFAULT_PAD_TOKEN,
@@ -42,7 +43,8 @@ _DEBUG_SPECIAL_TOKENS = {
 @dataclass(kw_only=True, slots=True)
 class RWKVVLModuleLRs:
     """
-    Per-root RWKV-VL learning rates. ``None`` means use ``optimizer.lr``.
+    Per-root RWKV-VL learning rates. ``None`` uses the default optimizer
+    parameter group's learning rate.
     A value of 0 freezes that root and excludes it from FSDP sharding.
     ``lm_head`` is not configurable; it always follows the resolved ``llm`` LR.
     """
@@ -101,10 +103,13 @@ class RWKVVLTrainerConfig(Trainer.Config):
     largest expected per-batch vision token count."""
 
 
-def _rwkv_vl_dataloader(dataset: str, **kwargs) -> MMDataLoader.Config:
-    return MMDataLoader.Config(
-        dataset=dataset,
-        max_images_per_batch=0,
+def _rwkv_vl_dataloader(dataset: str, **kwargs) -> GrainDataLoader.Config:
+    dataset_config: SingleDatasetConfig = MM_DATASETS[dataset]
+    processor = dataset_config.processor
+    if not isinstance(processor, MultiModalProcessor.Config):
+        raise ValueError(f"Multimodal dataset {dataset!r} has no multimodal processor")
+    processor = replace(
+        processor,
         patch_size=16,
         temporal_patch_size=2,
         spatial_merge_size=2,
@@ -113,6 +118,17 @@ def _rwkv_vl_dataloader(dataset: str, **kwargs) -> MMDataLoader.Config:
         image_mean=(0.5, 0.5, 0.5),
         image_std=(0.5, 0.5, 0.5),
         **kwargs,
+    )
+    dataset_config = replace(dataset_config, processor=processor)
+    return GrainDataLoader.Config(
+        dataset=dataset_config,
+        collator=MultiModalCollator.Config(
+            max_images_per_batch=128,
+            patch_size=processor.patch_size,
+            temporal_patch_size=processor.temporal_patch_size,
+            spatial_merge_size=processor.spatial_merge_size,
+        ),
+        streaming_shuffle_buffer_size=128,
     )
 
 
@@ -132,16 +148,18 @@ def _rwkv_vl_chat_dataloader(**kwargs) -> MMChatDataLoader.Config:
 
 def rwkv_vl_debugmodel() -> Trainer.Config:
     return RWKVVLTrainerConfig(
-        loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(l2_wrap_factor=1e-4)
+        ),
         hf_assets_path="./tests/assets/tokenizer",
-        tokenizer=HuggingFaceTokenizer.Config(**_DEBUG_SPECIAL_TOKENS),
+        tokenizer=MultiModalTokenizer.Config(**_DEBUG_SPECIAL_TOKENS),
         model_spec=model_registry("debugmodel"),
         dataloader=_rwkv_vl_dataloader("cc12m-test"),
-        optimizer=OptimizersContainer.Config(lr=8e-4),
+        optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
         training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=512,
+            num_tokens_per_microbatch_per_dp_rank=512,
+            max_context_length=512,
             steps=10,
             dtype="bfloat16",
             mixed_precision_param="bfloat16",
@@ -149,13 +167,15 @@ def rwkv_vl_debugmodel() -> Trainer.Config:
         metrics=MetricsProcessor.Config(log_freq=1),
         parallelism=ParallelismConfig(context_parallel_load_balancer=None),
         checkpoint=CheckpointManager.Config(interval=10, last_save_model_only=False),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        activation_checkpoint=SelectiveAC.Config(),
     )
 
 
 def rwkv_vl_debugmodel_chat() -> Trainer.Config:
     return RWKVVLTrainerConfig(
-        loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(l2_wrap_factor=1e-4)
+        ),
         hf_assets_path="./tests/assets/tokenizer",
         tokenizer=HuggingFaceTokenizer.Config(
             trust_remote_code=True,
@@ -164,11 +184,11 @@ def rwkv_vl_debugmodel_chat() -> Trainer.Config:
         ),
         model_spec=model_registry("debugmodel"),
         dataloader=_rwkv_vl_chat_dataloader(dataset_path="./tests/assets/cc12m_test"),
-        optimizer=OptimizersContainer.Config(lr=8e-4),
+        optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
         training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=512,
+            num_tokens_per_microbatch_per_dp_rank=512,
+            max_context_length=512,
             steps=10,
             dtype="bfloat16",
             mixed_precision_param="bfloat16",
@@ -176,13 +196,15 @@ def rwkv_vl_debugmodel_chat() -> Trainer.Config:
         metrics=MetricsProcessor.Config(log_freq=1),
         parallelism=ParallelismConfig(context_parallel_load_balancer=None),
         checkpoint=CheckpointManager.Config(interval=10, last_save_model_only=False),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        activation_checkpoint=SelectiveAC.Config(),
     )
 
 
 def _rwkv_vl_chat_config(model_flavor: str) -> Trainer.Config:
     return RWKVVLTrainerConfig(
-        loss=ChunkedCELoss.Config(l2_wrap_factor=1e-4),
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(l2_wrap_factor=1e-4)
+        ),
         hf_assets_path="./tests/assets/tokenizer",
         tokenizer=HuggingFaceTokenizer.Config(
             trust_remote_code=True,
@@ -191,11 +213,11 @@ def _rwkv_vl_chat_config(model_flavor: str) -> Trainer.Config:
         ),
         model_spec=model_registry(model_flavor),
         dataloader=_rwkv_vl_chat_dataloader(dataset_path="./tests/assets/cc12m_test"),
-        optimizer=OptimizersContainer.Config(lr=8e-4),
+        optimizer=default_adamw(lr=8e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
         training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=512,
+            num_tokens_per_microbatch_per_dp_rank=512,
+            max_context_length=512,
             steps=10,
             dtype="bfloat16",
             mixed_precision_param="bfloat16",
@@ -203,7 +225,7 @@ def _rwkv_vl_chat_config(model_flavor: str) -> Trainer.Config:
         metrics=MetricsProcessor.Config(log_freq=1),
         parallelism=ParallelismConfig(context_parallel_load_balancer=None),
         checkpoint=CheckpointManager.Config(interval=10, last_save_model_only=True),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        activation_checkpoint=SelectiveAC.Config(),
     )
 
 

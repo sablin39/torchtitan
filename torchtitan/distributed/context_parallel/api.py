@@ -1,0 +1,386 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from typing import Any, cast, TYPE_CHECKING
+
+import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor.experimental._attention import (
+    _context_parallel_shard,
+    _HeadTailLoadBalancer,
+    _PTRRLoadBalancer,
+)
+from torch.nn.attention.flex_attention import BlockMask
+
+from torchtitan.models.common.attention import AttentionMasksType
+
+if TYPE_CHECKING:
+    from torchtitan.config import ParallelismConfig
+
+
+def validate_cp_backend(parallelism: "ParallelismConfig") -> None:
+    """Validate CP backend compatibility for ShardingConfig-based models."""
+    if (
+        parallelism.context_parallel_degree > 1
+        and parallelism.spmd_backend != "spmd_types"
+    ):
+        raise ValueError(
+            "Context Parallel requires parallelism.spmd_backend='spmd_types', "
+            f"got '{parallelism.spmd_backend}'."
+        )
+
+
+def prepare_context_parallel_input(
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    extra_kwargs: dict[str, Any],
+    cp_mesh: DeviceMesh,
+    device: torch.device,
+    load_balancer_type: str | None = "headtail",
+    ptrr_mask_key: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """
+    Shard inputs, labels, positions, and attention masks for Context Parallel.
+
+    The caller must provide ``extra_kwargs["positions"]`` before calling this
+    function.  Position resolution (per-document vs sequential) is handled
+    upstream in ``post_dataloading_process``.
+
+    Args:
+        inputs: Input tensor of shape [num_tokens]
+        labels: Label tensor of shape [num_tokens]
+        extra_kwargs: Dictionary containing 'positions' (required) and
+            optionally 'attention_masks' to be sharded.
+        cp_mesh: Device mesh for context parallel dimension
+        device: Device for the tensors
+        load_balancer_type: Type of load balancer to use for sharding.
+            Options: "headtail", "ptrr", or None. Defaults to "headtail".
+        ptrr_mask_key: When ``load_balancer_type`` is "ptrr" and the attention
+            masks are a dict[str, BlockMask], selects which mask the
+            PTRRLoadBalancer is built from. Ignored otherwise.
+
+    Returns:
+        Tuple of (sharded_inputs, sharded_labels, updated_extra_kwargs) where:
+            - sharded_inputs: Inputs sharded along sequence dimension
+            - sharded_labels: Labels sharded along sequence dimension
+            - updated_extra_kwargs: Dict with sharded 'positions' and optionally
+              sharded 'attention_masks'
+    """
+    attention_masks = extra_kwargs.get("attention_masks", None)
+    positions = extra_kwargs["positions"]
+    input_token_mask = extra_kwargs.pop("input_token_mask", None)
+    shard_inputs = (inputs, labels, positions)
+    if input_token_mask is not None:
+        shard_inputs = (*shard_inputs, input_token_mask)
+    sharded_inputs, attention_masks = cp_shard(
+        cp_mesh,
+        shard_inputs,
+        attention_masks,
+        load_balancer_type,
+        ptrr_mask_key=ptrr_mask_key,
+    )
+    inputs, labels, positions = sharded_inputs[:3]
+    extra_kwargs["positions"] = positions
+    if input_token_mask is not None:
+        extra_kwargs["input_token_mask"] = sharded_inputs[3]
+    if attention_masks is not None:
+        extra_kwargs["attention_masks"] = attention_masks
+
+    return inputs, labels, extra_kwargs
+
+
+def _build_flattened_cu_seqlens(
+    *,
+    batch_size: int,
+    seq_len: int,
+    positions: torch.Tensor | None,
+    device: torch.device,
+) -> torch.Tensor:
+    if positions is None:
+        return torch.arange(
+            0,
+            (batch_size + 1) * seq_len,
+            seq_len,
+            dtype=torch.long,
+            device=device,
+        )
+
+    if positions.shape != (batch_size, seq_len):
+        raise ValueError(
+            f"RWKV/FLA CP expected positions shape {(batch_size, seq_len)}, "
+            f"got {tuple(positions.shape)}"
+        )
+
+    starts: list[int] = [0]
+    positions_cpu = positions.detach().to("cpu")
+    for batch_idx in range(batch_size):
+        row = positions_cpu[batch_idx]
+        row_offset = batch_idx * seq_len
+        if batch_idx > 0:
+            starts.append(row_offset)
+        nonzero_positions = torch.nonzero(row, as_tuple=False).flatten()
+        if nonzero_positions.numel() == 0:
+            continue
+        padding_start = int(nonzero_positions[-1].item()) + 1
+        for idx in range(1, seq_len):
+            if row[idx] > row[idx - 1]:
+                continue
+            starts.append(row_offset + idx)
+            # Collators pad positions with zeros; represent the whole padding
+            # tail as one ignored sequence instead of many one-token sequences.
+            if idx >= padding_start:
+                break
+    starts.append(batch_size * seq_len)
+    starts = sorted(set(int(x) for x in starts))
+    return torch.tensor(starts, dtype=torch.long, device=device)
+
+
+def prepare_fla_context_parallel_input(
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    extra_kwargs: dict[str, Any],
+    cp_mesh: DeviceMesh,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Prepare contiguous sequence shards for FLA linear-attention CP.
+
+    FLA CP expects a single flattened token stream shaped ``[1, total_tokens]``.
+    The global cumulative sequence lengths are built before partitioning and are
+    kept replicated so the model can call ``fla.ops.cp.build_cp_context``.
+    """
+    positions = extra_kwargs.pop("positions", None)
+    batch_size, seq_len = inputs.shape
+    total_tokens = batch_size * seq_len
+    cp_world_size = cp_mesh.size(0)
+    if total_tokens % cp_world_size != 0:
+        raise ValueError(
+            f"FLA CP requires total flattened tokens ({total_tokens}) to be "
+            f"divisible by CP degree ({cp_world_size})"
+        )
+
+    cu_seqlens_global = _build_flattened_cu_seqlens(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        positions=positions,
+        device=device,
+    )
+    extra_kwargs["cu_seqlens_global"] = cu_seqlens_global
+    extra_kwargs["cu_seqlens_global_cpu"] = cu_seqlens_global.detach().to("cpu")
+
+    # Optional v1 helper for multimodal models: keep a replicated copy so local
+    # CP shards can map image placeholder spans back to global vision item order.
+    if extra_kwargs.get("fla_cp_keep_global_input_ids", False):
+        extra_kwargs["fla_cp_global_input_ids"] = inputs.reshape(1, total_tokens)
+    extra_kwargs.pop("fla_cp_keep_global_input_ids", None)
+
+    rank = dist.get_rank(cp_mesh.get_group())
+    part_len = total_tokens // cp_world_size
+    extra_kwargs["fla_cp_global_start"] = torch.tensor(
+        rank * part_len,
+        dtype=torch.long,
+        device=device,
+    )
+
+    input_token_mask = extra_kwargs.pop("input_token_mask", None)
+    flat_inputs = inputs.reshape(1, total_tokens)
+    flat_labels = labels.reshape(1, total_tokens)
+    shard_inputs = (flat_inputs, flat_labels)
+    if input_token_mask is not None:
+        flat_input_token_mask = input_token_mask.reshape(1, total_tokens)
+        shard_inputs = (*shard_inputs, flat_input_token_mask)
+    sharded_inputs, _ = cp_shard(
+        cp_mesh,
+        shard_inputs,
+        attention_masks=None,
+        load_balancer_type=None,
+        input_seq_dim=1,
+    )
+    flat_inputs, flat_labels = sharded_inputs[:2]
+    if input_token_mask is not None:
+        extra_kwargs["input_token_mask"] = sharded_inputs[2]
+    return flat_inputs, flat_labels, extra_kwargs
+
+
+def prepare_fla_varlen_input(
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    extra_kwargs: dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Prepare unsharded FLA variable-length input.
+
+    RWKV/FLA models can train without CP on normal ``[B, S]`` tensors, but
+    packed samples need document boundaries passed to ``token_shift`` and the
+    DPLR recurrent kernel.  FLA represents those boundaries with
+    ``cu_seqlens`` and expects the token stream to be flattened to
+    ``[1, B * S]`` for varlen mode.
+    """
+    positions = extra_kwargs.pop("positions", None)
+    batch_size, seq_len = inputs.shape
+    total_tokens = batch_size * seq_len
+
+    cu_seqlens_global = _build_flattened_cu_seqlens(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        positions=positions,
+        device=device,
+    )
+    extra_kwargs["cu_seqlens_global"] = cu_seqlens_global
+    extra_kwargs["cu_seqlens_global_cpu"] = cu_seqlens_global.detach().to("cpu")
+
+    input_token_mask = extra_kwargs.pop("input_token_mask", None)
+    if input_token_mask is not None:
+        extra_kwargs["input_token_mask"] = input_token_mask.reshape(1, total_tokens)
+
+    return (
+        inputs.reshape(1, total_tokens),
+        labels.reshape(1, total_tokens),
+        extra_kwargs,
+    )
+
+
+def cp_shard(
+    cp_mesh: DeviceMesh,
+    inputs: tuple[torch.Tensor, ...],
+    attention_masks: AttentionMasksType | None,
+    load_balancer_type: str | None = "headtail",
+    input_seq_dim: int = 0,
+    ptrr_mask_key: str | None = None,
+) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | None]:
+    """
+    Shard inputs and attention masks across the context parallel mesh.
+
+    This function distributes input tensors across devices in the CP mesh
+    along the sequence dimension, enabling efficient processing. It optionally
+    uses a load balancer to handle uneven computation workload.
+
+    Args:
+        cp_mesh: Device mesh for context parallel dimension
+        inputs: Tuple of input tensors to be sharded along the sequence
+            dimension
+        attention_masks: Attention masks to be sharded. Supports None,
+            BlockMask, or dict[str, BlockMask]
+        load_balancer_type: Type of load balancer to use. Options:
+            - "headtail": Use HeadTailLoadBalancer (for SDPA)
+            - "ptrr": Use PTRRLoadBalancer (for FlexAttention)
+            - None: Disable load balancing
+            Defaults to "headtail".
+        input_seq_dim: Sequence dimension index for sharding. Defaults to 0
+            for folded text tensors with shape [num_tokens]. Callers with a
+            different layout must pass the sequence dimension explicitly.
+        ptrr_mask_key: When ``load_balancer_type`` is "ptrr" and
+            ``attention_masks`` is a dict[str, BlockMask], selects which mask in
+            the dict the PTRRLoadBalancer is built from. The resulting balancer
+            is used to shard every mask in the dict as well as the inputs.
+            Required (must be a valid key) in that case; ignored otherwise.
+
+    Returns:
+        Tuple of (sharded_inputs, attention_masks) where:
+            - sharded_inputs: Tuple of input tensors sharded along the
+              sequence dimension
+            - attention_masks: Sharded attention masks (BlockMask or
+              dict[str, BlockMask]) or None
+
+    Raises:
+        ValueError: If load_balancer_type is "ptrr" and attention_masks
+            is None, or is a dict and ``ptrr_mask_key`` is not a valid key
+    """
+    seq_len = inputs[0].size(input_seq_dim)
+    cp_world_size = cp_mesh.size(0)
+
+    load_balancer = None
+    if load_balancer_type:
+        match load_balancer_type:
+            case "headtail":
+                # For SDPA, we use the _HeadTailLoadBalancer.
+                load_balancer = _HeadTailLoadBalancer(
+                    seq_len, cp_world_size, cp_mesh.device_type
+                )
+            case "ptrr":
+                # For FlexAttention, we use _PTRRLoadBalancer.
+                # _PTRRLoadBalancer is built from a single BlockMask. When the
+                # attention masks are a dict[str, BlockMask], the caller must
+                # specify which mask to build the balancer from via
+                # ``ptrr_mask_key``; the resulting balancer is then used to
+                # shard every mask in the dict as well as the inputs.
+                if attention_masks is None:
+                    raise ValueError(
+                        "PTRRLoadBalancer requires attention_masks to be a "
+                        "BlockMask or dict[str, BlockMask], but got None"
+                    )
+                if isinstance(attention_masks, dict):
+                    if ptrr_mask_key is None:
+                        raise ValueError(
+                            "PTRRLoadBalancer received a dict[str, BlockMask] "
+                            "but no mask key was specified. Set "
+                            "--parallelism.context_parallel_ptrr_mask_key to "
+                            f"one of: {sorted(attention_masks.keys())}"
+                        )
+                    if ptrr_mask_key not in attention_masks:
+                        raise ValueError(
+                            f"context_parallel_ptrr_mask_key '{ptrr_mask_key}' "
+                            f"is not a key in attention_masks. Available keys: "
+                            f"{sorted(attention_masks.keys())}"
+                        )
+                    ptrr_mask = attention_masks[ptrr_mask_key]
+                else:
+                    ptrr_mask = attention_masks
+                if not isinstance(ptrr_mask, BlockMask):
+                    raise ValueError(
+                        f"PTRRLoadBalancer requires the mask to be a "
+                        f"BlockMask, but got {type(ptrr_mask)}"
+                    )
+                load_balancer = _PTRRLoadBalancer(ptrr_mask, cp_world_size)
+            case _:
+                raise ValueError(
+                    f"Invalid load_balancer_type '{load_balancer_type}'. "
+                    f"Must be one of: 'headtail', 'ptrr', or None"
+                )
+
+    inputs = cast(
+        tuple[torch.Tensor, ...],
+        _context_parallel_shard(
+            mesh=cp_mesh,
+            buffers=inputs,
+            seq_dims=tuple(input_seq_dim for _ in inputs),
+            load_balancer=load_balancer,
+        ),
+    )
+
+    # BlockMask, has shape, [B, H, Q, KV], and we can only shard
+    # on the Q seq dimension, not KV.
+    MASK_Q_SEQ_DIM = 2
+    if attention_masks is not None:
+        assert isinstance(attention_masks, (BlockMask, dict))
+        masks: list[BlockMask] = []
+        for mask in (
+            [attention_masks]
+            if isinstance(attention_masks, BlockMask)
+            else attention_masks.values()
+        ):
+            if not isinstance(mask, BlockMask):
+                raise ValueError(
+                    "Context parallelism can only shard BlockMask attention "
+                    f"masks, got {type(mask).__name__} in the mask dict."
+                )
+            masks.append(mask)
+        sharded_masks = _context_parallel_shard(
+            mesh=cp_mesh,
+            buffers=masks,
+            seq_dims=(MASK_Q_SEQ_DIM,) * len(masks),
+            load_balancer=load_balancer,
+        )
+        attention_masks = cast(
+            (BlockMask | dict[str, BlockMask]),
+            (
+                sharded_masks[0]
+                if isinstance(attention_masks, BlockMask)
+                else {k: v for k, v in zip(attention_masks.keys(), sharded_masks)}
+            ),
+        )
+
+    return inputs, attention_masks

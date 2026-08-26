@@ -7,7 +7,7 @@
 """Bitwise deterministic guardrail for graph_trainer.
 
 Tests that Trainer (eager) and GraphTrainer (aot_fx_trace) produce bitwise
-identical losses and gradients on Llama3 and DeepSeek-v3 debug models.
+identical losses and gradients on Llama3, DeepSeek-v3, and Qwen3 debug models.
 
 Requires a CUDA GPU. Run with:
     pytest torchtitan/experiments/graph_trainer/tests/test_bitwise_deterministic.py -x
@@ -25,18 +25,34 @@ from expecttest import assert_expected_inline
 from tests.utils import hash_gradient, hash_model
 from torch.nn.attention.flex_attention import flex_attention
 
-from torchtitan.components.loss import cross_entropy_loss
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
+from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
+from torchtitan.experiments.graph_trainer.common_utils import (
+    maybe_register_blockmask_pytree_node,
+)
+from torchtitan.experiments.graph_trainer.configs import (
+    EpOverlapConfig,
+    GraphTrainerCompileConfig,
+)
 from torchtitan.experiments.graph_trainer.deepseek_v3 import (
     model_registry as dsv3_model_registry,
 )
 from torchtitan.experiments.graph_trainer.deepseek_v3.parallelize import (
     annotate_deepseekv3,
 )
+from torchtitan.experiments.graph_trainer.ep_eager_chunk import (
+    maybe_apply_ep_overlap_eager_chunking,
+)
 from torchtitan.experiments.graph_trainer.llama3 import (
     model_registry as llama3_model_registry,
 )
 from torchtitan.experiments.graph_trainer.llama3.parallelize import annotate_llama
+from torchtitan.experiments.graph_trainer.qwen3 import (
+    model_registry as qwen3_model_registry,
+)
+from torchtitan.experiments.graph_trainer.qwen3.parallelize import annotate_qwen3
 from torchtitan.experiments.graph_trainer.tests._trainer_test_utils import (
     build_minimal_trainer,
 )
@@ -49,6 +65,7 @@ SEED = 42
 NUM_STEPS = 5
 BATCH_SIZE = 4
 SEQ_LEN = 128
+NUM_TOKENS = BATCH_SIZE * SEQ_LEN
 
 
 def _set_deterministic(seed: int = SEED) -> None:
@@ -57,9 +74,27 @@ def _set_deterministic(seed: int = SEED) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
 
 
 _TOKENIZER_PATH = "./tests/assets/tokenizer"
+
+
+# ``test_eager_self_deterministic`` pins eager loss/model/grad to hardcoded
+# golden values. torchtitan builds against the torch *nightly* (not a pinned
+# release), so eager numerics drift with upstream kernel/codegen changes --
+# in practice about weekly -- which makes hardcoded goldens unmaintainable:
+# they need near-weekly re-blessing and cannot even be re-based reliably,
+# since a dev's local nightly and CI's nightly can differ. The invariant that
+# actually matters, aot_fx_trace == eager, is covered by the loss-compare /
+# precompile tests, which compare within a single run and are immune to
+# nightly drift. Skip unconditionally until torch is pinned or the goldens are
+# replaced with a tolerance-based check. See #3876.
+_EAGER_GOLDEN_SKIP_REASON = (
+    "eager golden hashes are unmaintainable against the moving torch nightly "
+    "(numerics drift ~weekly); aot_fx_trace == eager is covered by the "
+    "loss-compare tests instead. See #3876."
+)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
@@ -72,6 +107,10 @@ class BitwiseDeterministicBase(unittest.TestCase):
     model_registry: Callable
     annotate_model: Callable
     model_flavor: str
+    # The unsuffixed subclasses use SDPA (a test-only backend that exercises the
+    # backend-agnostic graph machinery — precompile serialization, codegen,
+    # determinism — without FlexAttention's unpicklable, non-tensor BlockMask).
+    # The *FlexAttn subclasses override this to "flex".
     attn_backend: str = "sdpa"
 
     def setUp(self):
@@ -95,6 +134,20 @@ class BitwiseDeterministicBase(unittest.TestCase):
             self.model_flavor, attn_backend=self.attn_backend
         )
         self.model_config = model_spec.model
+        # Match Trainer.__init__: model configs consume runtime settings before
+        # build. DSv3 uses the synced RoPE length to decide YaRN scaling.
+        runtime_config = Trainer.Config(
+            model_spec=model_spec,
+            training=TrainingConfig(
+                num_tokens_per_microbatch_per_dp_rank=NUM_TOKENS,
+                max_context_length=SEQ_LEN,
+                steps=NUM_STEPS,
+            ),
+            parallelism=ParallelismConfig(),
+            checkpoint=CheckpointManager.Config(initial_load_model_only=False),
+            debug=DebugConfig(seed=SEED, deterministic=True),
+        )
+        self.model_config.update_from_config(config=runtime_config)
         vocab_size = self.model_config.vocab_size
         with torch.device("meta"):
             model = self.model_config.build()
@@ -103,15 +156,46 @@ class BitwiseDeterministicBase(unittest.TestCase):
             model.init_states(buffer_device=None)
         model.train()
         self.model = model
-        self.inputs = torch.randint(0, vocab_size, (BATCH_SIZE, SEQ_LEN), device="cuda")
-        self.labels = torch.randint(0, vocab_size, (BATCH_SIZE, SEQ_LEN), device="cuda")
+        self.inputs = torch.randint(0, vocab_size, (NUM_TOKENS,), device="cuda")
+        self.labels = torch.randint(0, vocab_size, (NUM_TOKENS,), device="cuda")
+        self.positions = torch.arange(SEQ_LEN, device="cuda").repeat(BATCH_SIZE)
 
     def tearDown(self):
         FlexAttention.inductor_configs = self._orig_inductor_configs
         FlexAttention._compiled_flex_attn = self._orig_compiled_flex_attn
 
+    def _get_extra_kwargs(self, model: nn.Module) -> dict[str, object]:
+        """Build extra_kwargs matching what post_dataloading_process produces.
+
+        For FlexAttention models, this generates the BlockMask attention
+        masks. For SDPA models, returns an empty dict.
+        """
+        from torchtitan.models.common.attention import FlexAttention as FlexAttnModule
+        from torchtitan.models.common.decoder import Decoder
+
+        if not isinstance(self.model_config, Decoder.Config):
+            return {}
+        layer = self.model_config.layers[0]
+        inner_attention = getattr(layer.attention, "inner_attention", None)
+        if not isinstance(inner_attention, FlexAttnModule.Config):
+            return {}
+        attention_masks = model.get_attention_masks(self.positions)
+        return {"attention_masks": attention_masks}
+
     def _run_steps(
-        self, model: nn.Module, trainer_cls: type, *, enable_passes: bool = True
+        self,
+        model: nn.Module,
+        trainer_cls: type,
+        *,
+        enable_passes: bool = True,
+        compile_passes: list[str] | None = None,
+        compile_ep_overlap_enabled: bool = False,
+        compile_ep_overlap_chunk_dim: str = "batch",
+        compile_ep_overlap_module_fqn: str = "layers.*",
+        compile_ep_overlap_disable_early_grad_accumulation: bool = False,
+        compile_inductor_compilation: str = "regional",
+        compile_disable_passes: list[str] | None = None,
+        numerics_changing_optim: bool = False,
     ) -> tuple[torch.Tensor, str, str]:
         """Run forward-backward-optimizer steps using the given trainer class."""
         # Annotate after deepcopy: annotate_fn wrappers capture bound methods
@@ -122,17 +206,25 @@ class BitwiseDeterministicBase(unittest.TestCase):
             self.model_config,
             trainer_cls,
             compile_enable_passes=enable_passes,
+            compile_passes=compile_passes,
+            compile_ep_overlap_enabled=compile_ep_overlap_enabled,
+            compile_ep_overlap_chunk_dim=compile_ep_overlap_chunk_dim,
+            compile_ep_overlap_module_fqn=compile_ep_overlap_module_fqn,
+            compile_ep_overlap_disable_early_grad_accumulation=(
+                compile_ep_overlap_disable_early_grad_accumulation
+            ),
+            compile_inductor_compilation=compile_inductor_compilation,
+            compile_disable_passes=compile_disable_passes,
+            compile_numerics_changing_optim=numerics_changing_optim,
             tokenizer=HuggingFaceTokenizer(tokenizer_path=_TOKENIZER_PATH),
         )
-        global_valid_tokens = torch.tensor(
-            BATCH_SIZE * SEQ_LEN, dtype=torch.float, device="cuda"
-        )
+        global_valid_tokens = torch.tensor(NUM_TOKENS, dtype=torch.float, device="cuda")
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
         for _ in range(NUM_STEPS):
             optimizer.zero_grad()
             loss = trainer.forward_backward_step(
-                input_dict={"input": self.inputs},
+                input_dict={"input": self.inputs, "positions": self.positions},
                 labels=self.labels,
                 global_valid_tokens=global_valid_tokens,
             )
@@ -151,8 +243,8 @@ class BitwiseDeterministicBase(unittest.TestCase):
         torchrun training with --compile.precompile_artifact_dir.
         """
         from torchtitan.experiments.graph_trainer.make_fx_tracer import (
-            run_traced_train_step,
-            trace_train_step,
+            minimal_fx_tracer,
+            run_traced,
         )
         from torchtitan.experiments.graph_trainer.passes import (
             apply_graph_passes,
@@ -167,22 +259,21 @@ class BitwiseDeterministicBase(unittest.TestCase):
         from torchtitan.experiments.graph_trainer.trainer import make_fwd_bwd_step
 
         self.annotate_model(model)
-        loss_fn = cross_entropy_loss
-        fwd_bwd_fn = make_fwd_bwd_step(loss_fn)
+        loss_fn = CrossEntropyLoss.Config().build()
+        fwd_bwd_fn = make_fwd_bwd_step(model, loss_fn)
 
-        global_valid_tokens = torch.tensor(
-            BATCH_SIZE * SEQ_LEN, dtype=torch.float, device="cuda"
-        )
-        extra_inputs: dict[str, torch.Tensor] = {}
-        extra_kwargs: dict[str, torch.Tensor] = {}
+        global_valid_tokens = torch.tensor(NUM_TOKENS, dtype=torch.float, device="cuda")
+        extra_kwargs: dict[str, object] = {
+            "positions": self.positions,
+            **self._get_extra_kwargs(model),
+        }
+        maybe_register_blockmask_pytree_node()
 
         # Step 1: Trace the graph
-        traced_result = trace_train_step(fwd_bwd_fn)(
-            model,
+        traced_result = minimal_fx_tracer(fwd_bwd_fn, module=model)(
             self.inputs,
             self.labels,
             global_valid_tokens,
-            extra_inputs,
             extra_kwargs,
         )
 
@@ -191,14 +282,13 @@ class BitwiseDeterministicBase(unittest.TestCase):
         if enable_passes:
             config = SimpleNamespace(
                 model_spec=SimpleNamespace(model=self.model_config),
-                compile=SimpleNamespace(
-                    memory_policy="default",
-                    inductor_compilation="regional",
+                compile=GraphTrainerCompileConfig(
+                    enable=True,
+                    mode="aot_fx_trace",
                 ),
                 parallelism=SimpleNamespace(
                     pipeline_parallel_degree=1,
                     fsdp_reshard_after_forward="default",
-                    enable_async_tensor_parallel=False,
                 ),
             )
             passes = compile_time_passes(traced_result, config)
@@ -219,10 +309,10 @@ class BitwiseDeterministicBase(unittest.TestCase):
         if enable_passes:
             load_config = SimpleNamespace(
                 model_spec=SimpleNamespace(model=self.model_config),
-                compile=SimpleNamespace(
+                compile=GraphTrainerCompileConfig(
+                    enable=True,
+                    mode="aot_fx_trace",
                     precompile_artifact_dir="precompiled",
-                    inductor_compilation="regional",
-                    enable_cudagraph=True,
                 ),
             )
             passes = construct_default_graph_passes(loaded_result, load_config)
@@ -236,13 +326,10 @@ class BitwiseDeterministicBase(unittest.TestCase):
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         for _ in range(NUM_STEPS):
             optimizer.zero_grad()
-            outputs = run_traced_train_step(
-                loaded_result,
-                model,
+            outputs = run_traced(loaded_result, module=model)(
                 self.inputs,
                 self.labels,
                 global_valid_tokens,
-                extra_inputs,
                 extra_kwargs,
             )
             loss = outputs[0]
@@ -284,6 +371,7 @@ class TestLlama3BitwiseDeterministic(BitwiseDeterministicBase):
     model_flavor = "debugmodel"
     annotate_model = staticmethod(annotate_llama)
 
+    @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
     @unittest.skipUnless(
         has_cuda_capability(9, 0), "Numerics only match on H100 (sm_90+)"
     )
@@ -295,14 +383,14 @@ class TestLlama3BitwiseDeterministic(BitwiseDeterministicBase):
         loss, model_hash, grad_hash = self._run_steps(
             copy.deepcopy(self.model), Trainer
         )
-        assert_expected_inline(str(loss.item()), """7.961757659912109""")
+        assert_expected_inline(str(loss.item()), """7.961757183074951""")
         assert_expected_inline(
             model_hash,
-            """d8c4495bc41d103e3864433002d31be0823567938729396c44eb2f2782a47a23""",
+            """135abf5bcdaac7d1a0cbf1b8e0f2bf84ac788ce202f3ec4b23bc8b05d5ee2f1e""",
         )
         assert_expected_inline(
             grad_hash,
-            """926c46345abe29f427f072fb747375009cac66c4ab4be4b41d09661356089016""",
+            """fe39cc3a984828640c2b9a95458f76cd82046f3147d9ad960845851731ceb4ad""",
         )
 
     def test_aot_fx_trace_vs_eager(self):
@@ -314,10 +402,30 @@ class TestLlama3BitwiseDeterministic(BitwiseDeterministicBase):
 
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
+        if self.attn_backend == "flex":
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
+            # that pickle.dumps cannot serialize. The SDPA subclasses cover this
+            # path (SDPA carries no such object).
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 
         self._assert_runs_match(run_traced, run_precompile, "trace vs precompile: ")
+
+    def test_numerics_changing_optim_run_to_run(self):
+        """Two runs with numerics_changing_optim produce bitwise identical results."""
+        run_a = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+        run_b = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+
+        self._assert_runs_match(run_a, run_b, "numerics_changing_optim run-to-run: ")
 
 
 class TestDSv3BitwiseDeterministic(BitwiseDeterministicBase):
@@ -327,6 +435,7 @@ class TestDSv3BitwiseDeterministic(BitwiseDeterministicBase):
     model_flavor = "debugmodel"
     annotate_model = staticmethod(annotate_deepseekv3)
 
+    @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
     @unittest.skipUnless(
         has_cuda_capability(9, 0), "Numerics only match on H100 (sm_90+)"
     )
@@ -338,14 +447,14 @@ class TestDSv3BitwiseDeterministic(BitwiseDeterministicBase):
         loss, model_hash, grad_hash = self._run_steps(
             copy.deepcopy(self.model), Trainer
         )
-        assert_expected_inline(str(loss.item()), """7.4749956130981445""")
+        assert_expected_inline(str(loss.item()), """7.474959373474121""")
         assert_expected_inline(
             model_hash,
-            """89942c2acb1be82c69efe87338ba248dd16b5dab4c5d410877e890c796dec89f""",
+            """99d414c98ec7de31e58ad41f3324a402dfa4f8fc4b3c57a406368af7360a2ec6""",
         )
         assert_expected_inline(
             grad_hash,
-            """2cc6dbc2a86a68cff84ff4087e73479da2ebec5929528f94f4958ba0f2eca3eb""",
+            """7f38de9544b31d1161c4191987663e2e8cc7be8b83b6226ff72a349a71aa1afa""",
         )
 
     def test_aot_fx_trace_vs_eager(self):
@@ -357,14 +466,34 @@ class TestDSv3BitwiseDeterministic(BitwiseDeterministicBase):
 
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
+        if self.attn_backend == "flex":
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
+            # that pickle.dumps cannot serialize. The SDPA subclasses cover this
+            # path (SDPA carries no such object).
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 
         self._assert_runs_match(run_traced, run_precompile, "trace vs precompile: ")
 
+    def test_numerics_changing_optim_run_to_run(self):
+        """Two runs with numerics_changing_optim produce bitwise identical results."""
+        run_a = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+        run_b = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+
+        self._assert_runs_match(run_a, run_b, "numerics_changing_optim run-to-run: ")
+
 
 class TestLlama3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
-    """Bitwise determinism tests for Llama3 with FlexAttention (debugmodel_flex_attn).
+    """Bitwise determinism tests for Llama3 with FlexAttention (debugmodel).
 
     aot_fx_trace compiles FlexAttention HOPs via regional_inductor into fused
     Triton kernels and produces bitwise identical results to eager.
@@ -375,6 +504,7 @@ class TestLlama3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
     attn_backend = "flex"
     annotate_model = staticmethod(annotate_llama)
 
+    @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
     @unittest.skipUnless(
         has_cuda_capability(9, 0), "Numerics only match on H100 (sm_90+)"
     )
@@ -386,14 +516,14 @@ class TestLlama3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
         loss, model_hash, grad_hash = self._run_steps(
             copy.deepcopy(self.model), Trainer
         )
-        assert_expected_inline(str(loss.item()), """7.961757183074951""")
+        assert_expected_inline(str(loss.item()), """7.961757659912109""")
         assert_expected_inline(
             model_hash,
-            """bc9fbc09b6f14f4cb1e1f75a691da0a4be5905cb0e02f9c29512c268dc43ff81""",
+            """cfb3c5cba404ea7a6f9adae605277995d157cf3b624e5a1e3729a786996da350""",
         )
         assert_expected_inline(
             grad_hash,
-            """66b847a7f479b464c883e1cce759d4b38d7a78f3c319463b8402710b69ac4530""",
+            """b8c505488cf613d016ed55e0e4dbcfcd8a278cc9e27f3cf0154301cbefc7ca4a""",
         )
 
     def test_aot_fx_trace_vs_eager(self):
@@ -402,18 +532,36 @@ class TestLlama3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         self._assert_runs_match(run_eager, run_traced, "eager vs aot_fx_trace: ")
 
-    # TODO: numerics mismatch between precompile and trace with FlexAttention
-    @unittest.skip("FlexAttention precompile numerics mismatch — under investigation")
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
+        if self.attn_backend == "flex":
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
+            # that pickle.dumps cannot serialize. The SDPA subclasses cover this
+            # path (SDPA carries no such object).
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 
         self._assert_runs_match(run_traced, run_precompile, "trace vs precompile: ")
 
+    def test_numerics_changing_optim_run_to_run(self):
+        """Two runs with numerics_changing_optim produce bitwise identical results."""
+        run_a = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+        run_b = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+
+        self._assert_runs_match(run_a, run_b, "numerics_changing_optim run-to-run: ")
+
 
 class TestDSv3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
-    """Bitwise determinism tests for DSv3 with FlexAttention (debugmodel_flex_attn).
+    """Bitwise determinism tests for DSv3 with FlexAttention (debugmodel).
 
     aot_fx_trace compiles FlexAttention HOPs via regional_inductor into fused
     Triton kernels and produces bitwise identical results to eager.
@@ -424,6 +572,21 @@ class TestDSv3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
     attn_backend = "flex"
     annotate_model = staticmethod(annotate_deepseekv3)
 
+    def _wrap_ep_chunk_eager_baseline(self, model: nn.Module) -> None:
+        maybe_apply_ep_overlap_eager_chunking(
+            model,
+            GraphTrainerCompileConfig(
+                enable=True,
+                ep_overlap=EpOverlapConfig(
+                    enabled=True,
+                    strategy="eager",
+                    chunk_dim="seq",
+                    module_fqn="layers.*.moe",
+                ),
+            ),
+        )
+
+    @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
     @unittest.skipUnless(
         has_cuda_capability(9, 0), "Numerics only match on H100 (sm_90+)"
     )
@@ -435,20 +598,21 @@ class TestDSv3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
         loss, model_hash, grad_hash = self._run_steps(
             copy.deepcopy(self.model), Trainer
         )
-        assert_expected_inline(str(loss.item()), """7.4749956130981445""")
+        assert_expected_inline(str(loss.item()), """7.474959373474121""")
         assert_expected_inline(
             model_hash,
-            """bb0a4727f4c2120af1c98451a0890eb1220ee1d123bec3ce65818d0669e7c541""",
+            """aff6268960d2b137a44756d322b72c0dc253ffbbc54077e4105fc3abed0fdd79""",
         )
         assert_expected_inline(
             grad_hash,
-            """16c5442f06bc283431e48c4bcd2498fa3c849351815668b72ce1c76095f22277""",
+            """86f1656c38fa1e23d6b29955889bd5c4ad0c363f9755e2c4ea8dee142cacfcfe""",
         )
 
-    # TODO: OOMs during flex_attention compilation on A100 GPUs.
+    # TODO: FlexAttention compilation exceeds resource limits on pre-Hopper GPUs.
     # Revisit when GraphTrainer addresses peak memory during compilation.
     @unittest.skipUnless(
-        has_cuda_capability(9, 0), "OOMs during flex_attention compilation on A100"
+        has_cuda_capability(9, 0),
+        "flex_attention compilation exceeds resource limits on pre-Hopper GPUs",
     )
     def test_aot_fx_trace_vs_eager(self):
         """aot_fx_trace with passes and eager produce bitwise identical results."""
@@ -456,14 +620,206 @@ class TestDSv3FlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         self._assert_runs_match(run_eager, run_traced, "eager vs aot_fx_trace: ")
 
-    # TODO: numerics mismatch between precompile and trace with FlexAttention
-    @unittest.skip("FlexAttention precompile numerics mismatch — under investigation")
     def test_precompile_vs_trace(self):
         """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
+        if self.attn_backend == "flex":
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
+            # that pickle.dumps cannot serialize. The SDPA subclasses cover this
+            # path (SDPA carries no such object).
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
         run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
         run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
 
         self._assert_runs_match(run_traced, run_precompile, "trace vs precompile: ")
+
+    # TODO: FlexAttention compilation exceeds resource limits on pre-Hopper GPUs.
+    @unittest.skipUnless(
+        has_cuda_capability(9, 0),
+        "flex_attention compilation exceeds resource limits on pre-Hopper GPUs",
+    )
+    def test_numerics_changing_optim_run_to_run(self):
+        """Two runs with numerics_changing_optim produce bitwise identical results."""
+        run_a = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+        run_b = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+
+        self._assert_runs_match(run_a, run_b, "numerics_changing_optim run-to-run: ")
+
+    @unittest.skipUnless(
+        has_cuda_capability(9, 0),
+        "flex_attention compilation exceeds resource limits on pre-Hopper GPUs",
+    )
+    def test_ep_chunk_matches_eager_chunking_bitwise(self):
+        """Fast single-GPU prerequisite for FlexAttention EP chunking numerics.
+
+        This validates chunking logic, pass composability, and eager-chunked vs.
+        graph-chunked numerics with and without the post-schedule concretization
+        pass. It does not exercise real EP all-to-all communication,
+        distributed sharding, or overlap behavior; the distributed DSV3 numerics
+        tests provide that end-to-end coverage.
+        """
+        eager_model = copy.deepcopy(self.model)
+        self._wrap_ep_chunk_eager_baseline(eager_model)
+
+        run_eager = self._run_steps(eager_model, Trainer)
+        graph_model = copy.deepcopy(self.model)
+        # The eager FlexAttention baseline compiles with concrete dims.
+        # Reset Dynamo before tracing the graph-chunked production path,
+        # which starts symbolic and then concretizes before Inductor.
+        torch._dynamo.reset()
+        run_traced = self._run_steps(
+            graph_model,
+            GraphTrainer,
+            compile_ep_overlap_enabled=True,
+            compile_ep_overlap_chunk_dim="seq",
+            compile_ep_overlap_module_fqn="layers.*.moe",
+            compile_ep_overlap_disable_early_grad_accumulation=True,
+        )
+
+        self._assert_runs_match(
+            run_eager,
+            run_traced,
+            "eager chunk vs ep_chunk moe_seq: ",
+        )
+
+
+class TestQwen3MoEBitwiseDeterministic(BitwiseDeterministicBase):
+    """Bitwise determinism tests for Qwen3 MoE debug model."""
+
+    model_registry = staticmethod(qwen3_model_registry)
+    model_flavor = "debugmodel_moe"
+    annotate_model = staticmethod(annotate_qwen3)
+
+    @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
+    @unittest.skipUnless(
+        has_cuda_capability(9, 0), "Numerics only match on H100 (sm_90+)"
+    )
+    def test_eager_self_deterministic(self):
+        """Eager mode: results match hardcoded expected values.
+
+        Run `EXPECTTEST_ACCEPT=1 pytest <this_file> ` to update the inline expected values.
+        """
+        loss, model_hash, grad_hash = self._run_steps(
+            copy.deepcopy(self.model), Trainer
+        )
+        assert_expected_inline(str(loss.item()), """7.2979936599731445""")
+        assert_expected_inline(
+            model_hash,
+            """dea001dde5db1b02f8b4c25fefc8ed517c390cacdfcea946d3829eb492e3c6dc""",
+        )
+        assert_expected_inline(
+            grad_hash,
+            """baf7140456134fe7256af1d8144bb6a579a731121a9843db177643b24eac9cd1""",
+        )
+
+    def test_aot_fx_trace_vs_eager(self):
+        """aot_fx_trace and eager produce bitwise identical losses and grads."""
+        run_eager = self._run_steps(copy.deepcopy(self.model), Trainer)
+        run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
+
+        self._assert_runs_match(run_eager, run_traced, "eager vs aot_fx_trace: ")
+
+    def test_precompile_vs_trace(self):
+        """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
+        if self.attn_backend == "flex":
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
+            # that pickle.dumps cannot serialize. The SDPA subclasses cover this
+            # path (SDPA carries no such object).
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
+        run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
+        run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
+
+        self._assert_runs_match(run_traced, run_precompile, "trace vs precompile: ")
+
+    def test_numerics_changing_optim_run_to_run(self):
+        """Two runs with numerics_changing_optim produce bitwise identical results."""
+        run_a = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+        run_b = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+
+        self._assert_runs_match(run_a, run_b, "numerics_changing_optim run-to-run: ")
+
+
+class TestQwen3MoEFlexAttnBitwiseDeterministic(BitwiseDeterministicBase):
+    """Bitwise determinism tests for Qwen3 MoE with FlexAttention.
+
+    aot_fx_trace compiles FlexAttention HOPs via regional_inductor into fused
+    Triton kernels and produces bitwise identical results to eager.
+    """
+
+    model_registry = staticmethod(qwen3_model_registry)
+    model_flavor = "debugmodel_moe"
+    attn_backend = "flex"
+    annotate_model = staticmethod(annotate_qwen3)
+
+    @unittest.skip(_EAGER_GOLDEN_SKIP_REASON)
+    @unittest.skipUnless(
+        has_cuda_capability(9, 0), "Numerics only match on H100 (sm_90+)"
+    )
+    def test_eager_self_deterministic(self):
+        """Eager results match hardcoded expected values.
+
+        Run `EXPECTTEST_ACCEPT=1 pytest <this_file>` to update the inline expected values.
+        """
+        loss, model_hash, grad_hash = self._run_steps(
+            copy.deepcopy(self.model), Trainer
+        )
+        assert_expected_inline(str(loss.item()), """7.297994613647461""")
+        assert_expected_inline(
+            model_hash,
+            """70ea7c9f5224ad2f8796270873f39d329ded42a9b3f437a14577d61c5d78e4c5""",
+        )
+        assert_expected_inline(
+            grad_hash,
+            """c336a44443add5c6af2b35de62e5f8584b2d0f8876390032ebceffc2a6608e03""",
+        )
+
+    def test_aot_fx_trace_vs_eager(self):
+        """aot_fx_trace with passes and eager produce bitwise identical results."""
+        run_eager = self._run_steps(copy.deepcopy(self.model), Trainer)
+        run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
+        self._assert_runs_match(run_eager, run_traced, "eager vs aot_fx_trace: ")
+
+    def test_precompile_vs_trace(self):
+        """Precompiled aot_fx_trace (save/load roundtrip) matches direct trace."""
+        if self.attn_backend == "flex":
+            # FlexAttention's BlockMask mask_mod closures are Python code objects
+            # that pickle.dumps cannot serialize. The SDPA subclasses cover this
+            # path (SDPA carries no such object).
+            self.skipTest("FlexAttention graphs contain unpicklable code objects")
+        run_traced = self._run_steps(copy.deepcopy(self.model), GraphTrainer)
+        run_precompile = self._run_steps_with_precompile(copy.deepcopy(self.model))
+
+        self._assert_runs_match(run_traced, run_precompile, "trace vs precompile: ")
+
+    def test_numerics_changing_optim_run_to_run(self):
+        """Two runs with numerics_changing_optim produce bitwise identical results."""
+        run_a = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+        run_b = self._run_steps(
+            copy.deepcopy(self.model),
+            GraphTrainer,
+            numerics_changing_optim=True,
+        )
+
+        self._assert_runs_match(run_a, run_b, "numerics_changing_optim run-to-run: ")
 
 
 if __name__ == "__main__":

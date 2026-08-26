@@ -7,7 +7,6 @@
 """Multimodal chat SFT dataset and dataloader."""
 
 import json
-import math
 import os
 import random
 from collections.abc import Callable
@@ -783,21 +782,11 @@ class MMChatCollator:
 
     def __post_init__(self) -> None:
         self.vit_patch_bucket_size = int(self.vit_patch_bucket_size)
-        if self.vit_patch_bucket_size < 0:
+        if self.vit_patch_bucket_size != 0:
             raise ValueError(
-                "vit_patch_bucket_size must be non-negative, "
-                f"got {self.vit_patch_bucket_size}"
+                "vit_patch_bucket_size is not supported by the Qwen3.5 vision "
+                "encoder; packed pixel_values must exactly match grid_thw"
             )
-
-    @property
-    def vit_patch_bucket_unit(self) -> int:
-        if self.vit_patch_bucket_size == 0:
-            return 0
-        return math.lcm(
-            self.vit_patch_bucket_size,
-            128,
-            self.spatial_merge_size**2,
-        )
 
     def collate_images(
         self,
@@ -821,21 +810,6 @@ class MMChatCollator:
                 f"Collated pixel_values has {patches.shape[0]} patches, but "
                 f"grid_thw describes {real_num_patch} patches"
             )
-
-        bucket_unit = self.vit_patch_bucket_unit
-        if bucket_unit > 0 and real_num_patch > 0:
-            bucket_num_patch = (
-                (real_num_patch + bucket_unit - 1) // bucket_unit
-            ) * bucket_unit
-            pad_len = bucket_num_patch - real_num_patch
-            if pad_len > 0:
-                patches = torch.cat(
-                    [
-                        patches,
-                        patches.new_zeros((pad_len, patches.shape[1])),
-                    ],
-                    dim=0,
-                )
 
         return patches, grid_thw
 
@@ -988,11 +962,24 @@ class MMChatDataLoader(ParallelAwareDataloader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer,
-        seq_len: int,
-        local_batch_size: int,
+        seq_len: int | None = None,
+        local_batch_size: int | None = None,
+        max_context_length: int | None = None,
+        num_tokens_per_batch: int | None = None,
         seed: int | None = None,
         **kwargs,
     ):
+        if seq_len is None:
+            seq_len = max_context_length
+        if seq_len is None or seq_len <= 0:
+            raise ValueError("MMChatDataLoader requires a positive context length")
+        if local_batch_size is None:
+            if num_tokens_per_batch is None or num_tokens_per_batch % seq_len != 0:
+                raise ValueError(
+                    "MMChatDataLoader requires num_tokens_per_batch to be divisible "
+                    f"by the context length, got {num_tokens_per_batch} and {seq_len}"
+                )
+            local_batch_size = num_tokens_per_batch // seq_len
         if not config.dataset_path:
             raise ValueError("MMChatDataLoader requires dataset_path")
         if (

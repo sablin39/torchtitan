@@ -11,16 +11,12 @@ from typing import Literal
 
 import torch
 import torch._inductor.config
-from torchtitan.components.quantization import (
-    _QuantizedGroupedExpertsConfig,
-    QuantizationConverter,
-    QuantizedLinearConfig,
-)
+from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
-from torchtitan.tools.utils import has_cuda_capability
+from torchtitan.tools.utils import has_cuda_capability, has_rocm_capability
 
 from .utils import module_filter_fn, swap_token_dispatcher
 
@@ -36,7 +32,7 @@ try:
         """
 
         @dataclass(kw_only=True, slots=True)
-        class Config(QuantizedLinearConfig):
+        class Config(Linear.Config):
             """Drop-in replacement for Linear.Config that builds Float8Linear."""
 
             _torchao_config: object = None
@@ -86,11 +82,16 @@ class Float8LinearConverter(QuantizationConverter):
         cfg = self.config
         filter_fqns = cfg.filter_fqns
 
-        if has_cuda_capability(8, 9) or (cfg.emulate and not cfg.model_compile_enabled):
+        if (
+            has_cuda_capability(8, 9)
+            or has_rocm_capability(9, 4)
+            or (cfg.emulate and not cfg.model_compile_enabled)
+        ):
             pass
         else:
             raise ValueError(
-                "Failed to swap to Float8Linear because float8 is only supported on SM89 or later. "
+                "Failed to swap to Float8Linear because float8 is only supported on "
+                "NVIDIA SM89 or later, or AMD gfx942 (MI300) or later. "
                 "To enable testing on older hardware, set `float8.emulate` to True in eager mode.",
             )
 
@@ -147,9 +148,9 @@ class Float8LinearConverter(QuantizationConverter):
 
         self.enabled = True
 
-    def convert(self, model_config) -> None:
+    def convert(self, model_config):
         if not self.enabled:
-            return
+            return model_config
 
         assert Float8Linear is not None
         for fqn, linear_config, parent, attr in model_config.traverse(Linear.Config):
@@ -161,12 +162,55 @@ class Float8LinearConverter(QuantizationConverter):
                     param_init=linear_config.param_init,
                     _torchao_config=self.torchao_config,
                 )
-                if isinstance(parent, list):
+                if parent is None:
+                    model_config = new_config
+                elif isinstance(parent, list):
                     parent[attr] = new_config
                 else:
                     setattr(parent, attr, new_config)
 
         logger.info("Swapped to Float8Linear layers")
+        return model_config
+
+
+_float8_experts_cache: dict[type, type] = {}
+
+
+def _get_float8_grouped_experts_cls(parent_cls: type) -> type:
+    """Get or create a Float8-quantized subclass of *parent_cls*.
+
+    Works for any ``GroupedExperts`` subclass (e.g. gpt-oss variants).
+    The returned class has a proper ``_owner`` set by ``__init_subclass__``.
+    """
+    if parent_cls in _float8_experts_cache:
+        return _float8_experts_cache[parent_cls]
+
+    parent_config_cls = parent_cls.Config  # type: ignore[attr-defined]
+
+    class Float8GroupedExperts(parent_cls):  # type: ignore[valid-type, misc]
+        @dataclass(kw_only=True, slots=True)
+        class Config(parent_config_cls):  # type: ignore[misc]
+            pass
+
+        def __init__(self, config: Config):
+            super().__init__(config)
+            from torchao.prototype.moe_training.config import Float8TrainingOpConfig
+
+            self._float8_op_config = Float8TrainingOpConfig()
+
+        def _grouped_mm(self, *, A, B_t, offs):
+            from torchao.prototype.moe_training.utils import (
+                _quantize_then_scaled_grouped_mm,
+            )
+
+            return _quantize_then_scaled_grouped_mm(
+                A, B_t, config=self._float8_op_config, offs=offs
+            )
+
+    Float8GroupedExperts.__name__ = f"Float8{parent_cls.__name__}"
+    Float8GroupedExperts.__qualname__ = f"Float8{parent_cls.__name__}"
+    _float8_experts_cache[parent_cls] = Float8GroupedExperts
+    return Float8GroupedExperts
 
 
 class Float8GroupedExpertsConverter(QuantizationConverter):
@@ -187,8 +231,11 @@ class Float8GroupedExpertsConverter(QuantizationConverter):
                 "torchao is not installed. Please install it to use float8 MoE training."
             )
 
-        if not has_cuda_capability(8, 9):
-            raise ValueError("Float8 MoE training only supported on SM89 or later.")
+        if not (has_cuda_capability(8, 9) or has_rocm_capability(9, 4)):
+            raise ValueError(
+                "Float8 MoE training only supported on NVIDIA SM89 or later, "
+                "or AMD gfx942 (MI300) or later."
+            )
 
         if not self.config.model_compile_enabled:
             logger.warning(
@@ -196,34 +243,18 @@ class Float8GroupedExpertsConverter(QuantizationConverter):
                 "enable it with --compile.enable"
             )
 
-    def convert(self, model_config) -> None:
-        from torchao.prototype.moe_training.config import Float8TrainingOpConfig
-        from torchao.quantization.quant_api import quantize_
-
-        _converted_config_cache: dict[type, type] = {}
-
+    def convert(self, model_config):
         for _fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
-            swap_token_dispatcher(config, self.PAD_MULTIPLE)
-
-            base_cls = type(config)
-            if base_cls not in _converted_config_cache:
-
-                @dataclass(kw_only=True, slots=True)
-                class Float8GroupedExpertsConfig(
-                    base_cls, _QuantizedGroupedExpertsConfig
-                ):
-                    def build(self, **kwargs):
-                        instance = base_cls.build(self, **kwargs)
-                        quantize_(instance, config=Float8TrainingOpConfig())
-                        return instance
-
-                _converted_config_cache[base_cls] = Float8GroupedExpertsConfig
-
-            ConfigCls = _converted_config_cache[base_cls]
-            new_config = ConfigCls(
-                **{f.name: getattr(config, f.name) for f in fields(config)}
+            swap_token_dispatcher(parent, self.PAD_MULTIPLE)
+            base_module_cls = type(config)._owner
+            quantized_cls = _get_float8_grouped_experts_cls(base_module_cls)
+            config_cls = quantized_cls.Config  # type: ignore[attr-defined]
+            new_config = config_cls(
+                **{f.name: getattr(config, f.name) for f in fields(config)},
             )
-            if isinstance(parent, list):
+            if parent is None:
+                model_config = new_config
+            elif isinstance(parent, list):
                 parent[attr] = new_config
             else:
                 setattr(parent, attr, new_config)
@@ -232,3 +263,4 @@ class Float8GroupedExpertsConverter(QuantizationConverter):
             "Converted GroupedExperts to use dynamic float8 rowwise quantization "
             "with scaled grouped GEMMs"
         )
+        return model_config

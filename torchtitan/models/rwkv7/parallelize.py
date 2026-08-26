@@ -11,14 +11,13 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 
 from torchtitan.config import (
-    ActivationCheckpointConfig,
     CompileConfig,
     ParallelismConfig,
     TORCH_DTYPE_MAP,
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import apply_ac
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import (
     disable_fsdp_gradient_division,
     get_fsdp_reshard_after_forward_policy,
@@ -34,7 +33,7 @@ def parallelize_rwkv7(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
-    ac_config: ActivationCheckpointConfig,
+    ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
     if parallel_dims.tp_enabled:
@@ -58,10 +57,11 @@ def parallelize_rwkv7(
                 "RWKV7 CP with torch.compile is experimental. TorchTitan will "
                 "leave RWKV/FLA blocks eager."
             )
-        total_tokens = training.local_batch_size * training.seq_len
+        total_tokens = training.num_tokens_per_microbatch_per_dp_rank
         if total_tokens % parallel_dims.cp != 0:
             raise ValueError(
-                f"RWKV7 CP requires local_batch_size * seq_len ({total_tokens}) "
+                "RWKV7 CP requires num_tokens_per_microbatch_per_dp_rank "
+                f"({total_tokens}) "
                 f"to be divisible by CP degree ({parallel_dims.cp})"
             )
         model.set_cp_process_group(parallel_dims.get_mesh("cp").get_group())
@@ -70,13 +70,8 @@ def parallelize_rwkv7(
         compile_config.enable and "model" in compile_config.components
     )
 
-    if ac_config.mode != "none":
-        apply_ac(
-            model.llm,
-            ac_config,
-            model_compile_enabled=False,
-            base_folder=dump_folder,
-        )
+    if ac_config is not None:
+        ac_config.build(dump_folder=dump_folder).apply(model.llm)
 
     if model_compile_enabled:
         logger.info("Leaving RWKV7 model eager; skipping torch.compile for RWKV blocks")

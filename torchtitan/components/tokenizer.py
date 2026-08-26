@@ -7,7 +7,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from torchtitan.config import Configurable
 
@@ -71,8 +71,8 @@ class BaseTokenizer(ABC, Configurable):
             lstrip_blocks=True,
             extensions=[jinja2.ext.loopcontrols],
         )
-        env.globals["raise_exception"] = cast(Any, raise_exception)
-        env.globals["strftime_now"] = cast(Any, strftime_now)
+        env.globals["raise_exception"] = raise_exception
+        env.globals["strftime_now"] = strftime_now
         env.filters["tojson"] = tojson
         self._chat_template = env.from_string(template)
 
@@ -217,3 +217,46 @@ class HuggingFaceTokenizer(BaseTokenizer):
 
     def id_to_token(self, token_id: int) -> str | None:
         return self.tokenizer.convert_ids_to_tokens(token_id)
+
+
+class MultiModalTokenizer(HuggingFaceTokenizer):
+    """Single source of truth for multimodal special tokens.
+
+    Requires 5 token strings via config, validates them against the vocabulary
+    at init, and exposes both string and ID attributes (e.g. ``image_token``,
+    ``image_id``). The Qwen multimodal Grain processor requires
+    ``MultiModalTokenizer`` (not ``HuggingFaceTokenizer``) and reads these
+    attributes directly; the collator packs the IDs into a plain
+    ``dict[str, int]`` that travels through the batch to the model forward.
+    Adding a new VLM means filling in 5 config strings — no subclassing needed.
+
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(HuggingFaceTokenizer.Config):
+        image_token: str
+        """Token string for image placeholders, e.g. ``"<|image_pad|>"``."""
+
+        video_token: str
+        """Token string for video placeholders, e.g. ``"<|video_pad|>"``."""
+
+        vision_start_token: str
+        """Token string marking the start of a vision sequence."""
+
+        vision_end_token: str
+        """Token string marking the end of a vision sequence."""
+
+        pad_token: str
+        """Token string for padding."""
+
+    # Config field prefixes that follow the {name}_token pattern.
+    TOKEN_FIELDS = ("image", "video", "vision_start", "vision_end", "pad")
+
+    def __init__(self, config: Config, *, tokenizer_path: str):
+        super().__init__(config, tokenizer_path=tokenizer_path)
+        for name in self.TOKEN_FIELDS:
+            if getattr(self, f"{name}_id", None) is None:
+                raise ValueError(
+                    f"Special token configured as {name}_token was not found "
+                    f"in the tokenizer at {tokenizer_path!r}."
+                )

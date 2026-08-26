@@ -16,7 +16,7 @@ from scripts.rwkv7_exporter.export_hf_model import save_remote_code_assets
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config.manager import ConfigManager
 
-from torchtitan.distributed.context_parallel import _build_flattened_cu_seqlens
+from torchtitan.distributed.context_parallel.api import _build_flattened_cu_seqlens
 from torchtitan.models.rwkv7 import model_registry as rwkv7_model_registry
 from torchtitan.models.rwkv7.model import (
     _token_shift_varlen_eager,
@@ -269,7 +269,7 @@ class TestRWKV7Backend(unittest.TestCase):
                 "rwkv_vl",
                 "--config",
                 "rwkv_vl_debugmodel_chat",
-                "--optimizer.lr",
+                "--optimizer.param-groups.0.optimizer-kwargs.lr",
                 "1e-5",
                 "--module-lrs.vision-encoder",
                 "0",
@@ -280,7 +280,7 @@ class TestRWKV7Backend(unittest.TestCase):
             ]
         )
         spec = cfg.model_spec
-        spec.model.update_from_config(trainer_config=cfg)
+        spec.model.update_from_config(config=cfg)
         self.assertEqual(
             spec.model.root_lrs,
             {
@@ -306,7 +306,7 @@ class TestRWKV7Backend(unittest.TestCase):
                 "rwkv_vl",
                 "--config",
                 "rwkv_vl_debugmodel_chat",
-                "--optimizer.lr",
+                "--optimizer.param-groups.0.optimizer-kwargs.lr",
                 "1e-5",
                 "--module-lrs.vision-encoder",
                 "0",
@@ -320,14 +320,15 @@ class TestRWKV7Backend(unittest.TestCase):
         self.assertEqual(cfg.module_lrs.proj, 1e-4)
         self.assertEqual(cfg.module_lrs.llm, 1e-5)
 
-        cfg.model_spec.model.update_from_config(trainer_config=cfg)
+        cfg.model_spec.model.update_from_config(config=cfg)
         groups = {
-            group.pattern: group.lr_multiplier for group in cfg.optimizer.param_groups
+            group.pattern: group.optimizer_kwargs["lr"]
+            for group in cfg.optimizer.param_groups
         }
         self.assertNotIn(r"^vision_encoder\.", groups)
-        self.assertEqual(groups[r"^proj\."], 10.0)
+        self.assertEqual(groups[r"^proj\."], 1e-4)
         # llm and lm_head share one param group (lm_head has no separate LR).
-        self.assertEqual(groups[r"^(llm|lm_head)\."], 1.0)
+        self.assertEqual(groups[r"^(llm|lm_head)\."], 1e-5)
 
     def test_rwkv_vl_backbone_chunk_size_cli_updates_model_config(self):
         cfg = ConfigManager().parse_args(
@@ -343,7 +344,7 @@ class TestRWKV7Backend(unittest.TestCase):
         self.assertEqual(cfg.backbone_chunk_size, 32)
         self.assertEqual(cfg.model_spec.model.llm.chunk_size, 64)
 
-        cfg.model_spec.model.update_from_config(trainer_config=cfg)
+        cfg.model_spec.model.update_from_config(config=cfg)
         self.assertEqual(cfg.model_spec.model.llm.chunk_size, 32)
         with torch.device("meta"):
             model = cfg.model_spec.model.build()
@@ -363,7 +364,7 @@ class TestRWKV7Backend(unittest.TestCase):
             ]
         )
         with self.assertRaisesRegex(ValueError, "at least 16"):
-            cfg.model_spec.model.update_from_config(trainer_config=cfg)
+            cfg.model_spec.model.update_from_config(config=cfg)
 
     def test_rwkv_vl_fsdp_skips_frozen_roots(self):
         spec = rwkv_vl_model_registry("debugmodel")
@@ -458,13 +459,18 @@ class TestRWKV7Backend(unittest.TestCase):
         adapter = RWKVVLStateDictAdapter(spec.model, hf_assets_path=None)
         vision_dim = spec.model.vision_encoder.dim
         hidden_size = spec.model.hidden_size
-        conv = torch.empty(vision_dim, 3, 2, 16, 16)
+        conv = torch.arange(
+            vision_dim * 3 * 2 * 16 * 16,
+            dtype=torch.float32,
+        ).reshape(vision_dim, 3, 2, 16, 16)
+        qkv = torch.arange(
+            vision_dim * 3 * vision_dim,
+            dtype=torch.float32,
+        ).reshape(vision_dim * 3, vision_dim)
         out = adapter.from_hf(
             {
                 "model.encoder.patch_embed.proj.weight": conv,
-                "model.encoder.blocks.0.attn.qkv.weight": torch.empty(
-                    vision_dim * 3, vision_dim
-                ),
+                "model.encoder.blocks.0.attn.qkv.weight": qkv,
                 "model.encoder.deepstack_merger_list.0.norm.weight": torch.empty(
                     vision_dim
                 ),
@@ -475,14 +481,40 @@ class TestRWKV7Backend(unittest.TestCase):
             }
         )
         self.assertEqual(
-            tuple(out["vision_encoder.patch_embed.proj.weight"].shape),
+            tuple(out["vision_encoder.patch_embed.weight"].shape),
             (vision_dim, 3 * 2 * 16 * 16),
         )
-        self.assertIn("vision_encoder.layers.0.attn.qkv.weight", out)
+        self.assertIn("vision_encoder.layers.0.attn.wq.weight", out)
+        self.assertIn("vision_encoder.layers.0.attn.wk.weight", out)
+        self.assertIn("vision_encoder.layers.0.attn.wv.weight", out)
         self.assertIn("vision_encoder.deepstack_merger_list.0.norm.weight", out)
         self.assertIn("proj.main.pre_norm.weight", out)
         self.assertIn("llm.pre_norm.weight", out)
         self.assertIn("llm.norm.weight", out)
+
+        restored = adapter.to_hf(out)
+        torch.testing.assert_close(
+            restored["model.encoder.patch_embed.proj.weight"],
+            conv,
+        )
+        torch.testing.assert_close(
+            restored["model.encoder.blocks.0.attn.qkv.weight"],
+            qkv,
+        )
+
+    def test_rwkv_vl_state_dict_adapter_rejects_incomplete_vision_qkv(self):
+        spec = rwkv_vl_model_registry("debugmodel")
+        adapter = RWKVVLStateDictAdapter(spec.model, hf_assets_path=None)
+        vision_dim = spec.model.vision_encoder.dim
+        projection = torch.empty(vision_dim, vision_dim)
+
+        with self.assertRaisesRegex(ValueError, "Incomplete vision QKV"):
+            adapter.to_hf(
+                {
+                    "vision_encoder.layers.0.attn.wq.weight": projection,
+                    "vision_encoder.layers.0.attn.wk.weight": projection,
+                }
+            )
 
     def test_flattened_cu_seqlens_fixed_rows(self):
         cu = _build_flattened_cu_seqlens(

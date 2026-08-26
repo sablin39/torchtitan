@@ -9,31 +9,59 @@ Shared configuration dataclasses for torchtitan.
 
 Some configs live near their owner instead of here:
   - Profiler.Config                 (in tools/profiler.py)
-  - OptimizersContainer.Config      (in components/optimizer.py)
-  - LRSchedulersContainer.Config    (in components/lr_scheduler.py)
+  - OptimizersContainer.Config      (in components/optimizer/optimizer.py)
+  - LRSchedulersContainer.Config    (in components/optimizer/lr_scheduler.py)
   - MetricsProcessor.Config         (in components/metrics.py)
-  - CheckpointManager.Config        (in components/checkpoint.py)
+  - CheckpointManager.Config        (in components/checkpointer/dcp.py)
 
 Configs without a clear single owner (or with circular-import constraints)
 live here.
+
+Most knobs belong to a component or to the model, not here. But some options
+have no suitable home, e.g. the training token-budget settings, and those can
+be placed here. Discuss with the maintainers first if you intend to add one.
+
+The command-line surface is frozen either way, so annotate a new field with
+``tyro.conf.Suppress``, as ``Trainer.Config.model_spec`` does. See
+``torchtitan/config/README.md``.
 """
 
 from dataclasses import dataclass, field
 from typing import Literal
 
+import torch
+
 
 @dataclass(kw_only=True, slots=True)
 class TrainingConfig:
-    local_batch_size: int = 8
-    """Local batch size (i.e., per-device batch size)"""
-
-    global_batch_size: int = -1
+    num_tokens_per_microbatch_per_dp_rank: int = 16384
     """
-    Global batch size (defaults to `training.local_batch_size * data-parallel degree`)
+    Number of input-token slots processed per data-parallel rank in one model
+    forward, before context or tensor parallel sharding.
     """
 
-    seq_len: int = 2048
-    """Sequence length"""
+    num_tokens_per_train_step: int = -1
+    """
+    Global number of input-token slots across data-parallel ranks, pipeline
+    microbatches, and gradient accumulation steps. Defaults to
+    `training.num_tokens_per_microbatch_per_dp_rank * num_pp_microbatches *
+    data-parallel degree`.
+    """
+
+    max_context_length: int = 2048
+    """Maximum logical context length used for training."""
+
+    def __post_init__(self) -> None:
+        if self.num_tokens_per_microbatch_per_dp_rank <= 0:
+            raise ValueError(
+                "num_tokens_per_microbatch_per_dp_rank must be greater than 0."
+            )
+        if self.num_tokens_per_train_step != -1 and self.num_tokens_per_train_step <= 0:
+            raise ValueError("num_tokens_per_train_step must be -1 or greater than 0.")
+        if self.max_context_length <= 0:
+            raise ValueError("max_context_length must be greater than 0.")
+        if self.max_norm < 0:
+            raise ValueError("max_norm must be greater than or equal to 0.")
 
     max_norm: float | int = 1.0
     """Max norm for gradient clipping"""
@@ -44,6 +72,18 @@ class TrainingConfig:
     enable_cpu_offload: bool = False
     """
     Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP
+    """
+
+    disable_cuda_graphs: bool = False
+    """
+    Disable CUDA graph capture and replay for the forward+backward step. CUDA
+    graphs require fixed-shape inputs and no CPU<->GPU synchronization during
+    the captured region. Expert parallelism is supported only with HybridEP
+    when ``non_blocking_capacity_factor`` is set, or with MinimalAsyncEP. Other
+    EP backends synchronize with the host during dispatch. Pipeline parallelism
+    is not supported yet. CUDA graphs are independent of
+    ``torch.compile(mode="reduce-overhead")``, which performs its own CUDA graph
+    capture.
     """
 
     dtype: Literal["bfloat16", "float32"] = "float32"
@@ -119,17 +159,25 @@ class ParallelismConfig:
     - "never" will disable `reshard_after_forward` for all forward passes.
     """
 
+    enable_fsdp_symm_mem: bool = False
+    """
+    Whether to enable FSDP2 symmetric-memory communication optimizations for
+    all FSDP modules after `fully_shard` has been applied.
+    """
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
-    disable_loss_parallel: bool = False
-    """Whether to apply loss parallel when sequence parallel is enabled"""
-
-    enable_async_tensor_parallel: bool = False
-    """Whether to apply async tensor parallel (currently only effective when compile is enabled)"""
-
     enable_sequence_parallel: bool = True
     """Whether to use SequenceParallel as part of tensor parallelism. Enabled by default."""
+
+    spmd_backend: Literal["partial_dtensor", "spmd_types"] = "spmd_types"
+    """
+    SPMD backend selector.
+
+    - "partial_dtensor": use DTensor for model-parallel axes only.
+    - "spmd_types": use the spmd_types path.
+    """
 
     pipeline_parallel_degree: int = 1
     """
@@ -183,12 +231,11 @@ class ParallelismConfig:
     PipelineScheduleSingle, PipelineScheduleMulti, or _PipelineScheduleRuntime.
     """
 
-    pipeline_parallel_microbatch_size: int = 1
+    num_pp_microbatches: int = 1
     """
-    The size of each pipeline parallel microbatch (default 1).
-    This value is used to compute the total number of microbatches by dividing local_batch_size with
-    pipeline_parallel_microbatch_size.
-    The global training batch size must be evenly divisible by pipeline_parallel_microbatch_size.
+    Number of pipeline microbatches per data-parallel rank and gradient
+    accumulation iteration. This setting is ignored when pipeline parallelism
+    is disabled (`pipeline_parallel_degree = 1`, the default).
     """
 
     context_parallel_degree: int = 1
@@ -202,119 +249,46 @@ class ParallelismConfig:
     - None: Disable load balancing
     """
 
+    context_parallel_ptrr_mask_key: str | None = None
+    """
+    When the load balancer is "ptrr" and the attention masks are a
+    dict[str, BlockMask], this selects which mask in the dict the
+    PTRRLoadBalancer is built from. The chosen balancer is then used to shard
+    every mask in the dict as well as the inputs. Only relevant for the "ptrr"
+    load balancer with dict-valued attention masks; ignored otherwise.
+    """
+
     def __post_init__(self):
+        if self.spmd_backend not in {"partial_dtensor", "spmd_types"}:
+            raise ValueError(
+                "parallelism.spmd_backend must be either 'partial_dtensor' "
+                "or 'spmd_types'."
+            )
         if self.context_parallel_load_balancer == "":
             raise ValueError(
                 "context_parallel_load_balancer cannot be an empty string. "
                 "Use None to disable load balancing."
             )
-
-    context_parallel_rotate_method: Literal["allgather", "alltoall"] = "allgather"
-    """
-    The collective to use in context parallel SDPA for kv shards exchange.
-    - 'allgather' means to all-gather all kv shards on ranks after the first sub-SDPA computation,
-    - 'alltoall' means to all-to-all shuffle the kv shards.
-    The default value is 'allgather'.
-    """
+        if self.enable_fsdp_symm_mem and (
+            not torch.cuda.is_available()
+            or (
+                torch.version.hip is None
+                and torch.cuda.get_device_capability() < (9, 0)
+            )
+        ):
+            raise ValueError(
+                "For NVIDIA GPUs, parallelism.enable_fsdp_symm_mem is only supported "
+                "for compute capability 9.0 or newer."
+            )
 
     expert_parallel_degree: int = 1
     """
     Expert parallelism degree. 1 means disabled. No effect for non-MoE models.
 
-    Currently, etp is either 1 or is the same as tp.
-
-    Note that this is still an experimental feature. Some constraints will be
-    relaxed soon when we have more flexible DeviceMesh support.
-    """
-
-    expert_tensor_parallel_degree: int = 1
-    """
-    Expert tensor parallelism degree. 1 means disabled. No effect for non-MoE models, or when ep = 1.
-    With this option, the tensor parallel degree on routed experts can be different from that on other params.
-    Currently, we only support either
-    - [partial dp -> ep] etp = tp
-    - [partial dp + all tp -> ep] etp = 1
-    Note that this is still an experimental feature.
-    """
-
-    expert_parallel_comm_backend: Literal["standard", "deepep", "hybridep"] = "standard"
-    """
-    Expert-parallel communication backend. No effect for non-MoE models or when ep = 1.
-
-    - "standard": Uses PyTorch all-to-all collectives (default)
-    - "deepep": Uses DeepEP custom kernels for H100/NVLink Switch
-    - "hybridep": Uses HybridEP with TMA optimization for GB200/NVLink72
-
-    DeepEP/HybridEP requires installation:
-    https://github.com/deepseek-ai/DeepEP.
-
-    For HybridEP, SM configuration can be set via environment variables:
-    - HYBRIDEP_NUM_SMS_DISPATCH (default: 16)
-    - HYBRIDEP_NUM_SMS_COMBINE (default: 16)
-    """
-
-
-@dataclass(kw_only=True, slots=True)
-class ActivationCheckpointConfig:
-    mode: Literal["selective", "full", "memory_budget", "none"] = "selective"
-    """Type of activation checkpointing to use"""
-
-    per_op_sac_force_recompute_mm_shapes_by_fqns: list[str] = field(
-        default_factory=lambda: ["moe.router.gate"]
-    )
-    """
-    When per-op selective ac is used, this list of fully qualified names is used
-    to determine which mm shapes to force recompute, rather than being considered
-    by rest of the sac policy, e.g save every other mm. Only nn.Linear modules are
-    supported today.
-
-    Note: this config applies to mms not limited to those matching the specified
-    fqns, e.g. if "moe.router.gate", corresponding to Linear(in, out), is specified,
-    ANY mm with shape matching (*, in) x (in, out) will be force recomputed.
-    """
-
-    early_stop: bool = False
-    """
-    Whether to stop recomputing early when all activations have already been
-    rematerialized.
-    """
-
-    memory_budget: float = 0.5
-    """
-    When mode is set to "memory_budget", this value determines how much
-    partitioner in the compiler should trade off compute for memory.
-    0.0 corresponds to the activation memory from applying
-    activation checkpointing to the full compiled region, and 1.0 corresponds to
-    the activation memory from the default runtime-optimized strategy. Read here:
-    https://pytorch.org/blog/activation-checkpointing-techniques/
-    """
-
-    visualize_memory_budget_pareto: bool = False
-    """
-    This dumps out a SVG visualization of the expected runtime vs. activation
-    memory tradeoffs for all memory budget values from 0 to 1 in increments of
-    0.05 in {--dump_folder}/memory_budget_pareto folder. See an example here:
-    https://github.com/pytorch/pytorch/pull/126320#discussion_r1625104015
-    """
-
-    preserve_rng_state: bool = True
-    """
-    If deterministic output compared to non-checkpointed passes is required, set
-    to true. Results in stashing and restoring the RNG state during each checkpoint,
-    may be slower. See https://docs.pytorch.org/docs/stable/checkpoint.html
-    for details.
-    """
-
-    determinism_check: str = "default"
-    """
-    A string specifying the determinism function. See
-    https://docs.pytorch.org/docs/stable/checkpoint.html for details.
-    """
-
-    debug: bool = False
-    """
-    Capture ac debug information. Will be slower. See
-    https://docs.pytorch.org/docs/stable/checkpoint.html for details.
+    Mesh constraint: the dense region (dp_shard * cp * tp) and sparse region
+    (efsdp * ep) cover the same ranks, so dp_shard * cp * tp == efsdp * ep.
+    EP borrows ranks from FSDP and TP: efsdp = dp_shard * cp * tp / ep.
+    pp and dp_replicate are outer dimensions unaffected by this constraint.
     """
 
 
@@ -323,10 +297,22 @@ class CompileConfig:
     enable: bool = False
     """Whether to apply torch.compile"""
 
+    enable_async_tensor_parallel: bool = False
+    """Whether to pipeline tensor-parallel collectives with matrix multiplications."""
+
     components: list[str] = field(default_factory=lambda: ["model", "loss"])
     """Which components to compile"""
 
     backend: str = "inductor"
+
+    def __post_init__(self) -> None:
+        if self.enable_async_tensor_parallel and not (
+            self.enable and "model" in self.components
+        ):
+            raise ValueError(
+                "Async TP requires 'model' in --compile.components and "
+                "--compile.enable"
+            )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -349,21 +335,13 @@ class CommConfig:
     save_traces_file_prefix: str = "rank_"
     """Flight recorder trace files prefix"""
 
-    mode: Literal["default", "fake_backend", "local_tensor", "torchcomms"] = "default"
+    mode: Literal["default", "fake_backend"] = "default"
     """
     Communication mode for distributed training.
 
     Options:
     - "default": Normal distributed training with real communication
     - "fake_backend": Fake comm backend for dry run mode only (configuration validation without GPU)
-    - "local_tensor": Local tensor mode for debugging purposes. There will be only one process
-      regardless of the number of GPUs. LocalTensor will simulate the computation by running one
-      rank after another. While the performance will be slow, the numerics should be the same.
-      This enables us to verify numerics with fewer GPUs. For example, we can directly run 5D
-      parallelisms within a single node to reduce the combinations we need to use in integration tests.
-    - "torchcomms": Use torchcomms-based communicators. Requires the torchcomms package to be installed.
-
-    NOTE: local_tensor is an experimental feature and automatically uses fake_backend internally.
     """
 
 
@@ -371,6 +349,9 @@ class CommConfig:
 class DebugConfig:
     seed: int | None = None
     """Choose the base RNG seed used for training"""
+
+    spmd_typechecking: bool = False
+    """Enable global SPMD type checking; only effective under spmd_backend="spmd_types"."""
 
     deterministic: bool = False
     """Use deterministic algorithms wherever possible, may be slower"""
@@ -394,3 +375,9 @@ class DebugConfig:
 
     save_config_file: str | None = None
     """Path to save job config into"""
+
+    enable_structured_logging: bool = True
+    """Whether to enable the structured per-rank trace logger (see
+    ``torchtitan.observability.structured_logger``). When False, all
+    ``log_trace_span`` / ``log_trace_instant`` / ``log_trace_scalar`` calls
+    are no-ops. Disable to fully eliminate trace overhead."""

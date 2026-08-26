@@ -22,49 +22,31 @@ from __future__ import annotations
 
 import gc
 import unittest
-from dataclasses import replace
 from functools import partial
 
 import torch
 import torch.nn as nn
 
 from torchtitan.models.common import Linear
-from torchtitan.models.qwen3_vl.vision_encoder import Qwen3VLVisionEncoder
 from torchtitan.models.rwkv7.model import rwkv7_backbone_config
+from torchtitan.models.rwkv_vl import _vl_vision_encoder_config
 from torchtitan.models.rwkv_vl.model import (
     RWKV7VLForConditionalGeneration,
     VisualAdapter,
 )
-
-
-_LINEAR_INIT = {
-    "weight": partial(nn.init.trunc_normal_, std=0.02),
-    "bias": nn.init.zeros_,
-}
-_POS_EMBED_INIT = {"pos_embed": partial(nn.init.trunc_normal_, std=0.02)}
-
-
-def _linear_cfg(in_features: int, out_features: int) -> Linear.Config:
-    return Linear.Config(
-        in_features=in_features,
-        out_features=out_features,
-        bias=True,
-        param_init=_LINEAR_INIT,
-    )
+from torchtitan.models.rwkv_vl.vision_encoder import RWKVVisionEncoder
 
 
 def _make_vision_encoder_config(
     *, deepstack_indices: list[int], spatial_merge_size: int = 2
-) -> Qwen3VLVisionEncoder.Config:
+) -> RWKVVisionEncoder.Config:
     dim = 128
     ffn_dim = 512
     patch_size = 16
     temporal_patch_size = 2
     in_channels = 3
     out_hidden_size = 256
-    patch_dim = in_channels * temporal_patch_size * patch_size * patch_size
-    merged_hidden_size = dim * (spatial_merge_size**2)
-    return Qwen3VLVisionEncoder.Config(
+    return _vl_vision_encoder_config(
         dim=dim,
         ffn_dim=ffn_dim,
         n_layers=4,
@@ -75,14 +57,7 @@ def _make_vision_encoder_config(
         out_hidden_size=out_hidden_size,
         num_position_embeddings=1024,
         deepstack_visual_indices=deepstack_indices,
-        patch_embed_proj=_linear_cfg(patch_dim, dim),
-        attn_qkv=_linear_cfg(dim, dim * 3),
-        attn_proj=_linear_cfg(dim, dim),
-        mlp_fc1=_linear_cfg(dim, ffn_dim),
-        mlp_fc2=_linear_cfg(ffn_dim, dim),
-        merger_fc1=_linear_cfg(merged_hidden_size, merged_hidden_size),
-        merger_fc2=_linear_cfg(merged_hidden_size, out_hidden_size),
-        param_init=_POS_EMBED_INIT,
+        in_channels=in_channels,
     )
 
 
@@ -203,6 +178,7 @@ class TestRwkvVLProjectorVariants(unittest.TestCase):
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
         model = cfg.build().to(self.device).to(torch.bfloat16)
+        model.init_states(buffer_device=self.device)
         return model
 
     def test_mlp_projector_forward_backward(self):
@@ -262,25 +238,49 @@ class TestRwkvVLProjectorVariants(unittest.TestCase):
             device=self.device, image_token_id=model.config.image_token_id
         )
         with torch.no_grad():
-            out1 = model(tokens, pixel_values=pixel_values, grid_thw=grid_thw)
-            # Build a new pixel batch where image-A patches are identical
-            # but image-B patches are scrambled. Image-A token positions
-            # in the output must be unchanged.
+            _, deepstack1, num_tokens, num_kv = model._get_vision_embeds(
+                pixel_values,
+                grid_thw=grid_thw,
+            )
             grid_a = grid_thw[0]
             patches_a = int((grid_a.prod()).item())
             pixel_values_alt = pixel_values.clone()
             pixel_values_alt[patches_a:].uniform_(-1, 1)
-            out2 = model(
-                tokens, pixel_values=pixel_values_alt, grid_thw=grid_thw
+            _, deepstack2, _, _ = model._get_vision_embeds(
+                pixel_values_alt,
+                grid_thw=grid_thw,
             )
-        # Image-A image_pad positions span tokens[0, 8:8+n_pad_a].
+            injector1 = model._make_cross_attn_injector(
+                deepstack_features=deepstack1,
+                num_tokens_per_item=num_tokens,
+                num_kv_per_item=num_kv,
+                vision_token_id=model.config.image_token_id,
+                global_input_ids=None,
+                global_start=None,
+                local_tokens=tokens,
+            )
+            injector2 = model._make_cross_attn_injector(
+                deepstack_features=deepstack2,
+                num_tokens_per_item=num_tokens,
+                num_kv_per_item=num_kv,
+                vision_token_id=model.config.image_token_id,
+                global_input_ids=None,
+                global_start=None,
+                local_tokens=tokens,
+            )
+            query_hidden = torch.randn(
+                1,
+                tokens.shape[1],
+                model.hidden_size,
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            out1 = injector1(0, query_hidden)
+            out2 = injector2(0, query_hidden)
+
         n_pad_a = patches_a // (model.processor_spatial_merge_size**2)
         a_slice = (slice(None), slice(8, 8 + n_pad_a))
-        diff = (out1[a_slice] - out2[a_slice]).abs().max().item()
-        # With per-image masking, image-A outputs should be unaffected.
-        # Allow tiny noise from numerical broadcasting through unrelated
-        # text-stream computations.
-        self.assertLess(diff, 1e-2)
+        torch.testing.assert_close(out1[a_slice], out2[a_slice])
 
 
 if __name__ == "__main__":

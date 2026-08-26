@@ -17,20 +17,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.tensor import distribute_tensor, DTensor
 
-from torchtitan.models.common import Embedding, Linear
+from torchtitan.models.common import (
+    Embedding,
+    GroupNorm,
+    Identity,
+    LayerNorm,
+    Linear,
+    Sigmoid,
+    Tanh,
+)
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
 from torchtitan.ops.scatter_add import deterministic_scatter_add
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict, Sequential
 from torchtitan.tools.logging import logger
-
-
-LayerNorm = Module.from_nn_module(nn.LayerNorm)
-GroupNorm = Module.from_nn_module(nn.GroupNorm)
-Tanh = Module.from_nn_module(nn.Tanh)
-Sigmoid = Module.from_nn_module(nn.Sigmoid)
-Identity = Module.from_nn_module(nn.Identity)
 
 
 def _zero_(param: torch.Tensor) -> None:
@@ -335,11 +336,11 @@ class RWKVLoRA(Module):
             else 1.0
         )
         if config.activation is None:
-            activation = Identity()
+            activation = Identity.Config().build()
         elif config.activation == "sigmoid":
-            activation = Sigmoid()
+            activation = Sigmoid.Config().build()
         elif config.activation == "tanh":
-            activation = Tanh()
+            activation = Tanh.Config().build()
         else:
             raise ValueError(f"Unsupported RWKV LoRA activation: {config.activation}")
 
@@ -463,12 +464,12 @@ class RWKV7TimeMix(Module):
             bias=False,
         ).build()
 
-        self.g_norm = GroupNorm(
+        self.g_norm = GroupNorm.Config(
             num_groups=self.num_heads,
             num_channels=self.value_dim,
             eps=self.head_dim * config.norm_eps,
             affine=True,
-        )
+        ).build()
 
     def _init_self_parameters(self) -> None:
         ratio_0_to_1 = (
@@ -978,12 +979,12 @@ class RWKV7Block(Module):
         super().__init__()
         self.config = config
         self.layer_idx = config.layer_idx
-        self.attn_norm = LayerNorm(
-            config.hidden_size,
+        self.attn_norm = LayerNorm.Config(
+            normalized_shape=config.hidden_size,
             eps=config.norm_eps,
             elementwise_affine=True,
             bias=config.norm_bias,
-        )
+        ).build()
         self.attn = RWKV7TimeMix.Config(
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
@@ -998,12 +999,12 @@ class RWKV7Block(Module):
             norm_eps=config.norm_eps,
             chunk_size=config.chunk_size,
         ).build()
-        self.ffn_norm = LayerNorm(
-            config.hidden_size,
+        self.ffn_norm = LayerNorm.Config(
+            normalized_shape=config.hidden_size,
             eps=config.norm_eps,
             elementwise_affine=True,
             bias=config.norm_bias,
-        )
+        ).build()
         self.moe_enabled = config.moe_channel_mix_enabled
         if self.moe_enabled:
             if config.moe_channel_mix_intermediate_size is None:
@@ -1111,12 +1112,12 @@ class RWKV7Backbone(Module):
             )
         ).build()
         self.layers = ModuleDict()
-        self.pre_norm = LayerNorm(
-            config.hidden_size,
+        self.pre_norm = LayerNorm.Config(
+            normalized_shape=config.hidden_size,
             eps=config.norm_eps,
             elementwise_affine=True,
             bias=config.norm_bias,
-        )
+        ).build()
         value_dims = config.value_dim or [config.hidden_size] * config.num_hidden_layers
         moe_channel_mix_enabled = config.moe_channel_mix_start_layer is not None
         if moe_channel_mix_enabled:
@@ -1188,12 +1189,12 @@ class RWKV7Backbone(Module):
                     config.moe_channel_mix_load_balance_coeff
                 ),
             ).build()
-        self.norm = LayerNorm(
-            config.hidden_size,
+        self.norm = LayerNorm.Config(
+            normalized_shape=config.hidden_size,
             eps=config.norm_eps,
             elementwise_affine=True,
             bias=config.norm_bias,
-        )
+        ).build()
 
     def forward_embeddings(
         self,
@@ -1234,28 +1235,11 @@ class RWKV7ForCausalLM(BaseModel):
         lm_head: Linear.Config | None = None
         uses_fla_context_parallel: bool = True
 
-        def update_from_config(self, *, trainer_config, **kwargs) -> None:
-            parallelism = trainer_config.parallelism
-            training = trainer_config.training
-            compile_config = getattr(trainer_config, "compile", None)
-
-            # Snap vocab_size to the paired tokenizer (rounded up for matmul
-            # alignment) so the model's embedding + lm_head match whatever
-            # tokenizer the trainer built.
-            from torchtitan.models.common.config_utils import (
-                align_vocab_size_to_tokenizer,
-            )
-
-            tokenizer = kwargs.get("tokenizer")
-            new_vocab = align_vocab_size_to_tokenizer(
-                declared_vocab_size=self.vocab_size, tokenizer=tokenizer
-            )
-            if new_vocab != self.vocab_size:
-                self.vocab_size = new_vocab
-                self.llm.vocab_size = new_vocab
-                self.llm.embeddings.num_embeddings = new_vocab
-                if self.lm_head is not None:
-                    self.lm_head.out_features = new_vocab
+        def update_from_config(self, *, config, **kwargs) -> None:
+            del kwargs
+            parallelism = config.parallelism
+            training = config.training
+            compile_config = getattr(config, "compile", None)
 
             if parallelism.tensor_parallel_degree > 1:
                 raise NotImplementedError(
@@ -1276,10 +1260,11 @@ class RWKV7ForCausalLM(BaseModel):
                     raise ValueError(
                         "RWKV7 CP requires --parallelism.context_parallel_load_balancer None"
                     )
-                total_tokens = training.local_batch_size * training.seq_len
+                total_tokens = training.num_tokens_per_microbatch_per_dp_rank
                 if total_tokens % parallelism.context_parallel_degree != 0:
                     raise ValueError(
-                        f"RWKV7 CP requires local_batch_size * seq_len "
+                        "RWKV7 CP requires "
+                        "num_tokens_per_microbatch_per_dp_rank "
                         f"({total_tokens}) to be divisible by context_parallel_degree "
                         f"({parallelism.context_parallel_degree})"
                     )

@@ -11,6 +11,8 @@ from typing import Literal
 
 import torch
 
+from torchtitan.models.common.multimodal import get_vision_positions
+
 
 ReduceMode = Literal["set", "add"]
 
@@ -29,17 +31,17 @@ def _find_vision_spans(
     num_tokens_per_item: torch.Tensor,
     vision_token_id: int,
 ) -> list[_VisionSpan]:
-    flat = tokens.reshape(-1)
-    mask = flat == vision_token_id
-    prev = torch.cat([torch.zeros(1, dtype=torch.bool, device=mask.device), mask[:-1]])
-    starts = torch.where(mask & ~prev)[0]
     return [
         _VisionSpan(
             item_idx=item_idx,
-            start=int(starts[item_idx].item()),
-            length=int(num_tokens_per_item[item_idx].item()),
+            start=start,
+            length=length,
         )
-        for item_idx in range(num_tokens_per_item.shape[0])
+        for item_idx, start, length in get_vision_positions(
+            tokens.reshape(-1),
+            num_tokens_per_item,
+            vision_token_id,
+        )
     ]
 
 
