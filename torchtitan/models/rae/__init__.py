@@ -1,6 +1,28 @@
-from .model import RAEDecoder
+from .data import RAEImageCollator, RAEImageProcessor, RAEQwenCollator, RAEQwenProcessor
+from .layout import unpatchify_packed
+from .model import RAEAttention, RAEBlock, RAEDecoder, RAEFeedForward
+from .packing import (
+    create_rae_packed_attention_mask,
+    create_rae_padding_mask,
+    create_rae_varlen_metadata,
+)
+from .position import Cosmos3DRotaryPositionEmbedding
 
-__all__ = ["RAEDecoder"]
+__all__ = [
+    "RAEDecoder",
+    "RAEAttention",
+    "RAEBlock",
+    "RAEFeedForward",
+    "Cosmos3DRotaryPositionEmbedding",
+    "create_rae_padding_mask",
+    "create_rae_packed_attention_mask",
+    "create_rae_varlen_metadata",
+    "RAEImageCollator",
+    "RAEImageProcessor",
+    "RAEQwenCollator",
+    "RAEQwenProcessor",
+    "unpatchify_packed",
+]
 
 
 def __getattr__(name: str):

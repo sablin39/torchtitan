@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -84,6 +86,9 @@ class FrozenRAEEncoder(nn.Module):
             self.latent_mean = self._format_stat(stats.get("mean"), "mean")
             self.latent_var = self._format_stat(stats.get("var"), "var")
         self.external = None
+        self.last_grid_thw: torch.Tensor | None = None
+        self.last_fps: torch.Tensor | None = None
+        self.last_temporal_start: torch.Tensor | None = None
         if config.kind == "qwen":
             self._init_qwen(config, device)
         elif config.kind in {"dino_hub", "hf"}:
@@ -193,7 +198,7 @@ class FrozenRAEEncoder(nn.Module):
             raise ValueError("Qwen encoder does not accept checkpoint_path")
         try:
             from safetensors import safe_open
-            from transformers import AutoConfig, AutoImageProcessor
+            from transformers import AutoConfig, AutoImageProcessor, AutoProcessor
             from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
         except ImportError as error:
             raise RuntimeError(
@@ -250,9 +255,14 @@ class FrozenRAEEncoder(nn.Module):
                 f"missing={missing}, unexpected={unexpected}"
             )
         self.external = visual.to(device=device).eval()
-        self.processor = AutoImageProcessor.from_pretrained(
-            str(model_directory), local_files_only=True
-        )
+        try:
+            self.processor = AutoProcessor.from_pretrained(
+                str(model_directory), local_files_only=True
+            )
+        except (OSError, ValueError):
+            self.processor = AutoImageProcessor.from_pretrained(
+                str(model_directory), local_files_only=True
+            )
         self._qwen_patch_size = int(vision_config.patch_size)
         self._qwen_depth = int(vision_config.depth)
         external_dim = int(vision_config.out_hidden_size)
@@ -293,52 +303,295 @@ class FrozenRAEEncoder(nn.Module):
             )
         return value
 
+    @staticmethod
+    def _as_btchw(media: Any) -> torch.Tensor:
+        if not isinstance(media, torch.Tensor):
+            import io
+
+            import numpy as np
+            from PIL import Image
+
+            if isinstance(media, (bytes, bytearray)):
+                media = Image.open(io.BytesIO(media)).convert("RGB")
+            if hasattr(media, "convert"):
+                media = np.array(media.convert("RGB"), copy=True)
+            if isinstance(media, (list, tuple)):
+                frames = [FrozenRAEEncoder._as_btchw(frame)[0] for frame in media]
+                return torch.stack(frames, dim=0)
+            media = torch.from_numpy(np.asarray(media))
+        media = media.float()
+        if media.numel() and media.max() > 1:
+            media = media / 255.0
+        if media.ndim == 3:
+            if media.shape[-1] in (1, 3, 4):
+                media = media[..., :3].permute(2, 0, 1)
+            elif media.shape[0] not in (1, 3, 4):
+                raise ValueError("RAE media must be HWC or CHW with three channels")
+            else:
+                media = media[:3]
+            return media.unsqueeze(0)
+        if media.ndim == 4:
+            if media.shape[1] in (1, 3, 4):
+                return media[:, :3]
+            if media.shape[-1] in (1, 3, 4):
+                return media[..., :3].permute(0, 3, 1, 2)
+            raise ValueError("RAE videos must use TCHW or THWC layout")
+        if media.ndim == 5:
+            if media.shape[0] != 1 or media.shape[2] not in (1, 3, 4):
+                raise ValueError("RAE media batches must use one BTCHW item")
+            return media[0, :, :3]
+        raise ValueError("RAE media must have CHW, TCHW, or BTCHW dimensions")
+
     def forward(
-        self, images_BCHW: torch.Tensor, *, add_noise: bool = False
-    ) -> torch.Tensor:
-        images_BCHW = images_BCHW.float()
-        if images_BCHW.shape[-2:] != (self.image_size, self.image_size):
-            images_BCHW = F.interpolate(
-                images_BCHW,
-                size=(self.image_size, self.image_size),
-                mode="bilinear",
-                align_corners=False,
+        self,
+        images_BTCHW: torch.Tensor | Sequence[torch.Tensor] | Mapping[str, Any],
+        *,
+        add_noise: bool = False,
+        return_grid_thw: bool = False,
+        fps: torch.Tensor | float | None = None,
+        temporal_start: torch.Tensor | float = 0.0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        self.last_grid_thw = None
+        self.last_fps = None
+        self.last_temporal_start = None
+
+        def scalar_values(
+            value: torch.Tensor | float | None,
+            batch_size: int,
+            default: float,
+        ) -> list[float]:
+            if value is None:
+                return [default] * batch_size
+            if isinstance(value, torch.Tensor):
+                values = value.detach().float().flatten().tolist()
+            else:
+                values = [float(value)]
+            if len(values) == 1:
+                values *= batch_size
+            if len(values) != batch_size:
+                raise ValueError("RAE metadata must be scalar or one value per sample")
+            return [float(item) for item in values]
+
+        processor_output: Mapping[str, Any] | None = None
+        images_BCHW: torch.Tensor | None = None
+        batch_size: int
+        media_kind = "image"
+        if isinstance(images_BTCHW, Mapping):
+            if self.kind != "qwen":
+                raise ValueError(
+                    "Preprocessed Qwen mappings require encoder.kind='qwen'"
+                )
+            processor_output = images_BTCHW
+            pixel_key = next(
+                (
+                    key
+                    for key in ("pixel_values", "pixel_values_videos", "input")
+                    if processor_output.get(key) is not None
+                ),
+                None,
             )
+            grid_key = next(
+                (
+                    key
+                    for key in (
+                        "image_grid_thw",
+                        "video_grid_thw",
+                        "grid_thw",
+                        "grid_thw_videos",
+                    )
+                    if processor_output.get(key) is not None
+                ),
+                None,
+            )
+            if pixel_key is None or grid_key is None:
+                raise ValueError(
+                    "Qwen encoder mappings require pixel_values and grid_thw metadata"
+                )
+            media_kind = str(
+                processor_output.get(
+                    "media_kind", "video" if "video" in pixel_key else "image"
+                )
+            )
+            grid_thw = torch.as_tensor(processor_output[grid_key])
+            batch_size = int(grid_thw.reshape(-1, 3).shape[0])
+        elif isinstance(images_BTCHW, torch.Tensor):
+            raw_media = images_BTCHW.float()
+            if raw_media.numel() and raw_media.max() > 1:
+                raw_media = raw_media / 255.0
+            if self.kind == "qwen":
+                if raw_media.ndim == 4:
+                    images_BCHW = raw_media
+                    batch_size = raw_media.shape[0]
+                    processor_output = self.processor(
+                        images=raw_media.detach(),
+                        do_rescale=False,
+                        return_tensors="pt",
+                    )
+                elif raw_media.ndim == 5:
+                    media_kind = "video"
+                    videos_TCHW = [
+                        raw_media[index].detach() for index in range(raw_media.shape[0])
+                    ]
+                    batch_size = len(videos_TCHW)
+                    if not hasattr(self.processor, "video_processor"):
+                        raise RuntimeError(
+                            "Qwen processor does not provide a video processor"
+                        )
+                    processor_output = self.processor(
+                        videos=videos_TCHW,
+                        do_rescale=False,
+                        do_sample_frames=False,
+                        return_metadata=True,
+                        return_tensors="pt",
+                    )
+                else:
+                    raise ValueError("Qwen encoder expects BCHW images or BTCHW videos")
+            else:
+                if raw_media.ndim == 5:
+                    if raw_media.shape[1] != 1:
+                        raise ValueError(
+                            "Non-Qwen RAE encoders only accept one-frame BTCHW images"
+                        )
+                    raw_media = raw_media[:, 0]
+                if raw_media.ndim != 4:
+                    raise ValueError("Non-Qwen RAE encoders expect BCHW images")
+                images_BCHW = raw_media
+                batch_size = raw_media.shape[0]
+        else:
+            media_items = list(images_BTCHW)
+            if not media_items:
+                raise ValueError("RAE encoder requires at least one image or video")
+            if self.kind != "qwen":
+                if any(item.ndim not in (3, 4) for item in media_items):
+                    raise ValueError(
+                        "Non-Qwen RAE encoders expect CHW or one-frame TCHW images"
+                    )
+                if any(item.ndim == 4 and item.shape[0] != 1 for item in media_items):
+                    raise ValueError(
+                        "Non-Qwen RAE encoders only accept one-frame TCHW images"
+                    )
+                images_BCHW = torch.stack(
+                    [
+                        item.float() if item.ndim == 3 else item[0].float()
+                        for item in media_items
+                    ]
+                )
+                batch_size = images_BCHW.shape[0]
+            else:
+                media_items = [self._as_btchw(item) for item in media_items]
+                media_kind = (
+                    "video"
+                    if any(item.shape[0] > 1 for item in media_items)
+                    else "image"
+                )
+                batch_size = len(media_items)
+                if media_kind == "video":
+                    if not hasattr(self.processor, "video_processor"):
+                        raise RuntimeError(
+                            "Qwen processor does not provide a video processor"
+                        )
+                    processor_output = self.processor(
+                        videos=[item.detach() for item in media_items],
+                        do_rescale=False,
+                        do_sample_frames=False,
+                        return_metadata=True,
+                        return_tensors="pt",
+                    )
+                else:
+                    processor_output = self.processor(
+                        images=[item[0].detach() for item in media_items],
+                        do_rescale=False,
+                        return_tensors="pt",
+                    )
+
+        if self.kind != "qwen" and images_BCHW is not None:
+            if images_BCHW.shape[1] != 3:
+                raise ValueError("RAE images must have three channels")
+            if images_BCHW.shape[-2:] != (self.image_size, self.image_size):
+                images_BCHW = F.interpolate(
+                    images_BCHW,
+                    size=(self.image_size, self.image_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+        tokens_BLC: torch.Tensor | None = None
+        latents_BCHW: torch.Tensor | None = None
         if self.external is not None and self.kind == "qwen":
-            processor_output = self.processor(
-                images_BCHW.detach(),
-                do_rescale=False,
-                return_tensors="pt",
+            assert processor_output is not None
+            pixel_key = next(
+                key
+                for key in ("pixel_values", "pixel_values_videos", "input")
+                if processor_output.get(key) is not None
             )
+            grid_key = next(
+                key
+                for key in (
+                    "image_grid_thw",
+                    "video_grid_thw",
+                    "grid_thw",
+                    "grid_thw_videos",
+                )
+                if processor_output.get(key) is not None
+            )
+            grid_thw = torch.as_tensor(processor_output[grid_key])
             external_device = next(self.external.parameters()).device
-            processor_output = {
+            model_inputs = {
                 name: value.to(device=external_device)
                 for name, value in processor_output.items()
-                if torch.is_tensor(value)
+                if name == pixel_key or name == grid_key
             }
             with torch.no_grad():
                 outputs = self.external(
-                    hidden_states=processor_output["pixel_values"],
-                    grid_thw=processor_output["image_grid_thw"],
+                    hidden_states=model_inputs[pixel_key],
+                    grid_thw=model_inputs[grid_key],
                     output_hidden_states=bool(self.layer_indices),
                 )
             merged_hidden_states = _merge_qwen_hidden_states(
                 outputs, self.external.merger, self.layer_indices
             )
-            grid_thw = processor_output["image_grid_thw"]
-            tokens_per_image = (
-                grid_thw[:, 1] * grid_thw[:, 2] // self.merge_size**2
-            ).tolist()
-            if len(set(tokens_per_image)) != 1:
-                raise ValueError("Qwen encoder requires equal image grids in a batch")
-            tokens_BLC = merged_hidden_states.view(
-                images_BCHW.shape[0], tokens_per_image[0], self.latent_dim
+            grid_thw = grid_thw.to(
+                device=merged_hidden_states.device, dtype=torch.long
+            ).reshape(-1, 3)
+            tokens_per_item = grid_thw.prod(dim=-1) // self.merge_size**2
+            post_merge_grid_thw = grid_thw.clone()
+            post_merge_grid_thw[:, 1:] //= self.merge_size
+            self.last_grid_thw = post_merge_grid_thw.detach().cpu()
+            same_grid = torch.all(post_merge_grid_thw == post_merge_grid_thw[0])
+            if torch.all(tokens_per_item == tokens_per_item[0]) and same_grid:
+                tokens_BLC = merged_hidden_states.view(
+                    batch_size, int(tokens_per_item[0].item()), self.latent_dim
+                )
+            else:
+                tokens_BLC = merged_hidden_states
+            fps_source = processor_output.get("fps") if fps is None else fps
+            if fps_source is None and media_kind == "video":
+                metadata = processor_output.get("video_metadata")
+                metadata_fps = (
+                    [getattr(item, "fps", None) for item in metadata]
+                    if metadata
+                    else []
+                )
+                if len(metadata_fps) != batch_size or any(
+                    item_fps is None or item_fps <= 0 for item_fps in metadata_fps
+                ):
+                    raise ValueError(
+                        "Video FPS must be provided with the input or processor metadata"
+                    )
+                fps_values = [float(item_fps) for item_fps in metadata_fps]
+            else:
+                fps_values = scalar_values(fps_source, batch_size, 0.0)
+            if media_kind == "video" and any(value <= 0 for value in fps_values):
+                raise ValueError("Video FPS must be positive")
+            self.last_fps = torch.tensor(fps_values, device=merged_hidden_states.device)
+            start_values = scalar_values(temporal_start, batch_size, 0.0)
+            self.last_temporal_start = torch.tensor(
+                start_values, device=merged_hidden_states.device
             )
         elif self.external is not None and self.kind == "dino_hub":
+            assert images_BCHW is not None
             images_BCHW = F.interpolate(
-                images_BCHW,
-                size=(self.image_size, self.image_size),
-                mode="bicubic",
+                images_BCHW, size=(self.image_size, self.image_size), mode="bicubic"
             )
             mean_1C11 = images_BCHW.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
             std_1C11 = images_BCHW.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
@@ -349,6 +602,7 @@ class FrozenRAEEncoder(nn.Module):
             else:
                 tokens_BLC = self.external(images_BCHW)
         elif self.kind == "hf":
+            assert images_BCHW is not None
             images_BCHW = F.interpolate(
                 images_BCHW,
                 size=(self._hf_processor_size, self._hf_processor_size),
@@ -385,6 +639,7 @@ class FrozenRAEEncoder(nn.Module):
             else:
                 tokens_BLC = outputs.last_hidden_state[:, prefix_length:]
         elif self.kind == "fixed":
+            assert images_BCHW is not None
             latent_side = self.image_size // 16
             images_BCHW = F.interpolate(
                 images_BCHW,
@@ -393,33 +648,92 @@ class FrozenRAEEncoder(nn.Module):
                 align_corners=False,
             )
             latents_BCHW = self.projection(images_BCHW)
+
         if self.external is not None:
-            side = int(math.sqrt(tokens_BLC.shape[1]))
-            if side * side != tokens_BLC.shape[1]:
-                raise ValueError("RAE encoder returned a non-square token grid")
-            latents_BCHW = tokens_BLC.transpose(1, 2).reshape(
-                images_BCHW.shape[0], self.latent_dim, side, side
-            )
+            if tokens_BLC is None:
+                raise RuntimeError("RAE external encoder did not return tokens")
+            if tokens_BLC.ndim == 3:
+                side = int(math.sqrt(tokens_BLC.shape[1]))
+                if side * side != tokens_BLC.shape[1]:
+                    if return_grid_thw:
+                        latents = tokens_BLC
+                    else:
+                        raise ValueError(
+                            "Qwen encoder returned a non-square token grid; "
+                            "request return_grid_thw=True for variable resolution"
+                        )
+                else:
+                    latents_BCHW = tokens_BLC.transpose(1, 2).reshape(
+                        batch_size, self.latent_dim, side, side
+                    )
+                    latents = latents_BCHW
+            else:
+                latents = tokens_BLC
+        else:
+            if latents_BCHW is None:
+                raise RuntimeError("RAE encoder did not return image latents")
+            latents = latents_BCHW
         if self.latent_mean is not None or self.latent_var is not None:
-            latent_mean = (
-                self.latent_mean.to(latents_BCHW.device, dtype=latents_BCHW.dtype)
-                if self.latent_mean is not None
-                else 0
-            )
-            latent_var = (
-                self.latent_var.to(latents_BCHW.device, dtype=latents_BCHW.dtype)
-                if self.latent_var is not None
-                else 1
-            )
-            latents_BCHW = (latents_BCHW - latent_mean) / torch.sqrt(latent_var + 1e-5)
+            if latents.ndim == 2:
+                mean_shape = (1, self.latent_dim)
+                variance_shape = (1, self.latent_dim)
+            elif latents.ndim == 3:
+                mean_shape = (1, 1, self.latent_dim)
+                variance_shape = (1, 1, self.latent_dim)
+            else:
+                mean_shape = (
+                    self.latent_mean.shape
+                    if self.latent_mean is not None
+                    else (1, self.latent_dim, 1, 1)
+                )
+                variance_shape = (
+                    self.latent_var.shape
+                    if self.latent_var is not None
+                    else (1, self.latent_dim, 1, 1)
+                )
+            latent_mean = self.latent_mean
+            if latent_mean is not None:
+                latent_mean = latent_mean.to(latents.device, dtype=latents.dtype)
+                if latents.ndim < 4 and latent_mean.ndim == 4:
+                    latent_mean = latent_mean.mean(dim=(2, 3))
+                latent_mean = latent_mean.reshape(mean_shape)
+            else:
+                latent_mean = 0
+            latent_var = self.latent_var
+            if latent_var is not None:
+                latent_var = latent_var.to(latents.device, dtype=latents.dtype)
+                if latents.ndim < 4 and latent_var.ndim == 4:
+                    latent_var = latent_var.mean(dim=(2, 3))
+                latent_var = latent_var.reshape(variance_shape)
+            else:
+                latent_var = 1
+            latents = (latents - latent_mean) / torch.sqrt(latent_var + 1e-5)
         if add_noise and self.noise_tau > 0:
+            if latents.ndim == 4:
+                noise_shape = (latents.shape[0], 1, 1, 1)
+            elif latents.ndim == 3:
+                noise_shape = (latents.shape[0], 1, 1)
+            else:
+                noise_shape = (1, 1)
             noise_scale = self.noise_tau * torch.rand(
-                (latents_BCHW.shape[0], 1, 1, 1),
-                device=latents_BCHW.device,
-                dtype=latents_BCHW.dtype,
+                noise_shape,
+                device=latents.device,
+                dtype=latents.dtype,
             )
-            latents_BCHW = latents_BCHW + noise_scale * torch.randn_like(latents_BCHW)
-        return latents_BCHW
+            latents = latents + noise_scale * torch.randn_like(latents)
+        if return_grid_thw:
+            if self.last_grid_thw is None:
+                if latents.ndim == 4:
+                    self.last_grid_thw = torch.tensor(
+                        [[1, latents.shape[-2], latents.shape[-1]]],
+                        dtype=torch.long,
+                    )
+                else:
+                    raise ValueError(
+                        "return_grid_thw requires Qwen grid metadata for token latents"
+                    )
+            return latents, self.last_grid_thw.to(latents.device)
+        return latents
 
 
 __all__ = ["RAEEncoderConfig", "FrozenRAEEncoder"]

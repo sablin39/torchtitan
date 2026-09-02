@@ -9,14 +9,13 @@ from torchtitan.components.data import (
 from torchtitan.components.loss import MSELoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import (
-    default_adamw,
     LRSchedulersContainer,
     OptimizersContainer,
     ParamGroupConfig,
 )
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.protocols.model_spec import ModelSpec
-from .data import RAEImageCollator, RAEImageProcessor
+from .data import RAEImageCollator, RAEImageProcessor, RAEQwenCollator, RAEQwenProcessor
 from .discriminator import RAEFeatureDiscriminator
 from .encoder import RAEEncoderConfig
 from .model import RAEDecoder
@@ -24,7 +23,9 @@ from .parallelize import parallelize_rae
 from .trainer import RAEGANAugmentConfig, RAEGANConfig, RAEStage1Trainer
 
 
-def model_registry(flavor: str = "base") -> ModelSpec:
+def model_registry(
+    flavor: str = "base", *, attention_backend: str = "sdpa"
+) -> ModelSpec:
     if flavor not in {"base", "debug"}:
         raise ValueError(f"Unknown RAE flavor: {flavor}")
     debug = flavor == "debug"
@@ -36,7 +37,10 @@ def model_registry(flavor: str = "base") -> ModelSpec:
         num_layers=2 if debug else 8,
         num_heads=4 if debug else 16,
         intermediate_size=128 if debug else 2048,
-        use_dmuon=False,
+        attention_backend=attention_backend,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        use_dmuon=debug,
     )
     return ModelSpec(
         name="rae",
@@ -50,21 +54,38 @@ def model_registry(flavor: str = "base") -> ModelSpec:
     )
 
 
-def _image_dataloader(*, image_size: int, batch_size: int) -> GrainDataLoader.Config:
+def _image_dataloader(
+    *,
+    image_size: int | None,
+    batch_size: int,
+    qwen_model_name: str | None = None,
+) -> GrainDataLoader.Config:
     dataset = SingleDatasetConfig(
         source=HuggingFaceStreamingSource.Config(
             path="tests/assets/cc12m_test",
             split="train",
             load_dataset_kwargs={"data_files": {"train": "*.tar"}},
         ),
-        processor=RAEImageProcessor.Config(
-            image_size=image_size,
-            image_key="jpg",
+        processor=(
+            RAEQwenProcessor.Config(
+                model_name=qwen_model_name,
+                image_key="jpg",
+                image_size=image_size,
+            )
+            if qwen_model_name is not None
+            else RAEImageProcessor.Config(
+                image_size=image_size,
+                image_key="jpg",
+            )
         ),
     )
     return GrainDataLoader.Config(
         dataset=dataset,
-        collator=RAEImageCollator.Config(batch_size=batch_size),
+        collator=(
+            RAEQwenCollator.Config(batch_size=batch_size, media_kind="image")
+            if qwen_model_name is not None
+            else RAEImageCollator.Config(batch_size=batch_size)
+        ),
         repeat=True,
         shuffle=True,
     )
@@ -90,15 +111,19 @@ def _dmuon(lr: float) -> OptimizersContainer.Config:
 
 
 def rae_stage1_debug() -> RAEStage1Trainer.Config:
-    image_size = 32
+    image_size = 256
     batch_size = 2
-    return RAEStage1Trainer.Config(
+    config = RAEStage1Trainer.Config(
         hf_assets_path="./tests/assets/tokenizer",
-        model_spec=model_registry("debug"),
+        model_spec=model_registry("debug", attention_backend="varlen"),
         loss=MSELoss.Config(),
         metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=_image_dataloader(image_size=image_size, batch_size=batch_size),
-        optimizer=default_adamw(lr=2e-4, weight_decay=0.0),
+        dataloader=_image_dataloader(
+            image_size=None,
+            batch_size=batch_size,
+            qwen_model_name="~/models/Qwen3.5-0.8B",
+        ),
+        optimizer=_dmuon(2e-4),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=1),
         training=TrainingConfig(
             num_tokens_per_microbatch_per_dp_rank=batch_size,
@@ -114,13 +139,22 @@ def rae_stage1_debug() -> RAEStage1Trainer.Config:
             data_parallel_replicate_degree=1,
         ),
         checkpoint=CheckpointManager.Config(enable=False),
-        encoder=RAEEncoderConfig(kind="fixed", latent_dim=32, image_size=image_size),
+        encoder=RAEEncoderConfig(
+            kind="qwen",
+            name="~/models/Qwen3.5-0.8B",
+            latent_dim=1024,
+            image_size=image_size,
+            merge_size=2,
+        ),
         gan=RAEGANConfig(
             discriminator_start_step=0,
             discriminator_update_start_step=0,
             perceptual_start_step=0,
         ),
     )
+    config.model_spec.model.latent_dim = 1024
+    config.model_spec.model.image_size = image_size // 2
+    return config
 
 
 def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
@@ -137,7 +171,11 @@ def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
         layer_indices=(),
         merge_size=2,
     )
-    config.dataloader = _image_dataloader(image_size=256, batch_size=1)
+    config.dataloader = _image_dataloader(
+        image_size=None,
+        batch_size=1,
+        qwen_model_name="~/models/Qwen3.5-0.8B",
+    )
     config.training = TrainingConfig(
         num_tokens_per_microbatch_per_dp_rank=1,
         max_context_length=1,
@@ -160,10 +198,9 @@ def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
     )
     config.discriminator = RAEFeatureDiscriminator.Config(
         feature_channels=1024,
-        backbone_kind="hf_dinodisc",
-        dino_model_path="~/models/dinov3-vitl16-pretrain-lvd1689m",
-        dino_key_depths=(5, 11, 17, 23),
-        image_size=128,
+        backbone_kind="hf",
+        hf_model_path="~/models/dinov3-vitl16-pretrain-lvd1689m",
+        hf_key_depths=(5, 11, 17, 23),
     )
     config.parallelism = ParallelismConfig(data_parallel_shard_degree=-1)
     config.checkpoint = CheckpointManager.Config(enable=True, interval=1000)

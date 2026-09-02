@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +27,10 @@ from .discriminator import (
     RAEPerceptualLoss,
 )
 from .encoder import FrozenRAEEncoder, RAEEncoderConfig
+from .metrics import log_stage1_metrics
+
+
+ImageBatch = torch.Tensor | list[torch.Tensor]
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,7 +380,9 @@ class RAEStage1Trainer(Trainer):
             squared_norm = squared_norm + stats.total_norm.float().square()
         return squared_norm.sqrt()
 
-    def _next_images(self, data_iterator: Iterator) -> torch.Tensor:
+    def _next_images(
+        self, data_iterator: Iterator
+    ) -> tuple[ImageBatch, Mapping[str, Any] | None]:
         try:
             input_dict, labels = next(data_iterator)
         except DataloaderExhaustedError:
@@ -386,9 +392,84 @@ class RAEStage1Trainer(Trainer):
         self.ntokens_seen += labels.numel()
         self.n_valid_tokens_seen += labels.numel()
         self.n_nonpad_tokens_seen += labels.numel()
-        return input_dict["input"].to(self.device, non_blocking=True)
+        images = input_dict["input"]
+        encoder_input: Mapping[str, Any] | None = None
+        if "media" in input_dict:
+            media = input_dict["media"]
+            if not isinstance(media, (list, tuple)):
+                raise ValueError("RAE Qwen media must be a list of BTCHW tensors")
+            image_items = []
+            for media_item in media:
+                if media_item.ndim != 5 or media_item.shape[0] != 1:
+                    raise ValueError("RAE Qwen media must contain one BTCHW item")
+                if media_item.shape[1] != 1:
+                    raise ValueError(
+                        "RAE Stage 1 image training accepts only one-frame media"
+                    )
+                image_items.append(media_item[0, 0])
+            images = image_items
+            encoder_input = {
+                name: value
+                for name, value in input_dict.items()
+                if torch.is_tensor(value) or name == "media_kind"
+            }
+        if isinstance(images, torch.Tensor):
+            if images.ndim == 5:
+                if images.shape[1] != 1:
+                    raise ValueError(
+                        "RAE Stage 1 image training accepts only one-frame media"
+                    )
+                images = images[:, 0]
+            if images.ndim != 4:
+                raise ValueError("RAE Stage 1 input must have BCHW shape")
+            images = images.to(self.device, non_blocking=True)
+        elif isinstance(images, (list, tuple)):
+            images = [image.to(self.device, non_blocking=True) for image in images]
+            if not images or any(image.ndim != 3 for image in images):
+                raise ValueError("RAE Stage 1 image lists must contain CHW tensors")
+        else:
+            raise ValueError("RAE Stage 1 input must be a BCHW tensor or CHW list")
+        if encoder_input is not None:
+            encoder_input = {
+                name: value.to(self.device, non_blocking=True)
+                if torch.is_tensor(value)
+                else value
+                for name, value in encoder_input.items()
+            }
+        return images, encoder_input
 
-    def _supervision_images(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+    def _supervision_images(
+        self,
+        images_BCHW: ImageBatch,
+        target_sizes: list[tuple[int, int]] | None = None,
+    ) -> ImageBatch:
+        if isinstance(images_BCHW, (list, tuple)):
+            image_items = list(images_BCHW)
+            if target_sizes is None:
+                target_sizes = [
+                    (self.encoder.supervision_image_size,) * 2 for _ in image_items
+                ]
+            if len(target_sizes) != len(image_items):
+                raise ValueError("Supervision target sizes must match image count")
+            return [
+                self._resize_supervision_image(image, size)
+                for image, size in zip(image_items, target_sizes, strict=True)
+            ]
+        if images_BCHW.ndim == 5:
+            batch_size, num_frames, channels, height, width = images_BCHW.shape
+            flattened = images_BCHW.reshape(
+                batch_size * num_frames, channels, height, width
+            )
+            supervised = self._supervision_images(flattened)
+            return supervised.reshape(
+                batch_size,
+                num_frames,
+                channels,
+                supervised.shape[-2],
+                supervised.shape[-1],
+            )
+        if images_BCHW.ndim != 4:
+            raise ValueError("RAE supervision expects BCHW or BTCHW images")
         target_size = self.encoder.supervision_image_size
         if images_BCHW.shape[-2:] == (target_size, target_size):
             return images_BCHW
@@ -400,6 +481,90 @@ class RAEStage1Trainer(Trainer):
             antialias=True,
         ).clamp(0, 1)
 
+    @staticmethod
+    def _resize_supervision_image(
+        image_CHW: torch.Tensor, target_size: tuple[int, int]
+    ) -> torch.Tensor:
+        if image_CHW.ndim != 3:
+            raise ValueError("RAE supervision image lists must contain CHW tensors")
+        if image_CHW.shape[-2:] == target_size:
+            return image_CHW
+        return (
+            F.interpolate(
+                image_CHW.unsqueeze(0),
+                size=target_size,
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+            .squeeze(0)
+            .clamp(0, 1)
+        )
+
+    @staticmethod
+    def _image_items(images: ImageBatch) -> list[torch.Tensor]:
+        if isinstance(images, torch.Tensor):
+            if images.ndim != 4:
+                raise ValueError("RAE image batches must have BCHW shape")
+            return list(images.unbind(0))
+        return list(images)
+
+    def _encode_decode(
+        self,
+        decoder: nn.Module,
+        images: ImageBatch,
+        encoder_input: Mapping[str, Any] | None,
+        *,
+        add_noise: bool,
+    ) -> list[torch.Tensor]:
+        encoder_source = encoder_input if encoder_input is not None else images
+        encoded = self.encoder(
+            encoder_source,
+            add_noise=add_noise,
+            return_grid_thw=True,
+        )
+        if not isinstance(encoded, tuple):
+            raise RuntimeError("RAE encoder must return grid metadata for Stage 1")
+        latents, grid_thw = encoded
+        decoded = decoder(
+            latents,
+            grid_thw=grid_thw,
+            fps=self.encoder.last_fps,
+            temporal_start=self.encoder.last_temporal_start
+            if self.encoder.last_temporal_start is not None
+            else 0.0,
+        )
+        if latents.ndim == 2:
+            return decoder.unpatchify_packed(
+                decoded,
+                grid_thw,
+                patch_size=decoder.patch_size,
+            )
+        return self._image_items(decoded)
+
+    def _perceptual_loss(
+        self,
+        real_items: list[torch.Tensor],
+        fake_items: list[torch.Tensor],
+    ) -> torch.Tensor:
+        losses = [
+            self.perceptual_loss(real_image.unsqueeze(0), fake_image.unsqueeze(0))
+            for real_image, fake_image in zip(real_items, fake_items, strict=True)
+        ]
+        return torch.stack(losses).mean()
+
+    def _augment_images(self, images: list[torch.Tensor]) -> list[torch.Tensor]:
+        grouped: dict[tuple[int, int], list[int]] = {}
+        for index, image in enumerate(images):
+            grouped.setdefault(tuple(image.shape[-2:]), []).append(index)
+        augmented = list(images)
+        for indices in grouped.values():
+            group = torch.stack([images[index] for index in indices])
+            group = self.discriminator_augmentation(group)
+            for group_index, image_index in enumerate(indices):
+                augmented[image_index] = group[group_index]
+        return augmented
+
     def train_step(self, data_iterator: Iterator) -> None:
         decoder = self.model_parts[0]
         gan = self.config.gan
@@ -410,7 +575,7 @@ class RAEStage1Trainer(Trainer):
         )
         use_perceptual = step >= gan.perceptual_start_step and gan.perceptual_weight > 0
         num_microbatches = self.gradient_accumulation_steps
-        images_batches: list[torch.Tensor] = []
+        images_batches: list[ImageBatch] = []
 
         self.optimizers.zero_grad(set_to_none=True)
         self.disc_optimizer.zero_grad(set_to_none=True)
@@ -420,22 +585,40 @@ class RAEStage1Trainer(Trainer):
         adaptive_metric = None
         generator_logits_metric = None
         for _ in range(num_microbatches):
-            images_BCHW = self._next_images(data_iterator)
-            images_batches.append(images_BCHW)
-            target_BCHW = self._supervision_images(images_BCHW)
-            real_normed_BCHW = target_BCHW * 2.0 - 1.0
+            images, encoder_input = self._next_images(data_iterator)
+            images_batches.append(images)
+            image_items = self._image_items(images)
             with torch.autocast(
                 device_type=self.device.type,
                 dtype=torch.bfloat16,
                 enabled=self.device.type == "cuda"
                 and self.config.training.dtype == "bfloat16",
             ):
-                latents_BCHW = self.encoder(images_BCHW, add_noise=True)
-                recon_BCHW = decoder(latents_BCHW)
-                recon_normed_BCHW = recon_BCHW * 2.0 - 1.0
-                reconstruction_loss = F.l1_loss(recon_BCHW, target_BCHW)
+                recon_items = self._encode_decode(
+                    decoder,
+                    images,
+                    encoder_input,
+                    add_noise=True,
+                )
+                target_sizes = [
+                    tuple(reconstruction.shape[-2:]) for reconstruction in recon_items
+                ]
+                target_items = self._image_items(
+                    self._supervision_images(images, target_sizes)
+                )
+                reconstruction_loss = torch.stack(
+                    [
+                        F.l1_loss(reconstruction, target)
+                        for reconstruction, target in zip(
+                            recon_items, target_items, strict=True
+                        )
+                    ]
+                ).mean()
                 perceptual_loss = (
-                    self.perceptual_loss(real_normed_BCHW, recon_normed_BCHW)
+                    self._perceptual_loss(
+                        [target * 2.0 - 1.0 for target in target_items],
+                        [reconstruction * 2.0 - 1.0 for reconstruction in recon_items],
+                    )
                     if use_perceptual
                     else reconstruction_loss.new_zeros(())
                 )
@@ -443,10 +626,10 @@ class RAEStage1Trainer(Trainer):
                     reconstruction_loss + gan.perceptual_weight * perceptual_loss
                 )
                 if use_gan:
-                    fake_augmented_BCHW = self.discriminator_augmentation(
-                        recon_normed_BCHW
+                    fake_augmented = self._augment_images(
+                        [reconstruction * 2.0 - 1.0 for reconstruction in recon_items]
                     )
-                    logits_fake = self.discriminator_train(fake_augmented_BCHW)
+                    logits_fake = self.discriminator_train(fake_augmented)
                     generator_logits_metric = logits_fake.detach().mean()
                     adversarial_loss = gan_generator_loss(
                         logits_fake, gan.generator_loss
@@ -486,12 +669,13 @@ class RAEStage1Trainer(Trainer):
         self.lr_schedulers.step()
         self._update_ema()
 
-        images_BCHW = torch.cat(images_batches, dim=0)
-        target_BCHW = self._supervision_images(images_BCHW)
-        real_normed_BCHW = target_BCHW * 2.0 - 1.0
-        disc_loss = images_BCHW.new_zeros(())
-        disc_grad_norm = images_BCHW.new_zeros(())
-        discriminator_real_metric = discriminator_fake_metric = images_BCHW.new_zeros(
+        image_items = [
+            image for batch in images_batches for image in self._image_items(batch)
+        ]
+        metric_source = image_items[0]
+        disc_loss = metric_source.new_zeros(())
+        disc_grad_norm = metric_source.new_zeros(())
+        discriminator_real_metric = discriminator_fake_metric = metric_source.new_zeros(
             ()
         )
         if train_discriminator:
@@ -505,15 +689,33 @@ class RAEStage1Trainer(Trainer):
                     enabled=self.device.type == "cuda"
                     and self.config.training.dtype == "bfloat16",
                 ):
-                    fake_BCHW = decoder(self.encoder(images_BCHW)).detach()
-                fake_normed_BCHW = (fake_BCHW * 2.0 - 1.0).clamp(-1.0, 1.0)
-                fake_normed_BCHW = (
-                    torch.round((fake_normed_BCHW + 1.0) * 127.5) / 127.5 - 1.0
+                    fake_items = [
+                        fake.detach()
+                        for fake in self._encode_decode(
+                            decoder,
+                            image_items,
+                            None,
+                            add_noise=False,
+                        )
+                    ]
+                target_sizes = [tuple(fake.shape[-2:]) for fake in fake_items]
+                real_items = self._image_items(
+                    self._supervision_images(image_items, target_sizes)
                 )
-                fake_augmented_BCHW = self.discriminator_augmentation(fake_normed_BCHW)
-                real_augmented_BCHW = self.discriminator_augmentation(real_normed_BCHW)
-                logits_fake = self.discriminator_train(fake_augmented_BCHW)
-                logits_real = self.discriminator_train(real_augmented_BCHW)
+                fake_normed_items = [
+                    (fake * 2.0 - 1.0).clamp(-1.0, 1.0) for fake in fake_items
+                ]
+                fake_normed_items = [
+                    torch.round((fake + 1.0) * 127.5) / 127.5 - 1.0
+                    for fake in fake_normed_items
+                ]
+                real_normed_items = [real * 2.0 - 1.0 for real in real_items]
+                logits_fake = self.discriminator_train(
+                    self._augment_images(fake_normed_items)
+                )
+                logits_real = self.discriminator_train(
+                    self._augment_images(real_normed_items)
+                )
                 discriminator_fake_metric = logits_fake.detach().mean()
                 discriminator_real_metric = logits_real.detach().mean()
                 disc_loss = gan_discriminator_loss(
@@ -529,19 +731,22 @@ class RAEStage1Trainer(Trainer):
             self.discriminator.set_head_requires_grad(False)
 
         if self.metrics_processor.should_log(self.step):
-            self._log_stage1_metrics(
-                reconstruction_metric,
-                perceptual_metric,
-                adversarial_metric,
-                disc_loss,
-                adaptive_metric,
-                decoder_grad_norm,
-                disc_grad_norm,
-                generator_logits_metric
-                if generator_logits_metric is not None
-                else images_BCHW.new_zeros(()),
-                discriminator_real_metric,
-                discriminator_fake_metric,
+            log_stage1_metrics(
+                self.step,
+                (
+                    reconstruction_metric,
+                    perceptual_metric,
+                    adversarial_metric,
+                    disc_loss,
+                    adaptive_metric,
+                    decoder_grad_norm,
+                    disc_grad_norm,
+                    generator_logits_metric
+                    if generator_logits_metric is not None
+                    else metric_source.new_zeros(()),
+                    discriminator_real_metric,
+                    discriminator_fake_metric,
+                ),
             )
 
     @staticmethod
@@ -567,19 +772,6 @@ class RAEStage1Trainer(Trainer):
             .clamp(0, max_weight)
             .detach()
         )
-
-    def _log_stage1_metrics(self, *losses: torch.Tensor) -> None:
-        values = [float(loss.detach().item()) for loss in losses]
-        if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
-            from torchtitan.tools.logging import logger
-
-            logger.info(
-                "[RAE Stage 1 | step %d] recon=%.5f perceptual=%.5f "
-                "gan=%.5f disc=%.5f adaptive=%.5f decoder_grad=%.5f "
-                "disc_grad=%.5f gen_logit=%.5f real_logit=%.5f fake_logit=%.5f",
-                self.step,
-                *values,
-            )
 
 
 __all__ = ["RAEStage1Trainer", "RAEGANConfig"]

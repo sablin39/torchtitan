@@ -11,6 +11,7 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import (
     disable_fsdp_gradient_division,
     resolve_fsdp_mesh,
@@ -30,8 +31,6 @@ def parallelize_rae(
     dump_folder: str,
 ) -> RAEDecoder:
     del ac_config, dump_folder
-    if compile_config.enable and "model" in compile_config.components:
-        raise NotImplementedError("RAE Stage 1 model compilation is not supported yet")
     if parallel_dims.spmd_backend != "spmd_types":
         raise ValueError("RAE Stage 1 parallelization requires the spmd_types backend")
     if parallelism.tensor_parallel_degree > 1:
@@ -40,6 +39,13 @@ def parallelize_rae(
         raise NotImplementedError("RAE Stage 1 does not support context parallelism")
     if parallelism.pipeline_parallel_degree > 1:
         raise NotImplementedError("RAE Stage 1 does not support pipeline parallelism")
+
+    if compile_config.enable and "model" in compile_config.components:
+        apply_compile(
+            model,
+            compile_config=compile_config,
+            parallel_dims=parallel_dims,
+        )
 
     dmuon = None
     if model._dmuon_enabled:

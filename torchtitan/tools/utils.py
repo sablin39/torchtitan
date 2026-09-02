@@ -34,8 +34,9 @@ def has_cuda_capability(major: int, minor: int) -> bool:
 
 
 def get_cuda_flash_attention_impl() -> str | None:
-    """Return the FlashAttention implementation for the current CUDA architecture."""
-    # Blackwell (SM 10.0) and newer use FA4; Hopper (SM 9.0) uses FA3.
+    """Return the preferred registered FlashAttention implementation."""
+    # Blackwell (SM 10.0) and newer prefer FA4; VarlenAttention restores the
+    # default FA2 implementation when a newer device is not supported by FA4.
     if has_cuda_capability(10, 0):
         return "FA4"
     if has_cuda_capability(9, 0):

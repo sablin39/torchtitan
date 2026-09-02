@@ -41,6 +41,63 @@ class TestPackedVarlenMetadata(unittest.TestCase):
 
 
 class TestPackedVarlenAttention(unittest.TestCase):
+    def test_sm120_restores_default_fa2(self):
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(12, 0)),
+            patch(
+                "torchtitan.models.common.attention.restore_flash_attention_impl"
+            ) as restore,
+            patch(
+                "torchtitan.models.common.attention.activate_flash_attention_impl"
+            ) as activate,
+        ):
+            VarlenAttention.Config().build()
+
+        activate.assert_not_called()
+        restore.assert_called_once_with(_raise_warn=False)
+
+    def test_custom_flash_activation_failure_restores_default_fa2(self):
+        with (
+            patch(
+                "torchtitan.tools.utils.get_cuda_flash_attention_impl",
+                return_value="FA3",
+            ),
+            patch(
+                "torchtitan.models.common.attention.activate_flash_attention_impl",
+                side_effect=RuntimeError("FA3 unavailable"),
+            ) as activate,
+            patch(
+                "torchtitan.models.common.attention.restore_flash_attention_impl"
+            ) as restore,
+        ):
+            VarlenAttention.Config().build()
+
+        activate.assert_called_once_with("FA3")
+        restore.assert_called_once_with(_raise_warn=False)
+
+    def test_sm90_selection_is_not_stuck_after_sm120_fallback(self):
+        capability = [(12, 0)]
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch(
+                "torch.cuda.get_device_capability",
+                side_effect=lambda: capability[0],
+            ),
+            patch(
+                "torchtitan.models.common.attention.restore_flash_attention_impl"
+            ) as restore,
+            patch(
+                "torchtitan.models.common.attention.activate_flash_attention_impl"
+            ) as activate,
+        ):
+            VarlenAttention.Config().build()
+            capability[0] = (9, 0)
+            VarlenAttention.Config().build()
+
+        restore.assert_called_once_with(_raise_warn=False)
+        activate.assert_called_once_with("FA3")
+
     def test_gqa_preserves_td_shape(self):
         torch.manual_seed(42)
         num_tokens, dim, num_heads, head_dim = 6, 8, 2, 4

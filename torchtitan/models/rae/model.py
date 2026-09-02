@@ -1,16 +1,29 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
 
+from torchtitan.models.common.attention import VarlenAttention, VarlenMetadata
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import LayerNorm
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleList
+from .layout import (
+    flatten_latents,
+    prepend_cls_positions,
+    unpatchify_batched,
+    unpatchify_packed,
+)
+
+from .packing import (
+    create_rae_packed_attention_mask,
+    create_rae_padding_mask,
+    create_rae_varlen_metadata,
+)
+from .position import Cosmos3DRotaryPositionEmbedding
 
 # Tensor suffixes: B=batch, L=tokens, D=hidden, N=heads, H=head width,
 # C=channels, Y/X=patch-grid axes, and P/Q=within-patch axes.
@@ -22,6 +35,12 @@ class RAEAttention(Module):
         hidden_size: int
         num_heads: int
         qkv_bias: bool = True
+        attention_backend: Literal["sdpa", "varlen"] = "sdpa"
+        rope_theta: float = 10000.0
+        rope_scale: tuple[float, float, float] = (2.0, 1.0, 1.0)
+        spatial_merge_size: int = 2
+        temporal_patch_size: int = 2
+        reference_fps: float = 24.0
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -29,6 +48,11 @@ class RAEAttention(Module):
             raise ValueError("RAE hidden_size must be divisible by num_heads")
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_size // config.num_heads
+        self.attention_backend = config.attention_backend
+        if self.attention_backend not in {"sdpa", "varlen"}:
+            raise ValueError(
+                f"Unsupported RAE attention backend: {self.attention_backend}"
+            )
         self.qkv = Linear.Config(
             in_features=config.hidden_size,
             out_features=3 * config.hidden_size,
@@ -39,15 +63,85 @@ class RAEAttention(Module):
             out_features=config.hidden_size,
             bias=True,
         ).build()
+        self.rope = Cosmos3DRotaryPositionEmbedding.Config(
+            head_dim=self.head_dim,
+            theta=config.rope_theta,
+            rope_scale=config.rope_scale,
+            spatial_merge_size=config.spatial_merge_size,
+            temporal_patch_size=config.temporal_patch_size,
+            reference_fps=config.reference_fps,
+        ).build()
+        self.varlen_attention = (
+            VarlenAttention.Config(window_size=(-1, -1)).build()
+            if self.attention_backend == "varlen"
+            else None
+        )
 
-    def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
-        batch, length, hidden = x_BLD.shape
-        qkv_BL3NH: torch.Tensor = self.qkv(x_BLD).view(
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        positions: torch.Tensor | None = None,
+        attention_masks: torch.Tensor | VarlenMetadata | None = None,
+    ) -> torch.Tensor:
+        if x.ndim == 2:
+            if self.attention_backend == "varlen":
+                if not isinstance(attention_masks, VarlenMetadata):
+                    raise ValueError(
+                        "RAE varlen attention requires VarlenMetadata for packed latents"
+                    )
+            elif isinstance(attention_masks, VarlenMetadata):
+                raise ValueError(
+                    "VarlenMetadata requires RAE attention_backend='varlen'"
+                )
+            token_count, hidden = x.shape
+            qkv_T3NH: torch.Tensor = self.qkv(x).view(
+                token_count, 3, self.num_heads, self.head_dim
+            )
+            q_TNH, k_TNH, v_TNH = qkv_T3NH.unbind(dim=1)
+            if positions is not None:
+                q_TNH, k_TNH = self.rope(q_TNH, k_TNH, positions)
+            if self.attention_backend == "varlen":
+                assert self.varlen_attention is not None
+                out_TNH = self.varlen_attention(
+                    q_TNH,
+                    k_TNH,
+                    v_TNH,
+                    attention_masks=attention_masks,
+                    scale=self.head_dim**-0.5,
+                )
+            else:
+                out_NTH = F.scaled_dot_product_attention(
+                    q_TNH.transpose(0, 1),
+                    k_TNH.transpose(0, 1),
+                    v_TNH.transpose(0, 1),
+                    attn_mask=attention_masks,
+                    scale=self.head_dim**-0.5,
+                )
+                out_TNH = out_NTH.transpose(0, 1)
+            return self.proj(out_TNH.reshape(token_count, hidden))
+
+        if x.ndim != 3:
+            raise ValueError("RAE attention input must have shape (B, L, D) or (T, D)")
+        if self.attention_backend == "varlen":
+            raise ValueError(
+                "RAE varlen attention consumes packed (T, D) latents; flatten the "
+                "batch and provide VarlenMetadata"
+            )
+        batch, length, hidden = x.shape
+        qkv_BL3NH: torch.Tensor = self.qkv(x).view(
             batch, length, 3, self.num_heads, self.head_dim
         )
-        qkv_3BNLH = qkv_BL3NH.permute(2, 0, 3, 1, 4)
-        q_BNLH, k_BNLH, v_BNLH = qkv_3BNLH.unbind(0)
-        out_BNLH = F.scaled_dot_product_attention(q_BNLH, k_BNLH, v_BNLH)
+        q_BLNH, k_BLNH, v_BLNH = qkv_BL3NH.unbind(dim=2)
+        if positions is not None:
+            q_BLNH, k_BLNH = self.rope(q_BLNH, k_BLNH, positions)
+        out_BNLH = F.scaled_dot_product_attention(
+            q_BLNH.transpose(1, 2),
+            k_BLNH.transpose(1, 2),
+            v_BLNH.transpose(1, 2),
+            attn_mask=attention_masks,
+            scale=self.head_dim**-0.5,
+        )
         out_BLD = out_BNLH.transpose(1, 2).reshape(batch, length, hidden)
         return self.proj(out_BLD)
 
@@ -82,6 +176,12 @@ class RAEBlock(Module):
         num_heads: int
         intermediate_size: int
         norm_eps: float = 1e-6
+        attention_backend: Literal["sdpa", "varlen"] = "sdpa"
+        rope_theta: float = 10000.0
+        rope_scale: tuple[float, float, float] = (2.0, 1.0, 1.0)
+        spatial_merge_size: int = 2
+        temporal_patch_size: int = 2
+        reference_fps: float = 24.0
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -92,6 +192,12 @@ class RAEBlock(Module):
         self.attention = RAEAttention.Config(
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
+            attention_backend=config.attention_backend,
+            rope_theta=config.rope_theta,
+            rope_scale=config.rope_scale,
+            spatial_merge_size=config.spatial_merge_size,
+            temporal_patch_size=config.temporal_patch_size,
+            reference_fps=config.reference_fps,
         ).build()
         self.norm2 = LayerNorm.Config(
             normalized_shape=config.hidden_size,
@@ -102,18 +208,31 @@ class RAEBlock(Module):
             intermediate_size=config.intermediate_size,
         ).build()
 
-    def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
-        x_BLD = x_BLD + self.attention(self.norm1(x_BLD))
-        return x_BLD + self.feed_forward(self.norm2(x_BLD))
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        positions: torch.Tensor | None = None,
+        attention_masks: torch.Tensor | VarlenMetadata | None = None,
+    ) -> torch.Tensor:
+        x = x + self.attention(
+            self.norm1(x),
+            positions=positions,
+            attention_masks=attention_masks,
+        )
+        return x + self.feed_forward(self.norm2(x))
 
 
 class RAEDecoder(BaseModel):
     """TorchTitan-native RAEv2 Stage 1 decoder.
 
-    The model consumes encoder latents in ``(B, C, H, W)`` format and returns
-    reconstructed images in ``(B, 3, image_size, image_size)`` format. The
-    encoder, GAN discriminator, and EMA copy intentionally live in the Stage 1
-    trainer so this model remains compatible with TorchTitan meta construction.
+    The model consumes legacy ``(B, C, H, W)`` latents, batched post-merger
+    ``(B, L, C)`` latents, or packed ``(T, C)`` latents. Batched inputs return
+    ``(B, 3, H, W)`` for images and ``(B, 3, T, H, W)`` for videos. Packed
+    inputs return patch logits; call :meth:`unpatchify_packed` to recover a
+    list of variable-size clips. The encoder, GAN discriminator, and EMA copy
+    intentionally live in the Stage 1 trainer so this model remains compatible
+    with TorchTitan meta construction.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -133,12 +252,26 @@ class RAEDecoder(BaseModel):
         intermediate_size: int = 2048
         norm_eps: float = 1e-6
         qkv_bias: bool = True
+        attention_backend: Literal["sdpa", "varlen"] = "sdpa"
+        rope_theta: float = 10000.0
+        rope_scale: tuple[float, float, float] = (2.0, 1.0, 1.0)
+        spatial_merge_size: int = 2
+        temporal_patch_size: int = 2
+        reference_fps: float = 24.0
         use_dmuon: bool = False
 
         def update_from_config(self, *, config, **kwargs) -> None:
             del kwargs
             if self.image_size % self.patch_size != 0:
                 raise ValueError("RAE image_size must be divisible by patch_size")
+            if self.attention_backend not in {"sdpa", "varlen"}:
+                raise ValueError(
+                    f"Unsupported RAE attention backend: {self.attention_backend}"
+                )
+            if self.spatial_merge_size <= 0 or self.temporal_patch_size <= 0:
+                raise ValueError("RAE patch factors must be positive")
+            if self.reference_fps <= 0:
+                raise ValueError("RAE reference_fps must be positive")
             if not self.layers:
                 self.layers = [
                     RAEBlock.Config(
@@ -146,6 +279,12 @@ class RAEDecoder(BaseModel):
                         num_heads=self.num_heads,
                         intermediate_size=self.intermediate_size,
                         norm_eps=self.norm_eps,
+                        attention_backend=self.attention_backend,
+                        rope_theta=self.rope_theta,
+                        rope_scale=self.rope_scale,
+                        spatial_merge_size=self.spatial_merge_size,
+                        temporal_patch_size=self.temporal_patch_size,
+                        reference_fps=self.reference_fps,
                     )
                     for _ in range(self.num_layers)
                 ]
@@ -166,6 +305,9 @@ class RAEDecoder(BaseModel):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
         self.num_patches = (config.image_size // config.patch_size) ** 2
+        self.spatial_merge_size = config.spatial_merge_size
+        self.temporal_patch_size = config.temporal_patch_size
+        self.reference_fps = config.reference_fps
         self.input_projection = Linear.Config(
             in_features=config.latent_dim,
             out_features=config.hidden_size,
@@ -173,11 +315,6 @@ class RAEDecoder(BaseModel):
         ).build()
         self.trainable_cls_token = torch.nn.Parameter(
             torch.zeros(1, 1, config.hidden_size)
-        )
-        self.register_buffer(
-            "decoder_pos_embed",
-            torch.empty(1, self.num_patches + 1, config.hidden_size),
-            persistent=True,
         )
         self.layers = ModuleList([layer.build() for layer in config.layers])
         self.decoder_norm = LayerNorm.Config(
@@ -194,88 +331,90 @@ class RAEDecoder(BaseModel):
     def reset_parameters(self) -> None:
         torch.nn.init.normal_(self.trainable_cls_token, std=0.02)
 
-    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
-        device = buffer_device or self.decoder_pos_embed.device
-        if device.type == "meta":
-            device = torch.device("cpu")
-        grid_size = int(math.sqrt(self.num_patches))
-        if grid_size * grid_size != self.num_patches:
-            raise ValueError("RAE decoder requires a square number of output patches")
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(grid_size, device=device, dtype=torch.float32),
-            torch.arange(grid_size, device=device, dtype=torch.float32),
-            indexing="ij",
-        )
-        half = self.decoder_pos_embed.shape[-1] // 4
-        if half == 0 or self.decoder_pos_embed.shape[-1] % 4:
-            raise ValueError("RAE decoder hidden_size must be divisible by four")
-        frequency = torch.arange(half, device=device, dtype=torch.float32)
-        frequency = 1.0 / (10000 ** (frequency / half))
-        angles_y = grid_y.reshape(-1, 1) * frequency.reshape(1, -1)
-        angles_x = grid_x.reshape(-1, 1) * frequency.reshape(1, -1)
-        patch_pos = torch.cat(
-            [angles_y.sin(), angles_y.cos(), angles_x.sin(), angles_x.cos()], dim=1
-        )
-        cls_pos = torch.zeros(1, self.decoder_pos_embed.shape[-1], device=device)
-        self.decoder_pos_embed.copy_(
-            torch.cat([cls_pos, patch_pos], dim=0).unsqueeze(0)
+    @staticmethod
+    def unpatchify_packed(
+        patch_logits: torch.Tensor,
+        grid_thw: torch.Tensor,
+        *,
+        patch_size: int,
+    ) -> list[torch.Tensor]:
+        return unpatchify_packed(
+            patch_logits,
+            grid_thw,
+            patch_size=patch_size,
         )
 
-    def _flatten_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        if latents.ndim == 4:
-            batch, channels, _, _ = latents.shape
-            if channels != self.latent_dim:
-                raise ValueError(
-                    f"Expected latent channels {self.latent_dim}, got {channels}"
-                )
-            tokens_BLC = latents.flatten(2).transpose(1, 2)
-        elif latents.ndim == 3:
-            if latents.shape[-1] != self.latent_dim:
-                raise ValueError(
-                    f"Expected latent width {self.latent_dim}, got {latents.shape[-1]}"
-                )
-            tokens_BLC = latents
-        else:
-            raise ValueError("RAE latents must have shape (B, C, H, W) or (B, L, C)")
-        if tokens_BLC.shape[1] != self.num_patches:
-            side = int(math.sqrt(tokens_BLC.shape[1]))
-            if side * side != tokens_BLC.shape[1]:
-                raise ValueError("RAE latent token count must be a square")
-            target_side = int(math.sqrt(self.num_patches))
-            tokens_BLC = (
-                F.interpolate(
-                    tokens_BLC.transpose(1, 2).reshape(
-                        tokens_BLC.shape[0], self.latent_dim, side, side
-                    ),
-                    size=(target_side, target_side),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                .flatten(2)
-                .transpose(1, 2)
+    def forward(
+        self,
+        latents: torch.Tensor,
+        *,
+        grid_thw: torch.Tensor | None = None,
+        fps: torch.Tensor | float | None = None,
+        temporal_start: torch.Tensor | float = 0.0,
+        attention_masks: torch.Tensor | VarlenMetadata | None = None,
+    ) -> torch.Tensor:
+        tokens, grid, packed = flatten_latents(
+            latents,
+            grid_thw,
+            latent_dim=self.latent_dim,
+            num_patches=self.num_patches,
+        )
+        if packed:
+            if attention_masks is None:
+                sequence_lengths = grid.prod(dim=-1)
+                if self.config.attention_backend == "sdpa":
+                    attention_masks = create_rae_packed_attention_mask(
+                        sequence_lengths, device=tokens.device
+                    )
+                else:
+                    attention_masks = create_rae_varlen_metadata(
+                        sequence_lengths, device=tokens.device
+                    )
+            positions = self.layers[0].attention.rope.build_packed_positions(
+                grid,
+                fps=fps,
+                temporal_start=temporal_start,
             )
-        return tokens_BLC
+            hidden = self.input_projection(tokens)
+            for layer in self.layers:
+                hidden = layer(
+                    hidden,
+                    positions=positions,
+                    attention_masks=attention_masks,
+                )
+            return self.decoder_pred(self.decoder_norm(hidden))
 
-    def forward(self, latents: torch.Tensor) -> torch.Tensor:
-        tokens_BLD = self.input_projection(self._flatten_latents(latents))
-        cls_B1D = self.trainable_cls_token.expand(tokens_BLD.shape[0], -1, -1)
-        tokens_BLD = torch.cat([cls_B1D, tokens_BLD], dim=1)
-        tokens_BLD = tokens_BLD + self.decoder_pos_embed.to(tokens_BLD.dtype)
+        positions = self.layers[0].attention.rope.build_positions(
+            grid,
+            fps=fps,
+            temporal_start=temporal_start,
+        )
+        if positions.ndim == 2:
+            positions = positions.unsqueeze(0).expand(tokens.shape[0], -1, -1)
+        hidden = self.input_projection(tokens)
+        cls_B1D = self.trainable_cls_token.expand(hidden.shape[0], -1, -1)
+        hidden = torch.cat([cls_B1D, hidden], dim=1)
+        positions = prepend_cls_positions(positions)
         for layer in self.layers:
-            tokens_BLD = layer(tokens_BLD)
-        patch_logits_BLP = self.decoder_pred(self.decoder_norm(tokens_BLD[:, 1:]))
-        side = self.image_size // self.patch_size
-        patch_logits_BYXPQC = patch_logits_BLP.view(
-            patch_logits_BLP.shape[0],
-            side,
-            side,
-            self.patch_size,
-            self.patch_size,
-            3,
-        )
-        return patch_logits_BYXPQC.permute(0, 5, 1, 3, 2, 4).reshape(
-            patch_logits_BLP.shape[0], 3, self.image_size, self.image_size
+            hidden = layer(
+                hidden,
+                positions=positions,
+                attention_masks=attention_masks,
+            )
+        patch_logits = self.decoder_pred(self.decoder_norm(hidden[:, 1:]))
+        return unpatchify_batched(
+            patch_logits,
+            grid.view(-1, 3),
+            patch_size=self.patch_size,
         )
 
 
-__all__ = ["RAEDecoder", "RAEBlock", "RAEAttention", "RAEFeedForward"]
+__all__ = [
+    "RAEDecoder",
+    "RAEBlock",
+    "RAEAttention",
+    "RAEFeedForward",
+    "create_rae_padding_mask",
+    "create_rae_packed_attention_mask",
+    "create_rae_varlen_metadata",
+]

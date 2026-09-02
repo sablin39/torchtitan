@@ -24,6 +24,7 @@ from torch.distributed.tensor.experimental import local_map
 from torch.nn.attention import (
     activate_flash_attention_impl,
     current_flash_attention_impl,
+    restore_flash_attention_impl,
     sdpa_kernel,
     SDPBackend,
 )
@@ -44,6 +45,7 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
+from torchtitan.tools.logging import logger, warn_once
 from torchtitan.tools.utils import round_up
 
 
@@ -129,10 +131,32 @@ class VarlenAttention(Module):
 
         flash_attention_impl = get_cuda_flash_attention_impl()
         if (
+            flash_attention_impl == "FA4"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] > 10
+        ):
+            # The installed FA4 kernel accepts SM90 and SM100; newer GPUs use
+            # PyTorch's default FA2 implementation instead.
+            restore_flash_attention_impl(_raise_warn=False)
+            flash_attention_impl = None
+        if (
             flash_attention_impl is not None
             and current_flash_attention_impl() != flash_attention_impl
         ):
-            activate_flash_attention_impl(flash_attention_impl)
+            try:
+                activate_flash_attention_impl(flash_attention_impl)
+            except (ImportError, RuntimeError, ValueError) as error:
+                # A custom FA implementation can be unavailable at runtime even
+                # when its architecture selector matches. Restore PyTorch FA2 so
+                # varlen attention remains usable without a process-wide failure.
+                restore_flash_attention_impl(_raise_warn=False)
+                # Keep one diagnostic per implementation failure even when a
+                # model creates multiple attention layers.
+                warn_once(
+                    logger,
+                    f"Unable to activate {flash_attention_impl} for varlen attention; "
+                    f"using PyTorch default FA2 instead: {error}",
+                )
 
     def forward(
         self,
