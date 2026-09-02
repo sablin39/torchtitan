@@ -480,6 +480,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 )
             else:
                 if not config.checkpoint.create_seed_checkpoint:
+                    materialize_before_parallelize = getattr(
+                        model_spec, "materialize_before_parallelize", False
+                    )
+                    if materialize_before_parallelize:
+                        model.to_empty(device=init_device)
+                        with torch.no_grad():
+                            cast(BaseModel, model).init_weights(
+                                buffer_device=buffer_device
+                            )
                     # Skip parallelize_fn for seed checkpoints — nothing from
                     # it is needed (AC, compile, nD parallelism, mixed precision, etc.).
                     model = model_spec.parallelize_fn(
@@ -492,11 +501,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         dump_folder=config.dump_folder,
                     )
 
-                model.to_empty(device=init_device)
-                with torch.no_grad():
-                    # TODO: Change this back to init_weights once
-                    # autoparallel contains the wrap_init_states
-                    cast(BaseModel, model).init_weights(buffer_device=buffer_device)
+                    if not materialize_before_parallelize:
+                        model.to_empty(device=init_device)
+                        with torch.no_grad():
+                            # TODO: Change this back to init_weights once
+                            # autoparallel contains the wrap_init_states
+                            cast(BaseModel, model).init_weights(
+                                buffer_device=buffer_device
+                            )
+                else:
+                    model.to_empty(device=init_device)
+                    with torch.no_grad():
+                        cast(BaseModel, model).init_weights(buffer_device=buffer_device)
                 model.train()
 
                 self.model_parts = [model]

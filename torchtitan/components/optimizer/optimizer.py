@@ -23,6 +23,8 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.flex_shard import build_dist_muon
 from torchtitan.tools.logging import logger
 
+from .dmuon import load_dmuon
+
 from .utils import (
     get_flat_optim_state_dict,
     init_optim_state,
@@ -135,6 +137,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
     optimizers: list[T]
     model_parts: list[nn.Module]
+    _dmuon_models: dict[int, nn.Module]
 
     @staticmethod
     def _resolve_optimizer_factory(name: str) -> Callable[..., Optimizer]:
@@ -219,16 +222,30 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         all_params = []
         self.optimizers = []
         self.model_parts = model_parts
+        self._dmuon_models = {}
 
         for part_idx, model in enumerate(self.model_parts):
             groups_by_opt_name, patterns_by_opt_name = self._build_param_groups(
                 model, param_group_configs, impl_kwargs
             )
             for opt_name, opt_param_groups in groups_by_opt_name.items():
-                optimizer = self._resolve_optimizer_factory(opt_name)(
-                    opt_param_groups,
-                    **config.optimizer_factory_kwargs_by_name.get(opt_name, {}),
+                factory_kwargs = config.optimizer_factory_kwargs_by_name.get(
+                    opt_name, {}
                 )
+                if opt_name == "DMuon":
+                    dmuon = load_dmuon()
+
+                    optimizer = dmuon.Muon(
+                        model,
+                        param_groups=opt_param_groups,
+                        **factory_kwargs,
+                    )
+                    self._dmuon_models[id(optimizer)] = model
+                else:
+                    optimizer = self._resolve_optimizer_factory(opt_name)(
+                        opt_param_groups,
+                        **factory_kwargs,
+                    )
                 self.optimizers.append(cast(T, optimizer))
                 self._log_optimizer(optimizer, part_idx, patterns_by_opt_name[opt_name])
                 for group in opt_param_groups:
@@ -310,17 +327,36 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         call is a no-op once state exists.
         """
         result: dict[str, Any] = {}
-        for optim in self.optimizers:
-            init_optim_state(optim)
-            result.update(get_flat_optim_state_dict(optim))
+        for index, optim in enumerate(self.optimizers):
+            dmuon_model = self._dmuon_models.get(id(optim))
+            if dmuon_model is not None:
+                dmuon = load_dmuon()
+
+                result[f"dmuon.{index}"] = dmuon.get_optimizer_state_dict(
+                    dmuon_model,
+                    optim,
+                    cpu_offload=False,
+                    rank0_only=False,
+                )
+            else:
+                init_optim_state(optim)
+                result.update(get_flat_optim_state_dict(optim))
         return result
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # init_optim_state must run first: the unflatten step reads each
         # optimizer's live state to learn which state tensors to expect.
-        for optim in self.optimizers:
-            init_optim_state(optim)
-            load_flat_optim_state_dict(optim, state_dict)
+        for index, optim in enumerate(self.optimizers):
+            dmuon_model = self._dmuon_models.get(id(optim))
+            if dmuon_model is not None:
+                saved_state = state_dict.get(f"dmuon.{index}")
+                if saved_state is not None:
+                    dmuon = load_dmuon()
+
+                    dmuon.set_optimizer_state_dict(dmuon_model, optim, saved_state)
+            else:
+                init_optim_state(optim)
+                load_flat_optim_state_dict(optim, state_dict)
 
     def _post_init(self, all_params: list[nn.Parameter]) -> None:
         # We need to call Optimizer.__init__() to initialize some necessary optimizer

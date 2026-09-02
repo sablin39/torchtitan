@@ -15,6 +15,7 @@ _supported_models = frozenset(
         "muse_glimmer",
         "qwen3",
         "qwen3_5",
+        "rae",
         "rwkv7",
         "rwkv_vl",
     ]

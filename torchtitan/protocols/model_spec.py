@@ -45,6 +45,8 @@ class ModelSpec:
     pipelining_fn: Callable | None
     post_optimizer_build_fn: Callable | None
     state_dict_adapter: type[BaseStateDictAdapter] | None
+    materialize_before_parallelize: bool = False
+    """Materialize parameters before parallelize_fn when required by an optimizer."""
 
     def traverse(
         self, config_cls: type, *, recurse: bool = False, _prefix: str = ""
