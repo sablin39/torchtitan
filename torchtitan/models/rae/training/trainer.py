@@ -18,15 +18,15 @@ from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.optimizer.dmuon import load_dmuon
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.trainer import Trainer
-
-from .augmentation import DiscriminatorAugmentation
-from .discriminator import (
+from ..discriminator import (
     gan_discriminator_loss,
     gan_generator_loss,
     RAEFeatureDiscriminator,
     RAEPerceptualLoss,
 )
-from .encoder import FrozenRAEEncoder, RAEEncoderConfig
+from ..encoder import FrozenRAEEncoder, RAEEncoderConfig
+
+from .augmentation import DiscriminatorAugmentation
 from .metrics import log_stage1_metrics
 
 

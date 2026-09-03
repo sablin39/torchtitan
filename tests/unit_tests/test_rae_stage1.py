@@ -4,26 +4,23 @@ import pytest
 import torch
 
 from torchtitan.components.optimizer.dmuon import load_dmuon
-from torchtitan.models.rae.augmentation import DiscriminatorAugmentation
 from torchtitan.models.rae.config_registry import rae_stage1_debug
-from torchtitan.models.rae.data import RAEImageProcessor, RAEQwenCollator
-from torchtitan.models.rae.discriminator import (
-    gan_discriminator_loss,
-    gan_generator_loss,
-    RAEFeatureDiscriminator,
-)
-from torchtitan.models.rae.encoder import (
-    _merge_qwen_hidden_states,
-    FrozenRAEEncoder,
-    RAEEncoderConfig,
-)
-from torchtitan.models.rae.model import (
+from torchtitan.models.rae.data import RAEQwenCollator
+from torchtitan.models.rae.decoder import (
     Cosmos3DRotaryPositionEmbedding,
     create_rae_padding_mask,
     create_rae_varlen_metadata,
     RAEDecoder,
 )
-from torchtitan.models.rae.trainer import RAEStage1Trainer
+from torchtitan.models.rae.discriminator import (
+    gan_discriminator_loss,
+    gan_generator_loss,
+    RAEFeatureDiscriminator,
+)
+from torchtitan.models.rae.encoder import FrozenRAEEncoder, RAEEncoderConfig
+from torchtitan.models.rae.encoder.encoder import _merge_qwen_hidden_states
+from torchtitan.models.rae.training import RAEStage1Trainer
+from torchtitan.models.rae.training.augmentation import DiscriminatorAugmentation
 
 
 def _debug_decoder() -> RAEDecoder:
@@ -297,17 +294,6 @@ def test_gan_losses_match_stage1_conventions() -> None:
 def test_vendored_dmuon_is_loadable() -> None:
     dmuon = load_dmuon()
     assert hasattr(dmuon, "Muon")
-
-
-def test_image_processor_preserves_center_crop_aspect_ratio() -> None:
-    processor = object.__new__(RAEImageProcessor)
-    processor.image_size = 16
-    processor.image_key = "image"
-    image = torch.zeros(3, 8, 32)
-    image[:, :, 12:20] = 1
-    processed = processor(image, None)
-    assert processed.shape == (3, 16, 16)
-    assert processed.mean() > 0.9
 
 
 def test_discriminator_augmentation_preserves_generator_gradient() -> None:

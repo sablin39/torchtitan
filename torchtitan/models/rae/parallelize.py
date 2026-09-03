@@ -17,7 +17,7 @@ from torchtitan.distributed.fsdp import (
     resolve_fsdp_mesh,
 )
 
-from .model import RAEDecoder
+from .decoder import RAEDecoder
 
 
 def parallelize_rae(

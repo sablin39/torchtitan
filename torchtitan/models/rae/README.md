@@ -4,6 +4,15 @@ This package contains a TorchTitan-native Stage 1 decoder and the model-specific
 alternating GAN trainer. The frozen image encoder is kept in the trainer, while
 the decoder is built through TorchTitan's meta-device and `Module` protocols.
 
+The package is organized by ownership: `decoder/` contains the transformer,
+position encoding, layout, and packing helpers; `encoder/` contains the frozen
+Hugging Face vision adapter; `discriminator/` contains the frozen feature
+backbones, trainable heads, and perceptual loss; `training/` contains the Stage
+1 trainer, DiffAug, and metric logging; `data.py` contains the Qwen media
+processor and collator; and `parallelize.py` contains the TorchTitan
+parallelization entry point. Qwen processing is the only shipped input path,
+so there is no duplicate fixed-image processor or collator.
+
 The debug recipe uses the checked-in `cc12m_test` images, the local Qwen3.5
 vision tower, unequal image grids, packed varlen attention, and DMuon:
 

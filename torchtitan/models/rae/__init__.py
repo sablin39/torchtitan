@@ -1,12 +1,15 @@
-from .data import RAEImageCollator, RAEImageProcessor, RAEQwenCollator, RAEQwenProcessor
-from .layout import unpatchify_packed
-from .model import RAEAttention, RAEBlock, RAEDecoder, RAEFeedForward
-from .packing import (
+from .data import RAEQwenCollator, RAEQwenProcessor
+from .decoder import (
+    Cosmos3DRotaryPositionEmbedding,
     create_rae_packed_attention_mask,
     create_rae_padding_mask,
     create_rae_varlen_metadata,
+    RAEAttention,
+    RAEBlock,
+    RAEDecoder,
+    RAEFeedForward,
+    unpatchify_packed,
 )
-from .position import Cosmos3DRotaryPositionEmbedding
 
 __all__ = [
     "RAEDecoder",
@@ -17,8 +20,6 @@ __all__ = [
     "create_rae_padding_mask",
     "create_rae_packed_attention_mask",
     "create_rae_varlen_metadata",
-    "RAEImageCollator",
-    "RAEImageProcessor",
     "RAEQwenCollator",
     "RAEQwenProcessor",
     "unpatchify_packed",
@@ -27,7 +28,7 @@ __all__ = [
 
 def __getattr__(name: str):
     if name in {"RAEStage1Trainer", "RAEGANConfig"}:
-        from .trainer import RAEGANConfig, RAEStage1Trainer
+        from .training import RAEGANConfig, RAEStage1Trainer
 
         return {"RAEStage1Trainer": RAEStage1Trainer, "RAEGANConfig": RAEGANConfig}[
             name
