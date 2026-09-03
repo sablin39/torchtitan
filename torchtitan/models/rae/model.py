@@ -292,9 +292,9 @@ class RAEDecoder(BaseModel):
         def get_nparams_and_flops(
             self, model: torch.nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            del seq_len
             parameter_count = sum(p.numel() for p in model.parameters())
-            return parameter_count, 0
+            attention_flops = 6 * self.num_layers * self.hidden_size * max(seq_len, 1)
+            return parameter_count, 6 * parameter_count + attention_flops
 
     def __init__(self, config: Config) -> None:
         super().__init__()

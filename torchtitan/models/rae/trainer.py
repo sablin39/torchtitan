@@ -389,6 +389,10 @@ class RAEStage1Trainer(Trainer):
             raise
         if "input" not in input_dict:
             raise KeyError("RAE Stage 1 batches must contain an 'input' image tensor")
+        # The base batch generator counts one dummy label per sample. RAE MFU is
+        # defined per post-merger latent token, so replace that sample count after
+        # the encoder exposes the actual runtime grid below.
+        self.metrics_processor.ntokens_since_last_log -= labels.numel()
         self.ntokens_seen += labels.numel()
         self.n_valid_tokens_seen += labels.numel()
         self.n_nonpad_tokens_seen += labels.numel()
@@ -526,6 +530,8 @@ class RAEStage1Trainer(Trainer):
         if not isinstance(encoded, tuple):
             raise RuntimeError("RAE encoder must return grid metadata for Stage 1")
         latents, grid_thw = encoded
+        if add_noise:
+            self.metrics_processor.ntokens_since_last_log += int(grid_thw.prod().item())
         decoded = decoder(
             latents,
             grid_thw=grid_thw,
@@ -747,6 +753,7 @@ class RAEStage1Trainer(Trainer):
                     discriminator_real_metric,
                     discriminator_fake_metric,
                 ),
+                metrics_processor=self.metrics_processor,
             )
 
     @staticmethod
