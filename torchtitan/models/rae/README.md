@@ -192,14 +192,16 @@ applies configurable residual dropout independently after attention and after
 the feed-forward branch; the default is `residual_dropout=0.1`, and evaluation
 mode disables it.
 
-The default recipe uses the local Hugging Face DINOv3 ViT-L/16 at
-`~/models/dinov3-vitl16-pretrain-lvd1689m` as the frozen discriminator backbone,
-with intermediate layers 5, 11, 17, and 23 and RAEv2-style residual spectral
-heads. The discriminator accepts any compatible local Hugging Face vision model
-through `backbone_kind="hf"` and `hf_model_path`; its processor statistics are
-read from the model directory. No Python module from the checked-out `RAEv2/`
-tree is needed at runtime. DMuon dedicates and replicates its parameter groups
-through the regular DDP path.
+The default recipe uses the local Hugging Face DINOv3 ViT-B/16 at
+`~/models/dinov3-vitb16-pretrain-lvd1689m` as the frozen discriminator backbone,
+with intermediate layers 2, 5, 8, and 11 and RAEv2-style residual spectral
+heads. ViT-B/16 has a 768-wide hidden state, reducing discriminator feature
+memory versus ViT-L/16 while retaining four depth-spaced probes. The
+discriminator accepts any compatible local Hugging Face vision model through
+`backbone_kind="hf"` and `hf_model_path`; its processor statistics are read from
+the model directory. No Python module from the checked-out `RAEv2/` tree is
+needed at runtime. DMuon dedicates and replicates its parameter groups through
+the regular DDP path.
 
 For RAEv2 parity, set `gan.perceptual_kind="lpips"` and provide
 `gan.lpips_calibration_checkpoint_path` (the RAEv2 `vgg.pth` calibration file).

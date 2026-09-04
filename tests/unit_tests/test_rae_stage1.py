@@ -15,6 +15,7 @@ from torchtitan.components.optimizer.dmuon import load_dmuon
 from torchtitan.models.rae.config_registry import (
     model_registry,
     rae_stage1_debug,
+    rae_stage1_dmuon,
     rae_stage1_dmuon_static,
     rae_stage1_openimages,
     rae_stage1_openimages_static,
@@ -496,6 +497,15 @@ def test_debug_recipe_uses_qwen_variable_resolution_and_dmuon() -> None:
     assert config.encoder.image_size == -1
     assert model.image_size == -1
     assert config.dataloader.dataset.processor.image_size is None
+
+
+def test_dmuon_recipe_uses_dinov3_vitb16_discriminator() -> None:
+    config = rae_stage1_dmuon()
+    discriminator = config.discriminator
+    assert discriminator.backbone_kind == "hf"
+    assert discriminator.hf_model_path == "~/models/dinov3-vitb16-pretrain-lvd1689m"
+    assert discriminator.feature_channels == 768
+    assert discriminator.hf_key_depths == (2, 5, 8, 11)
 
 
 def test_rae_recipe_enables_wandb_and_swanlab_tracking() -> None:

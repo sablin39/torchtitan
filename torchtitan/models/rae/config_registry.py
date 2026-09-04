@@ -248,10 +248,10 @@ def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
         augment=RAEGANAugmentConfig(probability=1.0, cutout=0.0),
     )
     config.discriminator = RAEFeatureDiscriminator.Config(
-        feature_channels=1024,
+        feature_channels=768,
         backbone_kind="hf",
-        hf_model_path="~/models/dinov3-vitl16-pretrain-lvd1689m",
-        hf_key_depths=(5, 11, 17, 23),
+        hf_model_path="~/models/dinov3-vitb16-pretrain-lvd1689m",
+        hf_key_depths=(2, 5, 8, 11),
     )
     config.parallelism = ParallelismConfig(
         data_parallel_replicate_degree=4,
