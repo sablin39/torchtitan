@@ -252,12 +252,16 @@ class RAEStage1Trainer(Trainer):
             config.discriminator,
             device=self.device,
         ).to(self.device)
+        self._cuda_graphs_enabled = (
+            not config.training.disable_cuda_graphs and self.device.type == "cuda"
+        )
         if config.compile.enable and "discriminator" in config.compile.components:
             self.discriminator.compile_forward(backend=config.compile.backend)
         if (
             dist.is_available()
             and dist.is_initialized()
             and self.parallel_dims.dp_enabled
+            and not self._cuda_graphs_enabled
         ):
             ddp_kwargs = {}
             if self.device.type == "cuda":
@@ -280,9 +284,6 @@ class RAEStage1Trainer(Trainer):
         self.discriminator_augmentation = DiscriminatorAugmentation(
             probability=config.gan.augment.probability,
             cutout=config.gan.augment.cutout,
-        )
-        self._cuda_graphs_enabled = (
-            not config.training.disable_cuda_graphs and self.device.type == "cuda"
         )
         self._generator_graphs: dict[
             tuple[tuple[int, ...], bool, bool], RAEGeneratorLossGraph
@@ -1034,6 +1035,8 @@ class RAEStage1Trainer(Trainer):
                         logits_real, logits_fake, gan.discriminator_loss
                     )
                     disc_loss.backward()
+                    if self._cuda_graphs_enabled:
+                        self._sync_discriminator_gradients()
                 disc_grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.discriminator.parameters(), self.config.training.max_norm
                 )
