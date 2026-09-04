@@ -245,7 +245,7 @@ class HFModelFeatureDiscriminator(nn.Module):
         return torch.cat(logits_B1, dim=1)
 
     def forward_fixed(self, images_BCHW: torch.Tensor) -> torch.Tensor:
-        """Evaluate a fixed BCHW batch without runtime grouping or resizing."""
+        """Evaluate a fixed BCHW batch with deterministic letterboxing."""
         if images_BCHW.ndim != 4 or images_BCHW.shape[1] != 3:
             raise ValueError(
                 "HF vision discriminator fixed path expects BCHW RGB images"
