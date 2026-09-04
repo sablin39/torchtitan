@@ -22,6 +22,7 @@ from torchtitan.components.data.loader import DataloaderExhaustedError
 from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.optimizer.dmuon import load_dmuon
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 from ..decoder import create_rae_static_varlen_metadata
 from ..discriminator import (
@@ -33,6 +34,11 @@ from ..discriminator import (
 from ..encoder import FrozenRAEEncoder, RAEEncoderConfig
 
 from .augmentation import DiscriminatorAugmentation
+from .graphs import (
+    RAEDiscriminatorGraph,
+    RAEGeneratorGraphOutput,
+    RAEGeneratorLossGraph,
+)
 from .metrics import log_stage1_metrics
 from .validation import RAEValidator
 
@@ -275,6 +281,14 @@ class RAEStage1Trainer(Trainer):
             probability=config.gan.augment.probability,
             cutout=config.gan.augment.cutout,
         )
+        self._cuda_graphs_enabled = (
+            not config.training.disable_cuda_graphs and self.device.type == "cuda"
+        )
+        self._generator_graphs: dict[
+            tuple[tuple[int, ...], bool, bool], RAEGeneratorLossGraph
+        ] = {}
+        self._discriminator_graphs: dict[tuple[int, ...], RAEDiscriminatorGraph] = {}
+        self._graph_failures: set[tuple[str, tuple[Any, ...]]] = set()
         self.disc_optimizer = torch.optim.AdamW(
             self.discriminator.parameters(),
             lr=config.gan.discriminator_lr,
@@ -662,6 +676,147 @@ class RAEStage1Trainer(Trainer):
         ]
         return torch.stack(losses).mean()
 
+    @staticmethod
+    def _stack_homogeneous_images(
+        images: list[torch.Tensor],
+    ) -> torch.Tensor | None:
+        if not images or any(image.ndim != 3 for image in images):
+            return None
+        shape = images[0].shape
+        if any(image.shape != shape for image in images[1:]):
+            return None
+        return torch.stack(images)
+
+    def _get_generator_graph(
+        self,
+        shape: tuple[int, ...],
+        *,
+        use_gan: bool,
+        use_perceptual: bool,
+    ) -> RAEGeneratorLossGraph | None:
+        if not self._cuda_graphs_enabled or self._adaptive_weight_enabled:
+            return None
+        key = (shape, use_gan, use_perceptual)
+        if ("generator", key) in self._graph_failures:
+            return None
+        graph = self._generator_graphs.get(key)
+        if graph is None:
+            gan = self.config.gan
+            graph = RAEGeneratorLossGraph(
+                self.discriminator,
+                self.perceptual_loss,
+                self.discriminator_augmentation,
+                use_gan=use_gan,
+                use_perceptual=use_perceptual,
+                perceptual_weight=gan.perceptual_weight,
+                discriminator_weight=gan.discriminator_weight,
+                generator_loss=gan.generator_loss,
+                loss_scale=1.0 / self.gradient_accumulation_steps,
+                autocast_dtype=(
+                    torch.bfloat16 if self.config.training.dtype == "bfloat16" else None
+                ),
+            )
+            self._generator_graphs[key] = graph
+        return graph
+
+    def _run_generator_graph(
+        self,
+        fake_BCHW: torch.Tensor,
+        target_BCHW: torch.Tensor,
+        *,
+        use_gan: bool,
+        use_perceptual: bool,
+    ) -> RAEGeneratorGraphOutput | None:
+        graph = self._get_generator_graph(
+            tuple(fake_BCHW.shape),
+            use_gan=use_gan,
+            use_perceptual=use_perceptual,
+        )
+        if graph is None:
+            return None
+        try:
+            valid_image_mask_B = torch.ones(
+                fake_BCHW.shape[0], device=fake_BCHW.device, dtype=torch.float32
+            )
+            return graph(fake_BCHW, target_BCHW, valid_image_mask_B)
+        except Exception as error:
+            key = (tuple(fake_BCHW.shape), use_gan, use_perceptual)
+            self._graph_failures.add(("generator", key))
+            logger.warning(
+                "RAE generator CUDA graph unavailable for shape %s; "
+                "falling back to eager loss (%s)",
+                tuple(fake_BCHW.shape),
+                error,
+            )
+            return None
+
+    def _get_discriminator_graph(
+        self, shape: tuple[int, ...]
+    ) -> RAEDiscriminatorGraph | None:
+        if not self._cuda_graphs_enabled:
+            return None
+        if ("discriminator", shape) in self._graph_failures:
+            return None
+        graph = self._discriminator_graphs.get(shape)
+        if graph is None:
+            graph = RAEDiscriminatorGraph(
+                self.discriminator,
+                self.discriminator_augmentation,
+                discriminator_loss=self.config.gan.discriminator_loss,
+                autocast_dtype=(
+                    torch.bfloat16 if self.config.training.dtype == "bfloat16" else None
+                ),
+            )
+            self._discriminator_graphs[shape] = graph
+        return graph
+
+    def _run_discriminator_graph(
+        self,
+        fake_BCHW: torch.Tensor,
+        real_BCHW: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        graph = self._get_discriminator_graph(tuple(fake_BCHW.shape))
+        if graph is None:
+            return None
+        try:
+            valid_image_mask_B = torch.ones(
+                fake_BCHW.shape[0], device=fake_BCHW.device, dtype=torch.float32
+            )
+            output = graph(fake_BCHW, real_BCHW, valid_image_mask_B)
+            self._sync_discriminator_gradients()
+            return output.loss, output.real_logits_mean, output.fake_logits_mean
+        except Exception as error:
+            self._graph_failures.add(("discriminator", tuple(fake_BCHW.shape)))
+            logger.warning(
+                "RAE discriminator CUDA graph unavailable for shape %s; "
+                "falling back to eager loss (%s)",
+                tuple(fake_BCHW.shape),
+                error,
+            )
+            return None
+
+    def _zero_discriminator_gradients(self) -> None:
+        if self._discriminator_graphs:
+            for parameter in self.discriminator.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.zero_()
+        else:
+            self.disc_optimizer.zero_grad(set_to_none=True)
+
+    def _sync_discriminator_gradients(self) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        if not self.parallel_dims.dp_enabled:
+            return
+        batch_mesh = self.parallel_dims.get_mesh("batch")
+        if batch_mesh.size() == 1:
+            return
+        group = batch_mesh.get_group()
+        for parameter in self.discriminator.parameters():
+            if parameter.grad is not None:
+                dist.all_reduce(parameter.grad, group=group)
+                parameter.grad.div_(batch_mesh.size())
+
     def _augment_images(self, images: list[torch.Tensor]) -> list[torch.Tensor]:
         grouped: dict[tuple[int, int], list[int]] = {}
         for index, image in enumerate(images):
@@ -688,7 +843,7 @@ class RAEStage1Trainer(Trainer):
         encoder_inputs: list[Mapping[str, Any] | None] = []
 
         self.optimizers.zero_grad(set_to_none=True)
-        self.disc_optimizer.zero_grad(set_to_none=True)
+        self._zero_discriminator_gradients()
         self.discriminator.eval()
         self.discriminator.set_head_requires_grad(False)
         reconstruction_metric = perceptual_metric = adversarial_metric = None
@@ -717,53 +872,82 @@ class RAEStage1Trainer(Trainer):
                 target_items = self._image_items(
                     self._supervision_images(images, target_sizes)
                 )
-                reconstruction_loss = torch.stack(
-                    [
-                        F.l1_loss(reconstruction, target)
-                        for reconstruction, target in zip(
-                            recon_items, target_items, strict=True
-                        )
-                    ]
-                ).mean()
-                perceptual_loss = (
-                    self._perceptual_loss(
-                        [target * 2.0 - 1.0 for target in target_items],
-                        [reconstruction * 2.0 - 1.0 for reconstruction in recon_items],
+                fake_BCHW = self._stack_homogeneous_images(recon_items)
+                target_BCHW = self._stack_homogeneous_images(target_items)
+                graph_output = (
+                    self._run_generator_graph(
+                        fake_BCHW,
+                        target_BCHW,
+                        use_gan=use_gan,
+                        use_perceptual=use_perceptual,
                     )
-                    if use_perceptual
-                    else reconstruction_loss.new_zeros(())
+                    if fake_BCHW is not None and target_BCHW is not None
+                    else None
                 )
-                reconstruction_total = (
-                    reconstruction_loss + gan.perceptual_weight * perceptual_loss
-                )
-                if use_gan:
-                    fake_augmented = self._augment_images(
-                        [reconstruction * 2.0 - 1.0 for reconstruction in recon_items]
-                    )
-                    logits_fake = self.discriminator_train(fake_augmented)
-                    generator_logits_metric = logits_fake.detach().mean()
-                    adversarial_loss = gan_generator_loss(
-                        logits_fake, gan.generator_loss
-                    )
-                    adaptive_weight = (
-                        self._adaptive_weight(
-                            reconstruction_total,
-                            adversarial_loss,
-                            decoder.decoder_pred.weight,
-                            gan.max_adaptive_weight,
-                        )
-                        if self._adaptive_weight_enabled
-                        else reconstruction_loss.new_ones(())
-                    )
-                    total_loss = (
-                        reconstruction_total
-                        + gan.discriminator_weight * adaptive_weight * adversarial_loss
-                    )
+                if graph_output is not None:
+                    assert fake_BCHW is not None
+                    reconstruction_loss = graph_output.reconstruction_loss
+                    perceptual_loss = graph_output.perceptual_loss
+                    adversarial_loss = graph_output.adversarial_loss
+                    adaptive_weight = graph_output.adaptive_weight
+                    generator_logits_metric = graph_output.logits_mean
+                    torch.autograd.backward(fake_BCHW, graph_output.fake_gradient)
                 else:
-                    adversarial_loss = reconstruction_loss.new_zeros(())
-                    adaptive_weight = reconstruction_loss.new_zeros(())
-                    total_loss = reconstruction_total
-            (total_loss / num_microbatches).backward()
+                    reconstruction_loss = torch.stack(
+                        [
+                            F.l1_loss(reconstruction, target)
+                            for reconstruction, target in zip(
+                                recon_items, target_items, strict=True
+                            )
+                        ]
+                    ).mean()
+                    perceptual_loss = (
+                        self._perceptual_loss(
+                            [target * 2.0 - 1.0 for target in target_items],
+                            [
+                                reconstruction * 2.0 - 1.0
+                                for reconstruction in recon_items
+                            ],
+                        )
+                        if use_perceptual
+                        else reconstruction_loss.new_zeros(())
+                    )
+                    reconstruction_total = (
+                        reconstruction_loss + gan.perceptual_weight * perceptual_loss
+                    )
+                    if use_gan:
+                        fake_augmented = self._augment_images(
+                            [
+                                reconstruction * 2.0 - 1.0
+                                for reconstruction in recon_items
+                            ]
+                        )
+                        logits_fake = self.discriminator_train(fake_augmented)
+                        generator_logits_metric = logits_fake.detach().mean()
+                        adversarial_loss = gan_generator_loss(
+                            logits_fake, gan.generator_loss
+                        )
+                        adaptive_weight = (
+                            self._adaptive_weight(
+                                reconstruction_total,
+                                adversarial_loss,
+                                decoder.decoder_pred.weight,
+                                gan.max_adaptive_weight,
+                            )
+                            if self._adaptive_weight_enabled
+                            else reconstruction_loss.new_ones(())
+                        )
+                        total_loss = (
+                            reconstruction_total
+                            + gan.discriminator_weight
+                            * adaptive_weight
+                            * adversarial_loss
+                        )
+                    else:
+                        adversarial_loss = reconstruction_loss.new_zeros(())
+                        adaptive_weight = reconstruction_loss.new_zeros(())
+                        total_loss = reconstruction_total
+                    (total_loss / num_microbatches).backward()
             reconstruction_metric = reconstruction_loss.detach()
             perceptual_metric = perceptual_loss.detach()
             adversarial_metric = adversarial_loss.detach()
@@ -793,7 +977,7 @@ class RAEStage1Trainer(Trainer):
             self.discriminator.set_head_requires_grad(True)
             self.discriminator_train.train()
             for _ in range(gan.discriminator_updates):
-                self.disc_optimizer.zero_grad(set_to_none=True)
+                self._zero_discriminator_gradients()
                 with torch.no_grad(), torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.bfloat16,
@@ -824,18 +1008,32 @@ class RAEStage1Trainer(Trainer):
                     for fake in fake_normed_items
                 ]
                 real_normed_items = [real * 2.0 - 1.0 for real in real_items]
-                logits_fake = self.discriminator_train(
-                    self._augment_images(fake_normed_items)
+                fake_BCHW = self._stack_homogeneous_images(fake_normed_items)
+                real_BCHW = self._stack_homogeneous_images(real_normed_items)
+                graph_output = (
+                    self._run_discriminator_graph(fake_BCHW, real_BCHW)
+                    if fake_BCHW is not None and real_BCHW is not None
+                    else None
                 )
-                logits_real = self.discriminator_train(
-                    self._augment_images(real_normed_items)
-                )
-                discriminator_fake_metric = logits_fake.detach().mean()
-                discriminator_real_metric = logits_real.detach().mean()
-                disc_loss = gan_discriminator_loss(
-                    logits_real, logits_fake, gan.discriminator_loss
-                )
-                disc_loss.backward()
+                if graph_output is not None:
+                    (
+                        disc_loss,
+                        discriminator_real_metric,
+                        discriminator_fake_metric,
+                    ) = graph_output
+                else:
+                    logits_fake = self.discriminator_train(
+                        self._augment_images(fake_normed_items)
+                    )
+                    logits_real = self.discriminator_train(
+                        self._augment_images(real_normed_items)
+                    )
+                    discriminator_fake_metric = logits_fake.detach().mean()
+                    discriminator_real_metric = logits_real.detach().mean()
+                    disc_loss = gan_discriminator_loss(
+                        logits_real, logits_fake, gan.discriminator_loss
+                    )
+                    disc_loss.backward()
                 disc_grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.discriminator.parameters(), self.config.training.max_norm
                 )

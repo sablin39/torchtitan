@@ -43,49 +43,47 @@ class DiscriminatorAugmentation:
         if self.probability < 1e-6:
             return images_BCHW
 
-        translate, color, cutout = (torch.rand(3) <= self.probability).tolist()
-        if not translate and not color and not cutout:
-            return images_BCHW
+        apply_translate, apply_color, apply_cutout = (
+            torch.rand(3, device=images_BCHW.device) <= self.probability
+        )
         batch_size, _, height, width = images_BCHW.shape
         random_B = torch.rand(7, batch_size, 1, 1, device=images_BCHW.device)
 
-        if translate:
-            height_delta = round(height * 0.125)
-            width_delta = round(width * 0.125)
-            height_offset_B11 = (
-                random_B[0].mul(2 * height_delta + 1).floor().long() - height_delta
-            )
-            width_offset_B11 = (
-                random_B[1].mul(2 * width_delta + 1).floor().long() - width_delta
-            )
-            batch_grid_BHW, height_grid_BHW, width_grid_BHW = self._get_grids(
-                batch_size, height, width, images_BCHW.device
-            )
-            height_grid_BHW = (
-                (height_grid_BHW + height_offset_B11).add(1).clamp(0, height + 1)
-            )
-            width_grid_BHW = (
-                (width_grid_BHW + width_offset_B11).add(1).clamp(0, width + 1)
-            )
-            padded_BCHW = F.pad(images_BCHW, (1, 1, 1, 1))
-            images_BCHW = padded_BCHW.permute(0, 2, 3, 1)[
-                batch_grid_BHW,
-                height_grid_BHW,
-                width_grid_BHW,
-            ].permute(0, 3, 1, 2)
+        height_delta = round(height * 0.125)
+        width_delta = round(width * 0.125)
+        height_offset_B11 = (
+            random_B[0].mul(2 * height_delta + 1).floor().long() - height_delta
+        )
+        width_offset_B11 = (
+            random_B[1].mul(2 * width_delta + 1).floor().long() - width_delta
+        )
+        batch_grid_BHW, height_grid_BHW, width_grid_BHW = self._get_grids(
+            batch_size, height, width, images_BCHW.device
+        )
+        height_grid_BHW = (
+            (height_grid_BHW + height_offset_B11).add(1).clamp(0, height + 1)
+        )
+        width_grid_BHW = (width_grid_BHW + width_offset_B11).add(1).clamp(0, width + 1)
+        padded_BCHW = F.pad(images_BCHW, (1, 1, 1, 1))
+        translated_BCHW = padded_BCHW.permute(0, 2, 3, 1)[
+            batch_grid_BHW,
+            height_grid_BHW,
+            width_grid_BHW,
+        ].permute(0, 3, 1, 2)
+        images_BCHW = torch.where(apply_translate, translated_BCHW, images_BCHW)
 
-        if color:
-            images_BCHW = images_BCHW + random_B[2].unsqueeze(-1) - 0.5
-            channel_mean_B1HW = images_BCHW.mean(dim=1, keepdim=True)
-            images_BCHW = (images_BCHW - channel_mean_B1HW) * random_B[3].unsqueeze(
-                -1
-            ).mul(2) + channel_mean_B1HW
-            image_mean_B111 = images_BCHW.mean((1, 2, 3), keepdim=True)
-            images_BCHW = (images_BCHW - image_mean_B111) * random_B[4].unsqueeze(
-                -1
-            ).add(0.5) + image_mean_B111
+        colored_BCHW = images_BCHW + random_B[2].unsqueeze(-1) - 0.5
+        channel_mean_B1HW = colored_BCHW.mean(dim=1, keepdim=True)
+        colored_BCHW = (colored_BCHW - channel_mean_B1HW) * random_B[3].unsqueeze(
+            -1
+        ).mul(2) + channel_mean_B1HW
+        image_mean_B111 = colored_BCHW.mean((1, 2, 3), keepdim=True)
+        colored_BCHW = (colored_BCHW - image_mean_B111) * random_B[4].unsqueeze(-1).add(
+            0.5
+        ) + image_mean_B111
+        images_BCHW = torch.where(apply_color, colored_BCHW, images_BCHW)
 
-        if cutout and self.cutout > 0:
+        if self.cutout > 0:
             cutout_height = round(height * self.cutout)
             cutout_width = round(width * self.cutout)
             height_offset_B11 = (
@@ -117,8 +115,11 @@ class DiscriminatorAugmentation:
                 dtype=images_BCHW.dtype,
                 device=images_BCHW.device,
             )
-            mask_BHW[batch_grid_BHW, height_grid_BHW, width_grid_BHW] = 0
-            images_BCHW = images_BCHW * mask_BHW.unsqueeze(1)
+            mask_BHW[
+                batch_grid_BHW, height_grid_BHW, width_grid_BHW
+            ] = images_BCHW.new_zeros(())
+            cutout_BCHW = images_BCHW * mask_BHW.unsqueeze(1)
+            images_BCHW = torch.where(apply_cutout, cutout_BCHW, images_BCHW)
 
         return images_BCHW.contiguous()
 

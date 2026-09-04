@@ -115,19 +115,27 @@ class LPIPSPerceptualLoss(nn.Module):
         input_BCHW: torch.Tensor,
         target_BCHW: torch.Tensor,
     ) -> torch.Tensor:
+        return self.forward_per_sample(input_BCHW, target_BCHW).mean()
+
+    def forward_per_sample(
+        self,
+        input_BCHW: torch.Tensor,
+        target_BCHW: torch.Tensor,
+    ) -> torch.Tensor:
         input_features = self.net(self.scaling_layer(input_BCHW))
         target_features = self.net(self.scaling_layer(target_BCHW))
         distances = []
-        for input_BCHW, target_BCHW, calibration in zip(
+        for input_features_BCHW, target_features_BCHW, calibration in zip(
             input_features,
             target_features,
             self.linear_layers,
         ):
             difference_BCHW = (
-                self._normalize(input_BCHW) - self._normalize(target_BCHW)
+                self._normalize(input_features_BCHW)
+                - self._normalize(target_features_BCHW)
             ).square()
-            distances.append(calibration(difference_BCHW).mean((2, 3), keepdim=True))
-        return torch.stack(distances).sum(dim=0).mean()
+            distances.append(calibration(difference_BCHW).mean((2, 3)).squeeze(1))
+        return torch.stack(distances).sum(dim=0)
 
 
 __all__ = ["LPIPSPerceptualLoss"]

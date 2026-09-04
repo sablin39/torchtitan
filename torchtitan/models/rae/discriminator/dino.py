@@ -234,6 +234,20 @@ class HFModelFeatureDiscriminator(nn.Module):
         ]
         return torch.cat(logits_B1, dim=1)
 
+    def forward_fixed(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+        """Evaluate a fixed BCHW batch without runtime grouping or resizing."""
+        if images_BCHW.ndim != 4 or images_BCHW.shape[1] != 3:
+            raise ValueError(
+                "HF vision discriminator fixed path expects BCHW RGB images"
+            )
+        if images_BCHW.shape[-2:] != (self.input_size, self.input_size):
+            raise ValueError(
+                "HF vision discriminator fixed path expects input_size x input_size"
+            )
+        mean_1C11 = images_BCHW.new_tensor(self.image_mean).view(1, -1, 1, 1)
+        std_1C11 = images_BCHW.new_tensor(self.image_std).view(1, 3, 1, 1)
+        return self._forward_group(((images_BCHW + 1.0) * 0.5 - mean_1C11) / std_1C11)
+
     def _resize_for_backbone(self, image_CHW: torch.Tensor) -> torch.Tensor:
         height, width = image_CHW.shape[-2:]
         if (height, width) == (self.input_size, self.input_size):

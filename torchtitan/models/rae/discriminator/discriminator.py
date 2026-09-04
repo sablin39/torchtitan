@@ -196,6 +196,19 @@ class RAEFeatureDiscriminator(nn.Module):
             outputs.append(torch.cat(logits, dim=0))
         return torch.stack(outputs)
 
+    def forward_fixed(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+        """Evaluate a fixed BCHW batch without list or shape-grouping logic."""
+        if images_BCHW.ndim != 4 or images_BCHW.shape[1] != 3:
+            raise ValueError("RAE discriminator fixed path expects BCHW RGB images")
+        if self._is_hf_model:
+            return self.backbone.forward_fixed((images_BCHW + 1.0) * 0.5)
+        features = self.backbone(images_BCHW)
+        logits = [
+            head(feature).mean(dim=-1)
+            for head, feature in zip(self.heads, features, strict=True)
+        ]
+        return torch.cat(logits, dim=1)
+
 
 class RAEPerceptualLoss(nn.Module):
     """Frozen feature-distance loss used as the Stage 1 LPIPS substitute."""
@@ -221,16 +234,24 @@ class RAEPerceptualLoss(nn.Module):
         self.requires_grad_(False)
 
     def forward(self, real_BCHW: torch.Tensor, fake_BCHW: torch.Tensor) -> torch.Tensor:
+        return self.forward_per_sample(real_BCHW, fake_BCHW).mean()
+
+    def forward_per_sample(
+        self, real_BCHW: torch.Tensor, fake_BCHW: torch.Tensor
+    ) -> torch.Tensor:
         if isinstance(self.backbone, FrozenImageFeatures):
             real_features = self.backbone(real_BCHW)
             fake_features = self.backbone(fake_BCHW)
             return torch.stack(
                 [
-                    F.l1_loss(fake, real)
+                    (fake - real).abs().flatten(1).mean(dim=1)
                     for fake, real in zip(fake_features, real_features)
                 ]
-            ).mean()
-        return self.backbone(real_BCHW, fake_BCHW)
+            ).mean(dim=0)
+        forward_per_sample = getattr(self.backbone, "forward_per_sample", None)
+        if forward_per_sample is None:
+            raise RuntimeError("Perceptual backbone lacks a per-sample loss path")
+        return forward_per_sample(real_BCHW, fake_BCHW)
 
 
 def gan_generator_loss(logits_fake: torch.Tensor, loss_type: str) -> torch.Tensor:

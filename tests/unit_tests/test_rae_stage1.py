@@ -33,11 +33,16 @@ from torchtitan.models.rae.discriminator import (
     gan_discriminator_loss,
     gan_generator_loss,
     RAEFeatureDiscriminator,
+    RAEPerceptualLoss,
 )
 from torchtitan.models.rae.encoder import FrozenRAEEncoder, RAEEncoderConfig
 from torchtitan.models.rae.encoder.encoder import _merge_qwen_hidden_states
 from torchtitan.models.rae.training import RAEStage1Trainer
 from torchtitan.models.rae.training.augmentation import DiscriminatorAugmentation
+from torchtitan.models.rae.training.graphs import (
+    RAEDiscriminatorGraph,
+    RAEGeneratorLossGraph,
+)
 from torchtitan.protocols.model_spec import ModelSpec
 
 
@@ -642,3 +647,46 @@ def test_discriminator_augmentation_can_be_disabled() -> None:
     augmentation = DiscriminatorAugmentation(probability=0.0)
     images = torch.randn(2, 3, 16, 16)
     assert torch.equal(augmentation(images), images)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
+def test_rae_cuda_loss_graph_replays_forward_and_gradients() -> None:
+    device = torch.device("cuda")
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8), device=device
+    ).to(device)
+    discriminator.eval()
+    discriminator.set_head_requires_grad(False)
+    perceptual = RAEPerceptualLoss(channels=8).to(device)
+    augmentation = DiscriminatorAugmentation(probability=0.0)
+    generator_graph = RAEGeneratorLossGraph(
+        discriminator,
+        perceptual,
+        augmentation,
+        use_gan=True,
+        use_perceptual=True,
+        perceptual_weight=1.0,
+        discriminator_weight=0.75,
+        generator_loss="vanilla",
+        loss_scale=1.0,
+        autocast_dtype=None,
+    )
+    fake = torch.rand(2, 3, 32, 32, device=device, requires_grad=True)
+    target = torch.rand_like(fake)
+    output = generator_graph(fake, target, torch.ones(2, device=device))
+    torch.autograd.backward(fake, output.fake_gradient)
+    assert fake.grad is not None
+
+    discriminator.set_head_requires_grad(True)
+    discriminator.train()
+    discriminator_graph = RAEDiscriminatorGraph(
+        discriminator,
+        augmentation,
+        discriminator_loss="hinge",
+        autocast_dtype=None,
+    )
+    output = discriminator_graph(
+        torch.randn_like(fake), torch.randn_like(fake), torch.ones(2, device=device)
+    )
+    assert output.loss.is_cuda
+    assert any(parameter.grad is not None for parameter in discriminator.parameters())
