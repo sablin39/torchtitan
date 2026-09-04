@@ -151,6 +151,19 @@ discriminator heads remain eager during discriminator updates because their
 power-iteration buffers are intentionally mutated in place; the frozen
 backbone is always in evaluation mode.
 
+When CUDA graphs are enabled, `training/graphs.py` captures the fixed-BCHW
+reconstruction, perceptual, frozen-discriminator generator loss, and
+discriminator forward/backward paths. Graphs are cached by batch and image
+shape, and the first occurrence of each shape includes capture and warmup.
+Mixed-resolution batches remain on the eager path because a CUDA graph cannot
+change tensor shapes. Graph mode bypasses DDP reducer hooks and explicitly
+averages discriminator gradients across the batch mesh; this keeps graph
+capture safe for replicated DP. DMuon and its optimizer step remain eager,
+while the returned reconstruction gradient is propagated through the decoder
+normally. On the RTX PRO 6000, a fixed `B=16, 256x256` loss path measured
+1.69x faster generator and 3.15x faster discriminator steady-state replay
+than eager execution (capture time excluded).
+
 RAE Stage 1 currently uses fully replicated data parallelism. Set
 `data_parallel_shard_degree=1`; sharded data parallelism is rejected by the RAE
 parallelization entry point because the decoder, packed-token metadata, and
