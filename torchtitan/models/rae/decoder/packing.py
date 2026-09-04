@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -52,6 +58,50 @@ def create_rae_varlen_metadata(
     )
 
 
+def create_rae_static_varlen_metadata(
+    sequence_lengths: torch.Tensor | Sequence[int],
+    static_sequence_length: int,
+    *,
+    device: torch.device | None = None,
+) -> VarlenMetadata:
+    """Build fixed-shape FA2 metadata with one isolated padding sequence.
+
+    The real samples remain separate attention documents. Any unused token
+    slots are appended as a final document, so padding cannot affect valid
+    queries and the cumulative-offset tensor keeps a stable shape for
+    compilation and CUDA graph replay.
+    """
+    lengths = _lengths_tensor(sequence_lengths, device=device).to(dtype=torch.int32)
+    valid_length = int(lengths.sum().item())
+    if static_sequence_length < valid_length:
+        raise ValueError(
+            "static_sequence_length must be at least the packed token count"
+        )
+    if static_sequence_length > valid_length:
+        padding_length = static_sequence_length - valid_length
+        lengths = torch.cat(
+            [
+                lengths,
+                torch.tensor(
+                    [padding_length], dtype=torch.int32, device=lengths.device
+                ),
+            ]
+        )
+    offsets = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=lengths.device),
+            torch.cumsum(lengths, dim=0).to(dtype=torch.int32),
+        ]
+    )
+    return VarlenMetadata(
+        cu_seq_q=offsets,
+        cu_seq_k=offsets,
+        max_q=static_sequence_length,
+        max_k=static_sequence_length,
+        cu_seq_q_host=None,
+    )
+
+
 def create_rae_padding_mask(
     sequence_lengths: torch.Tensor | Sequence[int],
     *,
@@ -73,7 +123,7 @@ def create_rae_packed_attention_mask(
     *,
     device: torch.device | None = None,
 ) -> torch.Tensor:
-    """Create a block-diagonal mask for packed SDPA fallback attention."""
+    """Create a bidirectional block-diagonal mask for packed SDPA fallback."""
     lengths = _lengths_tensor(sequence_lengths, device=device)
     sequence_ids = torch.repeat_interleave(
         torch.arange(lengths.shape[0], device=lengths.device), lengths
@@ -83,6 +133,7 @@ def create_rae_packed_attention_mask(
 
 __all__ = [
     "create_rae_varlen_metadata",
+    "create_rae_static_varlen_metadata",
     "create_rae_padding_mask",
     "create_rae_packed_attention_mask",
 ]

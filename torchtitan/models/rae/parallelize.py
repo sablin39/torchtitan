@@ -1,22 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
-from typing import Any
+from torch.distributed._composable import replicate
 
-from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
-
-from torchtitan.config import (
-    CompileConfig,
-    ParallelismConfig,
-    TORCH_DTYPE_MAP,
-    TrainingConfig,
-)
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
-from torchtitan.distributed.fsdp import (
-    disable_fsdp_gradient_division,
-    resolve_fsdp_mesh,
-)
-
 from .decoder import RAEDecoder
 
 
@@ -27,10 +22,9 @@ def parallelize_rae(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
-    ac_config: Any,
+    ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> RAEDecoder:
-    del ac_config, dump_folder
     if parallel_dims.spmd_backend != "spmd_types":
         raise ValueError("RAE Stage 1 parallelization requires the spmd_types backend")
     if parallelism.tensor_parallel_degree > 1:
@@ -39,6 +33,14 @@ def parallelize_rae(
         raise NotImplementedError("RAE Stage 1 does not support context parallelism")
     if parallelism.pipeline_parallel_degree > 1:
         raise NotImplementedError("RAE Stage 1 does not support pipeline parallelism")
+    if parallel_dims.dp_shard_enabled:
+        raise NotImplementedError(
+            "RAE Stage 1 currently supports replicated data parallelism only; "
+            "set data_parallel_shard_degree=1"
+        )
+
+    if ac_config is not None:
+        ac_config.build(dump_folder=dump_folder).apply(model)
 
     if compile_config.enable and "model" in compile_config.components:
         apply_compile(
@@ -47,15 +49,13 @@ def parallelize_rae(
             parallel_dims=parallel_dims,
         )
 
+    predicate = lambda name, parameter: parameter.ndim == 2 and parameter.requires_grad
     dmuon = None
     if model._dmuon_enabled:
         from torchtitan.components.optimizer.dmuon import load_dmuon
 
         dmuon = load_dmuon()
-        predicate = (
-            lambda name, parameter: parameter.ndim == 2 and parameter.requires_grad
-        )
-        if not parallel_dims.dp_enabled:
+        if not parallel_dims.dp_replicate_enabled:
             dmuon.dedicate_params_ddp(
                 model,
                 mesh=parallel_dims.world_mesh,
@@ -64,46 +64,20 @@ def parallelize_rae(
             dmuon.replicate(model, mesh=parallel_dims.world_mesh)
             return model
 
-    if not parallel_dims.dp_enabled:
+    if not parallel_dims.dp_replicate_enabled:
         return model
 
-    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-    fsdp_config: dict[str, Any] = {
-        "mesh": dp_mesh,
-        "mp_policy": MixedPrecisionPolicy(
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        ),
-    }
-    if dp_mesh_dims is not None:
-        fsdp_config["dp_mesh_dims"] = dp_mesh_dims
-    if training.enable_cpu_offload:
-        fsdp_config["offload_policy"] = CPUOffloadPolicy()
-
+    replicate_mesh = parallel_dims.get_mesh("dp_replicate")
     if model._dmuon_enabled:
         assert dmuon is not None
-        if parallel_dims.dp_shard_enabled:
-            shard_mesh = parallel_dims.get_mesh("fsdp")
-            replicate_mesh = parallel_dims.get_optional_mesh("dp_replicate")
-            dmuon.dedicate_params(
-                model,
-                mesh=shard_mesh,
-                replicate_mesh=replicate_mesh,
-                predicate=predicate,
-                reshard_after_forward=False,
-            )
-        else:
-            replicate_mesh = parallel_dims.get_mesh("dp_replicate")
-            dmuon.dedicate_params_ddp(
-                model,
-                mesh=replicate_mesh,
-                predicate=predicate,
-            )
-
-    for layer in model.layers:
-        fully_shard(layer, **fsdp_config)
-    fully_shard(model, **fsdp_config)
-    disable_fsdp_gradient_division(model)
+        dmuon.dedicate_params_ddp(
+            model,
+            mesh=replicate_mesh,
+            predicate=predicate,
+        )
+        dmuon.replicate(model, mesh=replicate_mesh)
+    else:
+        replicate(model, device_mesh=replicate_mesh)
     return model
 
 

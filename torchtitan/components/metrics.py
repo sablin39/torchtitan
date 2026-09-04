@@ -567,6 +567,9 @@ class MetricsProcessor(Configurable):
         """
         assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
 
+        if device_type == "cuda":
+            device_module.synchronize()
+
         time_delta = time.perf_counter() - self.time_last_log
 
         # tokens per second per device, abbreviated as tps
@@ -637,6 +640,8 @@ class MetricsProcessor(Configurable):
     def log_validation(
         self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
     ):
+        if device_type == "cuda":
+            device_module.synchronize()
         time_delta = time.perf_counter() - self.time_last_log
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()

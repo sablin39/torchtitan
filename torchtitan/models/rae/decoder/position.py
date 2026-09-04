@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -296,8 +302,14 @@ class Cosmos3DRotaryPositionEmbedding(Module):
         key: torch.Tensor,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if query.shape != key.shape:
-            raise ValueError("Cosmos 3D RoPE query and key must have identical shapes")
+        if (
+            query.ndim != key.ndim
+            or query.shape[:-2] != key.shape[:-2]
+            or query.shape[-1] != key.shape[-1]
+        ):
+            raise ValueError(
+                "Cosmos 3D RoPE query and key must share token dimensions and head width"
+            )
         return self._rotate(query, positions), self._rotate(key, positions)
 
 

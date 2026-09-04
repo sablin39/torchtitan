@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -206,18 +212,43 @@ class RAEQwenCollator(Collator):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Collator.Config):
-        batch_size: int = 1
+        batch_size: int | None = 1
         media_kind: Literal["image", "video"] = "image"
+        token_budget: int | None = None
+        max_tokens_per_item: int | None = None
 
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
-        del context
-        if config.batch_size <= 0:
+        if config.batch_size is not None and config.batch_size <= 0:
             raise ValueError("RAE Qwen batch_size must be positive")
-        self.batch_size = config.batch_size
+        if config.token_budget is not None and config.token_budget <= 0:
+            raise ValueError("RAE Qwen token_budget must be positive")
+        if config.max_tokens_per_item is not None and config.max_tokens_per_item <= 0:
+            raise ValueError("RAE Qwen max_tokens_per_item must be positive")
+        if config.batch_size is None and config.max_tokens_per_item is None:
+            raise ValueError(
+                "RAE Qwen requires batch_size or max_tokens_per_item when token packing"
+            )
         self.media_kind = config.media_kind
+        context_token_budget = getattr(context, "num_tokens_per_batch", None)
+        self.token_budget = config.token_budget or context_token_budget or 0
+        self.max_tokens_per_item = config.max_tokens_per_item
+        self._enforce_token_budget = (
+            config.token_budget is not None or config.max_tokens_per_item is not None
+        )
+        if config.batch_size is None:
+            if self.max_tokens_per_item is None or self.token_budget <= 0:
+                raise ValueError(
+                    "RAE token-budget batching requires a positive token_budget "
+                    "and max_tokens_per_item"
+                )
+            self._num_rows_per_batch = self.token_budget // self.max_tokens_per_item
+            if self._num_rows_per_batch <= 0:
+                raise ValueError("RAE Qwen token_budget must fit max_tokens_per_item")
+        else:
+            self._num_rows_per_batch = config.batch_size
 
     def num_rows_per_batch(self) -> int:
-        return self.batch_size
+        return self._num_rows_per_batch
 
     def __call__(self, rows: Sequence[dict[str, Any]]) -> TrainerBatch:
         rows = list(rows)
@@ -244,6 +275,19 @@ class RAEQwenCollator(Collator):
         rae_grid_thw = grid_thw.clone()
         rae_grid_thw[:, 1:] //= merge_size
         sequence_lengths = rae_grid_thw.prod(dim=-1)
+        if self.max_tokens_per_item is not None and torch.any(
+            sequence_lengths > self.max_tokens_per_item
+        ):
+            raise ValueError(
+                "RAE Qwen row exceeds max_tokens_per_item; increase the token "
+                "ceiling or lower the processor max_pixels"
+            )
+        packed_tokens = int(sequence_lengths.sum().item())
+        if self._enforce_token_budget and packed_tokens > self.token_budget:
+            raise ValueError(
+                "RAE Qwen packed batch exceeds token_budget; lower max_pixels "
+                "or increase token_budget"
+            )
         media = [row["media"] for row in rows]
         fps = torch.stack([torch.as_tensor(row.get("fps", 0.0)) for row in rows])
         temporal_start = torch.stack(

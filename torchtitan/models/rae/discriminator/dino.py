@@ -1,8 +1,14 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 # Tensor dimensions: B=batch, L=patch tokens, C=channel.
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import torch
@@ -82,6 +88,7 @@ class HFModelFeatureDiscriminator(nn.Module):
         norm_type: str,
         using_spec_norm: bool,
         norm_eps: float,
+        input_size: int | None,
     ) -> None:
         super().__init__()
         try:
@@ -158,6 +165,48 @@ class HFModelFeatureDiscriminator(nn.Module):
         if len(self.image_mean) != 3 or len(self.image_std) != 3:
             raise ValueError("HF vision processor statistics must have three values")
         self.model_norm = getattr(self.model, "norm", nn.Identity())
+        self.patch_size = int(getattr(model_config, "patch_size", 16))
+        if self.patch_size <= 0:
+            raise ValueError("HF vision model patch_size must be positive")
+        if input_size is None:
+            input_size = int(getattr(model_config, "image_size", 224))
+        if input_size <= 0 or input_size % self.patch_size != 0:
+            raise ValueError(
+                "HF vision discriminator input_size must be positive and divisible "
+                "by the backbone patch size"
+            )
+        self.input_size = input_size
+        self._compiled_forward_group: (
+            Callable[[torch.Tensor], torch.Tensor] | None
+        ) = None
+        self._compile_backend: str | None = None
+        self._compile_warmup_pending = False
+
+    def train(self, mode: bool = True) -> "HFModelFeatureDiscriminator":
+        """Keep the frozen Hugging Face backbone in evaluation mode."""
+        super().train(mode)
+        self.model.eval()
+        return self
+
+    def compile_forward(self, *, backend: str) -> None:
+        self._compile_backend = backend
+        self._compile_warmup_pending = True
+
+    def _get_forward_group(self, sample_BCHW: torch.Tensor) -> Callable:
+        """Initialize compiled execution after Transformers installs its hooks."""
+        if self.training:
+            return self._forward_group
+        if self._compile_warmup_pending:
+            with torch.no_grad():
+                self._forward_group(sample_BCHW.detach())
+            assert self._compile_backend is not None
+            self._compiled_forward_group = torch.compile(
+                self._forward_group,
+                backend=self._compile_backend,
+                fullgraph=True,
+            )
+            self._compile_warmup_pending = False
+        return self._compiled_forward_group or self._forward_group
 
     def set_head_requires_grad(self, enabled: bool) -> None:
         self.model.requires_grad_(False)
@@ -185,6 +234,40 @@ class HFModelFeatureDiscriminator(nn.Module):
         ]
         return torch.cat(logits_B1, dim=1)
 
+    def _resize_for_backbone(self, image_CHW: torch.Tensor) -> torch.Tensor:
+        height, width = image_CHW.shape[-2:]
+        if (height, width) == (self.input_size, self.input_size):
+            return image_CHW
+        scale = min(self.input_size / height, self.input_size / width)
+        target_height = max(
+            self.patch_size,
+            min(
+                self.input_size,
+                int(height * scale) // self.patch_size * self.patch_size,
+            ),
+        )
+        target_width = max(
+            self.patch_size,
+            min(
+                self.input_size,
+                int(width * scale) // self.patch_size * self.patch_size,
+            ),
+        )
+        resized = torch.nn.functional.interpolate(
+            image_CHW.unsqueeze(0),
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        ).squeeze(0)
+        canvas = image_CHW.new_full(
+            (image_CHW.shape[0], self.input_size, self.input_size), 0.5
+        )
+        top = (self.input_size - target_height) // 2
+        left = (self.input_size - target_width) // 2
+        canvas[:, top : top + target_height, left : left + target_width] = resized
+        return canvas
+
     def forward(
         self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
     ) -> torch.Tensor:
@@ -209,13 +292,15 @@ class HFModelFeatureDiscriminator(nn.Module):
                 raise ValueError(
                     "HF vision discriminator expects three-channel CHW images"
                 )
+            image_CHW = self._resize_for_backbone(image_CHW)
             groups.setdefault(tuple(image_CHW.shape[-2:]), []).append(index)
             images[index] = image_CHW
         for indices in groups.values():
             group_BCHW = torch.stack([images[index] for index in indices])
             mean_1C11 = group_BCHW.new_tensor(self.image_mean).view(1, -1, 1, 1)
             std_1C11 = group_BCHW.new_tensor(self.image_std).view(1, 3, 1, 1)
-            group_logits_BH = self._forward_group(
+            forward_group = self._get_forward_group(group_BCHW)
+            group_logits_BH = forward_group(
                 ((group_BCHW + 1.0) * 0.5 - mean_1C11) / std_1C11
             )
             for group_index, image_index in enumerate(indices):

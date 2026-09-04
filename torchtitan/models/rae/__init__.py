@@ -1,8 +1,15 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from .data import RAEQwenCollator, RAEQwenProcessor
 from .decoder import (
     Cosmos3DRotaryPositionEmbedding,
     create_rae_packed_attention_mask,
     create_rae_padding_mask,
+    create_rae_static_varlen_metadata,
     create_rae_varlen_metadata,
     RAEAttention,
     RAEBlock,
@@ -19,6 +26,7 @@ __all__ = [
     "Cosmos3DRotaryPositionEmbedding",
     "create_rae_padding_mask",
     "create_rae_packed_attention_mask",
+    "create_rae_static_varlen_metadata",
     "create_rae_varlen_metadata",
     "RAEQwenCollator",
     "RAEQwenProcessor",
@@ -33,12 +41,29 @@ def __getattr__(name: str):
         return {"RAEStage1Trainer": RAEStage1Trainer, "RAEGANConfig": RAEGANConfig}[
             name
         ]
-    if name in {"model_registry", "rae_stage1_debug", "rae_stage1_dmuon"}:
-        from .config_registry import model_registry, rae_stage1_debug, rae_stage1_dmuon
+    if name in {
+        "model_registry",
+        "rae_stage1_debug",
+        "rae_stage1_dmuon",
+        "rae_stage1_openimages",
+        "rae_stage1_openimages_static",
+        "rae_stage1_dmuon_static",
+    }:
+        from .config_registry import (
+            model_registry,
+            rae_stage1_debug,
+            rae_stage1_dmuon,
+            rae_stage1_dmuon_static,
+            rae_stage1_openimages,
+            rae_stage1_openimages_static,
+        )
 
         return {
             "model_registry": model_registry,
             "rae_stage1_debug": rae_stage1_debug,
             "rae_stage1_dmuon": rae_stage1_dmuon,
+            "rae_stage1_openimages": rae_stage1_openimages,
+            "rae_stage1_openimages_static": rae_stage1_openimages_static,
+            "rae_stage1_dmuon_static": rae_stage1_dmuon_static,
         }[name]
     raise AttributeError(name)

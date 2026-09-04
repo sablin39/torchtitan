@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import math
@@ -11,7 +17,7 @@ def flatten_latents(
     grid_thw: torch.Tensor | None,
     *,
     latent_dim: int,
-    num_patches: int,
+    num_patches: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """Normalize RAE latent layouts and return post-merger grid metadata."""
     packed = latents.ndim == 2
@@ -42,28 +48,35 @@ def flatten_latents(
     if grid_thw is None:
         if packed:
             raise ValueError("Packed RAE latents require grid_thw metadata")
-        token_count = tokens.shape[1]
-        side = int(math.sqrt(token_count))
-        if side * side != token_count:
-            raise ValueError(
-                "RAE latent token count must be square when grid_thw is omitted"
-            )
-        target_side = int(math.sqrt(num_patches))
-        if token_count != num_patches:
-            tokens = (
-                F.interpolate(
-                    tokens.transpose(1, 2).reshape(
-                        tokens.shape[0], latent_dim, side, side
-                    ),
-                    size=(target_side, target_side),
-                    mode="bilinear",
-                    align_corners=False,
+        if latents.ndim == 4 and num_patches is None:
+            target_height, target_width = latents.shape[-2:]
+        else:
+            token_count = tokens.shape[1]
+            side = int(math.sqrt(token_count))
+            if side * side != token_count:
+                raise ValueError(
+                    "RAE latent token count must be square when grid_thw is omitted"
                 )
-                .flatten(2)
-                .transpose(1, 2)
-            )
+            if num_patches is None:
+                target_height = target_width = side
+            else:
+                target_side = int(math.sqrt(num_patches))
+                if token_count != num_patches:
+                    tokens = (
+                        F.interpolate(
+                            tokens.transpose(1, 2).reshape(
+                                tokens.shape[0], latent_dim, side, side
+                            ),
+                            size=(target_side, target_side),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        .flatten(2)
+                        .transpose(1, 2)
+                    )
+                target_height = target_width = target_side
         grid = torch.tensor(
-            [1, target_side, target_side],
+            [1, target_height, target_width],
             dtype=torch.long,
             device=tokens.device,
         ).expand(tokens.shape[0], -1)

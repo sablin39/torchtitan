@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -64,6 +70,8 @@ class RAEFeatureDiscriminator(nn.Module):
         hf_norm_type: str = "bn"
         hf_using_spec_norm: bool = True
         hf_norm_eps: float = 1e-6
+        backbone_batch_size: int = 8
+        hf_input_size: int | None = None
 
         def __post_init__(self) -> None:
             if self.feature_channels <= 0:
@@ -80,6 +88,10 @@ class RAEFeatureDiscriminator(nn.Module):
                 )
             if self.hf_norm_eps <= 0:
                 raise ValueError("discriminator.hf_norm_eps must be positive")
+            if self.backbone_batch_size <= 0:
+                raise ValueError("discriminator.backbone_batch_size must be positive")
+            if self.hf_input_size is not None and self.hf_input_size <= 0:
+                raise ValueError("discriminator.hf_input_size must be positive")
 
     def __init__(
         self,
@@ -90,6 +102,7 @@ class RAEFeatureDiscriminator(nn.Module):
         super().__init__()
         config = config or self.Config()
         device = device or torch.device("cpu")
+        self.backbone_batch_size = config.backbone_batch_size
         self._is_hf_model = False
         if config.backbone_kind == "fixed":
             self.backbone = FrozenImageFeatures(config.feature_channels)
@@ -102,6 +115,7 @@ class RAEFeatureDiscriminator(nn.Module):
                 norm_type=config.hf_norm_type,
                 using_spec_norm=config.hf_using_spec_norm,
                 norm_eps=config.hf_norm_eps,
+                input_size=config.hf_input_size,
             )
             self._is_hf_model = True
         else:
@@ -137,6 +151,16 @@ class RAEFeatureDiscriminator(nn.Module):
             self.backbone.requires_grad_(False)
             self.heads.requires_grad_(enabled)
 
+    def train(self, mode: bool = True) -> "RAEFeatureDiscriminator":
+        super().train(mode)
+        if self._is_hf_model:
+            self.backbone.model.eval()
+        return self
+
+    def compile_forward(self, *, backend: str) -> None:
+        if self._is_hf_model:
+            self.backbone.compile_forward(backend=backend)
+
     def forward(
         self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
     ) -> torch.Tensor:
@@ -145,7 +169,13 @@ class RAEFeatureDiscriminator(nn.Module):
                 images = (images_BCHW + 1.0) * 0.5
             else:
                 images = [(image + 1.0) * 0.5 for image in images_BCHW]
-            return self.backbone(images)
+            return torch.cat(
+                [
+                    self.backbone(images[start : start + self.backbone_batch_size])
+                    for start in range(0, len(images), self.backbone_batch_size)
+                ],
+                dim=0,
+            )
         if isinstance(images_BCHW, torch.Tensor):
             if images_BCHW.ndim != 4:
                 raise ValueError("Fixed RAE discriminator expects BCHW images")

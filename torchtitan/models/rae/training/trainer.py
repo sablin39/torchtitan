@@ -1,6 +1,11 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
-import copy
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -18,6 +23,7 @@ from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.optimizer.dmuon import load_dmuon
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.trainer import Trainer
+from ..decoder import create_rae_static_varlen_metadata
 from ..discriminator import (
     gan_discriminator_loss,
     gan_generator_loss,
@@ -28,6 +34,7 @@ from ..encoder import FrozenRAEEncoder, RAEEncoderConfig
 
 from .augmentation import DiscriminatorAugmentation
 from .metrics import log_stage1_metrics
+from .validation import RAEValidator
 
 
 ImageBatch = torch.Tensor | list[torch.Tensor]
@@ -211,12 +218,26 @@ class RAEStage1Trainer(Trainer):
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
+        self.validator = RAEValidator(config.validator, self)
         decoder = self.model_parts[0]
+        static_sequence_length = int(getattr(decoder, "static_sequence_length", 0))
+        if not config.training.disable_cuda_graphs and (
+            self.device.type != "cuda" or static_sequence_length <= 0
+        ):
+            raise ValueError(
+                "RAE CUDA graphs require a CUDA device and a positive "
+                "decoder static_sequence_length"
+            )
+        self._static_sequence_length = static_sequence_length
         self._adaptive_weight_enabled = not any(
             hasattr(optimizer, "_dedicated_params") for optimizer in self.optimizers
         )
         self.encoder = FrozenRAEEncoder(config.encoder, self.device)
-        if decoder.image_size != self.encoder.supervision_image_size:
+        if (
+            decoder.image_size != -1
+            and self.encoder.supervision_image_size is not None
+            and decoder.image_size != self.encoder.supervision_image_size
+        ):
             raise ValueError(
                 "RAE decoder image_size must equal encoder image_size / merge_size: "
                 f"{decoder.image_size} != {self.encoder.supervision_image_size}"
@@ -225,6 +246,8 @@ class RAEStage1Trainer(Trainer):
             config.discriminator,
             device=self.device,
         ).to(self.device)
+        if config.compile.enable and "discriminator" in config.compile.components:
+            self.discriminator.compile_forward(backend=config.compile.backend)
         if (
             dist.is_available()
             and dist.is_initialized()
@@ -295,35 +318,40 @@ class RAEStage1Trainer(Trainer):
 
         return schedule
 
-    def _build_ema(self, decoder: nn.Module):
-        try:
-            ema_model = copy.deepcopy(decoder).to(self.device).eval()
-            ema_model.requires_grad_(False)
-            return ema_model, None
-        except (RuntimeError, TypeError):
-            config = getattr(decoder, "config", None)
-            if config is None:
-                raise RuntimeError(
-                    "RAE EMA could not clone the decoder after parallelization; "
-                    "the decoder must expose its config for a materialized EMA copy."
-                ) from None
-            ema_model = config.build().to(self.device)
-            ema_model.init_states()
-            if getattr(decoder, "_dmuon_enabled", False) and hasattr(
-                decoder, "_dedicated_comm_ctx"
-            ):
-                dmuon = load_dmuon()
-                state = dmuon.get_model_state_dict(
-                    decoder, cpu_offload=False, rank0_only=False
-                )
-                ema_model.load_state_dict(state, strict=False)
-            else:
-                raise RuntimeError(
-                    "RAE EMA cloning failed for a non-DMuon parallelized decoder."
-                ) from None
-            ema_model.eval()
-            ema_model.requires_grad_(False)
-            return ema_model, None
+    def _build_ema(
+        self, decoder: nn.Module
+    ) -> tuple[nn.Module, dict[str, torch.Tensor] | None]:
+        config = getattr(decoder, "config", None)
+        if config is None:
+            raise RuntimeError(
+                "RAE EMA requires the decoder to expose its config for an "
+                "unsharded EMA copy."
+            )
+
+        ema_model = config.build().to(self.device)
+        ema_model.init_states()
+        if getattr(decoder, "_dmuon_enabled", False) and hasattr(
+            decoder, "_dedicated_comm_ctx"
+        ):
+            dmuon = load_dmuon()
+            state = dmuon.get_model_state_dict(
+                decoder, cpu_offload=False, rank0_only=False
+            )
+        else:
+            state = decoder.state_dict()
+        normalized_state = {
+            name.replace("._checkpoint_wrapped_module.", "."): value
+            for name, value in state.items()
+        }
+        missing, _unexpected = ema_model.load_state_dict(normalized_state, strict=False)
+        if missing:
+            raise RuntimeError(
+                "RAE EMA initialization is missing decoder parameters: "
+                + ", ".join(missing)
+            )
+        ema_model.eval()
+        ema_model.requires_grad_(False)
+        return ema_model, None
 
     @torch.no_grad()
     def _update_ema(self) -> None:
@@ -339,6 +367,13 @@ class RAEStage1Trainer(Trainer):
                 )
                 for name, ema_parameter in self.ema_model.named_parameters():
                     parameter = state.get(name)
+                    if parameter is None and name.startswith("layers."):
+                        layer_prefix, layer_id, remainder = name.split(".", 2)
+                        wrapped_name = (
+                            f"{layer_prefix}.{layer_id}._checkpoint_wrapped_module."
+                            f"{remainder}"
+                        )
+                        parameter = state.get(wrapped_name)
                     if parameter is None:
                         raise RuntimeError(
                             f"DMuon model state is missing EMA parameter {name!r}"
@@ -381,7 +416,7 @@ class RAEStage1Trainer(Trainer):
         return squared_norm.sqrt()
 
     def _next_images(
-        self, data_iterator: Iterator
+        self, data_iterator: Iterator, *, count_training_stats: bool = True
     ) -> tuple[ImageBatch, Mapping[str, Any] | None]:
         try:
             input_dict, labels = next(data_iterator)
@@ -393,9 +428,10 @@ class RAEStage1Trainer(Trainer):
         # defined per post-merger latent token, so replace that sample count after
         # the encoder exposes the actual runtime grid below.
         self.metrics_processor.ntokens_since_last_log -= labels.numel()
-        self.ntokens_seen += labels.numel()
-        self.n_valid_tokens_seen += labels.numel()
-        self.n_nonpad_tokens_seen += labels.numel()
+        if count_training_stats:
+            self.ntokens_seen += labels.numel()
+            self.n_valid_tokens_seen += labels.numel()
+            self.n_nonpad_tokens_seen += labels.numel()
         images = input_dict["input"]
         encoder_input: Mapping[str, Any] | None = None
         if "media" in input_dict:
@@ -450,9 +486,12 @@ class RAEStage1Trainer(Trainer):
         if isinstance(images_BCHW, (list, tuple)):
             image_items = list(images_BCHW)
             if target_sizes is None:
-                target_sizes = [
-                    (self.encoder.supervision_image_size,) * 2 for _ in image_items
-                ]
+                target_size = self.encoder.supervision_image_size
+                target_sizes = (
+                    [(target_size,) * 2 for _ in image_items]
+                    if target_size is not None
+                    else [tuple(image.shape[-2:]) for image in image_items]
+                )
             if len(target_sizes) != len(image_items):
                 raise ValueError("Supervision target sizes must match image count")
             return [
@@ -475,6 +514,8 @@ class RAEStage1Trainer(Trainer):
         if images_BCHW.ndim != 4:
             raise ValueError("RAE supervision expects BCHW or BTCHW images")
         target_size = self.encoder.supervision_image_size
+        if target_size is None:
+            return images_BCHW.clamp(0, 1)
         if images_BCHW.shape[-2:] == (target_size, target_size):
             return images_BCHW
         return F.interpolate(
@@ -513,6 +554,54 @@ class RAEStage1Trainer(Trainer):
             return list(images.unbind(0))
         return list(images)
 
+    def _static_decode(
+        self,
+        decoder: nn.Module,
+        latents: torch.Tensor,
+        grid_thw: torch.Tensor,
+        fps: torch.Tensor | float | None,
+        temporal_start: torch.Tensor | float,
+    ) -> torch.Tensor:
+        if self._static_sequence_length <= 0:
+            raise ValueError("RAE static decode requires a positive token budget")
+        if latents.ndim == 3:
+            latents_TD = latents.reshape(-1, latents.shape[-1])
+        elif latents.ndim == 2:
+            latents_TD = latents
+        else:
+            raise ValueError(
+                "RAE static decode expects packed or batched token latents"
+            )
+        grid = grid_thw.reshape(-1, 3).to(device=latents.device, dtype=torch.long)
+        sequence_lengths = grid.prod(dim=-1)
+        valid_length = int(sequence_lengths.sum().item())
+        static_length = self._static_sequence_length
+        if static_length < valid_length:
+            raise ValueError(
+                "RAE decoder static_sequence_length is smaller than this batch; "
+                f"need at least {valid_length} token slots, got {static_length}"
+            )
+        latents_static = F.pad(latents_TD, (0, 0, 0, static_length - valid_length))
+        rope = decoder.layers[0].attention.rope
+        positions = rope.build_packed_positions(
+            grid,
+            fps=fps,
+            temporal_start=temporal_start,
+        )
+        positions = F.pad(positions, (0, 0, 0, static_length - valid_length))
+        metadata = create_rae_static_varlen_metadata(
+            sequence_lengths,
+            static_length,
+            device=latents.device,
+        )
+        patch_logits = decoder(
+            latents_static,
+            padded_positions_T3=positions,
+            attention_masks=metadata,
+            return_padded=True,
+        )
+        return patch_logits[:valid_length]
+
     def _encode_decode(
         self,
         decoder: nn.Module,
@@ -531,16 +620,30 @@ class RAEStage1Trainer(Trainer):
             raise RuntimeError("RAE encoder must return grid metadata for Stage 1")
         latents, grid_thw = encoded
         if add_noise:
-            self.metrics_processor.ntokens_since_last_log += int(grid_thw.prod().item())
-        decoded = decoder(
-            latents,
-            grid_thw=grid_thw,
-            fps=self.encoder.last_fps,
-            temporal_start=self.encoder.last_temporal_start
+            self.metrics_processor.ntokens_since_last_log += int(
+                grid_thw.prod(dim=-1).sum().item()
+            )
+        temporal_start = (
+            self.encoder.last_temporal_start
             if self.encoder.last_temporal_start is not None
-            else 0.0,
+            else 0.0
         )
-        if latents.ndim == 2:
+        if self._static_sequence_length > 0:
+            decoded = self._static_decode(
+                decoder,
+                latents,
+                grid_thw,
+                self.encoder.last_fps,
+                temporal_start,
+            )
+        else:
+            decoded = decoder(
+                latents,
+                grid_thw=grid_thw,
+                fps=self.encoder.last_fps,
+                temporal_start=temporal_start,
+            )
+        if latents.ndim == 2 or decoded.ndim == 2:
             return decoder.unpatchify_packed(
                 decoded,
                 grid_thw,
@@ -582,6 +685,7 @@ class RAEStage1Trainer(Trainer):
         use_perceptual = step >= gan.perceptual_start_step and gan.perceptual_weight > 0
         num_microbatches = self.gradient_accumulation_steps
         images_batches: list[ImageBatch] = []
+        encoder_inputs: list[Mapping[str, Any] | None] = []
 
         self.optimizers.zero_grad(set_to_none=True)
         self.disc_optimizer.zero_grad(set_to_none=True)
@@ -593,6 +697,7 @@ class RAEStage1Trainer(Trainer):
         for _ in range(num_microbatches):
             images, encoder_input = self._next_images(data_iterator)
             images_batches.append(images)
+            encoder_inputs.append(encoder_input)
             image_items = self._image_items(images)
             with torch.autocast(
                 device_type=self.device.type,
@@ -697,10 +802,13 @@ class RAEStage1Trainer(Trainer):
                 ):
                     fake_items = [
                         fake.detach()
+                        for batch, encoder_input in zip(
+                            images_batches, encoder_inputs, strict=True
+                        )
                         for fake in self._encode_decode(
                             decoder,
-                            image_items,
-                            None,
+                            batch,
+                            encoder_input,
                             add_noise=False,
                         )
                     ]

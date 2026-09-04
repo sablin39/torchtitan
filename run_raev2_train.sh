@@ -1,0 +1,40 @@
+
+set -euo pipefail
+
+
+cd /home/rwkv/molin/torchtitan
+source .venv/bin/activate
+
+
+
+export WANDB_PROJECT=rae-stage1
+export WANDB_RUN_NAME=rae-openimages-static-$(date +%Y%m%d-%H%M%S)
+export WANDB_MODE=offline
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+
+N_EPOCHS=10
+DP_DEGREE=4
+ACCUM_STEPS=8
+TOKENS_PER_MICROBATCH=64512
+TOKENS_PER_EPOCH=1000000000
+RAE_CONFIG=${RAE_CONFIG:-rae_stage1_openimages_static}
+
+TOKENS_PER_STEP=$((TOKENS_PER_MICROBATCH * DP_DEGREE * ACCUM_STEPS))
+TRAINING_STEPS=$(((
+    N_EPOCHS * TOKENS_PER_EPOCH + TOKENS_PER_STEP - 1
+) / TOKENS_PER_STEP))
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+  --standalone \
+  --nproc_per_node="${DP_DEGREE}" \
+  -m torchtitan.train \
+  --module rae \
+  --config "${RAE_CONFIG}" \
+  --training.num_tokens_per_microbatch_per_dp_rank "${TOKENS_PER_MICROBATCH}" \
+  --training.num_tokens_per_train_step "${TOKENS_PER_STEP}" \
+  --training.steps "${TRAINING_STEPS}" \
+  --checkpoint.folder checkpoint/rae_openimages_gqa_v2 \
+  --validator.freq 2000 \
+  --validator.steps 16

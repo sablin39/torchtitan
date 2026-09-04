@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import math
@@ -38,6 +44,8 @@ def _merge_qwen_hidden_states(
 
 @dataclass(frozen=True, slots=True)
 class RAEEncoderConfig:
+    """Frozen encoder settings; Qwen accepts ``image_size=-1`` dynamically."""
+
     kind: str = "fixed"
     name: str = ""
     latent_dim: int = 768
@@ -50,11 +58,13 @@ class RAEEncoderConfig:
     merge_size: int = 1
 
     def __post_init__(self) -> None:
-        if self.image_size <= 0:
-            raise ValueError("encoder.image_size must be positive")
+        if self.image_size == 0 or (self.image_size < -1):
+            raise ValueError("encoder.image_size must be -1 or positive")
+        if self.kind != "qwen" and self.image_size == -1:
+            raise ValueError("encoder.image_size=-1 is only supported for Qwen")
         if self.merge_size <= 0:
             raise ValueError("encoder.merge_size must be positive")
-        if self.image_size % self.merge_size:
+        if self.image_size != -1 and self.image_size % self.merge_size:
             raise ValueError("encoder.image_size must be divisible by merge_size")
 
 
@@ -74,7 +84,9 @@ class FrozenRAEEncoder(nn.Module):
         self.kind = config.kind
         self.layer_indices = config.layer_indices
         self.merge_size = config.merge_size
-        self.supervision_image_size = config.image_size // config.merge_size
+        self.supervision_image_size = (
+            None if config.image_size == -1 else config.image_size // config.merge_size
+        )
         self.latent_mean = None
         self.latent_var = None
         if config.normalization_stat_path is not None:
@@ -218,7 +230,9 @@ class FrozenRAEEncoder(nn.Module):
                 "encoder.merge_size does not match Qwen vision config: "
                 f"{config.merge_size} != {vision_config.spatial_merge_size}"
             )
-        if config.image_size % (vision_config.patch_size * config.merge_size):
+        if config.image_size != -1 and config.image_size % (
+            vision_config.patch_size * config.merge_size
+        ):
             raise ValueError(
                 "Qwen encoder image_size must be divisible by patch_size * merge_size"
             )
@@ -652,7 +666,9 @@ class FrozenRAEEncoder(nn.Module):
         if self.external is not None:
             if tokens_BLC is None:
                 raise RuntimeError("RAE external encoder did not return tokens")
-            if tokens_BLC.ndim == 3:
+            if tokens_BLC.ndim == 3 and self.kind == "qwen" and return_grid_thw:
+                latents = tokens_BLC.reshape(-1, tokens_BLC.shape[-1])
+            elif tokens_BLC.ndim == 3:
                 side = int(math.sqrt(tokens_BLC.shape[1]))
                 if side * side != tokens_BLC.shape[1]:
                     if return_grid_thw:

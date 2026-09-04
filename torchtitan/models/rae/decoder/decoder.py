@@ -1,7 +1,13 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, cast, Literal
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +27,7 @@ from .layout import (
 from .packing import (
     create_rae_packed_attention_mask,
     create_rae_padding_mask,
+    create_rae_static_varlen_metadata,
     create_rae_varlen_metadata,
 )
 from .position import Cosmos3DRotaryPositionEmbedding
@@ -34,6 +41,7 @@ class RAEAttention(Module):
     class Config(Module.Config):
         hidden_size: int
         num_heads: int
+        num_kv_heads: int
         qkv_bias: bool = True
         attention_backend: Literal["sdpa", "varlen"] = "sdpa"
         rope_theta: float = 10000.0
@@ -46,8 +54,18 @@ class RAEAttention(Module):
         super().__init__()
         if config.hidden_size % config.num_heads != 0:
             raise ValueError("RAE hidden_size must be divisible by num_heads")
+        if config.num_kv_heads <= 0:
+            raise ValueError("RAE num_kv_heads must be positive")
+        if config.num_kv_heads > config.num_heads:
+            raise ValueError("RAE num_kv_heads cannot exceed num_heads")
+        if config.num_heads % config.num_kv_heads != 0:
+            raise ValueError("RAE num_heads must be divisible by num_kv_heads")
         self.num_heads = config.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.enable_gqa = self.num_heads != self.num_kv_heads
         self.head_dim = config.hidden_size // config.num_heads
+        if self.head_dim % 2:
+            raise ValueError("RAE attention head_dim must be even for rotary embedding")
         self.attention_backend = config.attention_backend
         if self.attention_backend not in {"sdpa", "varlen"}:
             raise ValueError(
@@ -55,7 +73,7 @@ class RAEAttention(Module):
             )
         self.qkv = Linear.Config(
             in_features=config.hidden_size,
-            out_features=3 * config.hidden_size,
+            out_features=(self.num_heads + 2 * self.num_kv_heads) * self.head_dim,
             bias=config.qkv_bias,
         ).build()
         self.proj = Linear.Config(
@@ -88,38 +106,55 @@ class RAEAttention(Module):
             if self.attention_backend == "varlen":
                 if not isinstance(attention_masks, VarlenMetadata):
                     raise ValueError(
-                        "RAE varlen attention requires VarlenMetadata for packed latents"
+                        "RAE varlen attention requires VarlenMetadata for packed "
+                        "latents"
                     )
             elif isinstance(attention_masks, VarlenMetadata):
                 raise ValueError(
                     "VarlenMetadata requires RAE attention_backend='varlen'"
                 )
             token_count, hidden = x.shape
-            qkv_T3NH: torch.Tensor = self.qkv(x).view(
-                token_count, 3, self.num_heads, self.head_dim
+            qkv_TD = self.qkv(x)
+            q_TNqH = qkv_TD[..., : self.num_heads * self.head_dim].view(
+                token_count, self.num_heads, self.head_dim
             )
-            q_TNH, k_TNH, v_TNH = qkv_T3NH.unbind(dim=1)
+            kv_start = self.num_heads * self.head_dim
+            kv_width = self.num_kv_heads * self.head_dim
+            k_TNkvH = qkv_TD[..., kv_start : kv_start + kv_width].view(
+                token_count, self.num_kv_heads, self.head_dim
+            )
+            v_TNkvH = qkv_TD[..., kv_start + kv_width :].view(
+                token_count, self.num_kv_heads, self.head_dim
+            )
             if positions is not None:
-                q_TNH, k_TNH = self.rope(q_TNH, k_TNH, positions)
+                q_TNqH, k_TNkvH = self.rope(q_TNqH, k_TNkvH, positions)
             if self.attention_backend == "varlen":
                 assert self.varlen_attention is not None
-                out_TNH = self.varlen_attention(
-                    q_TNH,
-                    k_TNH,
-                    v_TNH,
+                out_TNqH = self.varlen_attention(
+                    q_TNqH,
+                    k_TNkvH,
+                    v_TNkvH,
                     attention_masks=attention_masks,
                     scale=self.head_dim**-0.5,
+                    enable_gqa=self.enable_gqa,
                 )
             else:
-                out_NTH = F.scaled_dot_product_attention(
-                    q_TNH.transpose(0, 1),
-                    k_TNH.transpose(0, 1),
-                    v_TNH.transpose(0, 1),
+                if attention_masks is not None and not isinstance(
+                    attention_masks, torch.Tensor
+                ):
+                    raise ValueError(
+                        "Packed SDPA attention requires a tensor attention mask"
+                    )
+                out_NqTH = F.scaled_dot_product_attention(
+                    q_TNqH.transpose(0, 1),
+                    k_TNkvH.transpose(0, 1),
+                    v_TNkvH.transpose(0, 1),
                     attn_mask=attention_masks,
                     scale=self.head_dim**-0.5,
+                    enable_gqa=self.enable_gqa,
                 )
-                out_TNH = out_NTH.transpose(0, 1)
-            return self.proj(out_TNH.reshape(token_count, hidden))
+                out_TNqH = out_NqTH.transpose(0, 1)
+            return self.proj(out_TNqH.reshape(token_count, hidden))
 
         if x.ndim != 3:
             raise ValueError("RAE attention input must have shape (B, L, D) or (T, D)")
@@ -128,21 +163,34 @@ class RAEAttention(Module):
                 "RAE varlen attention consumes packed (T, D) latents; flatten the "
                 "batch and provide VarlenMetadata"
             )
+        if attention_masks is not None and not isinstance(
+            attention_masks, torch.Tensor
+        ):
+            raise ValueError("Batched SDPA attention requires a tensor attention mask")
         batch, length, hidden = x.shape
-        qkv_BL3NH: torch.Tensor = self.qkv(x).view(
-            batch, length, 3, self.num_heads, self.head_dim
+        qkv_BLD = self.qkv(x)
+        q_BLNqH = qkv_BLD[..., : self.num_heads * self.head_dim].view(
+            batch, length, self.num_heads, self.head_dim
         )
-        q_BLNH, k_BLNH, v_BLNH = qkv_BL3NH.unbind(dim=2)
+        kv_start = self.num_heads * self.head_dim
+        kv_width = self.num_kv_heads * self.head_dim
+        k_BLNkvH = qkv_BLD[..., kv_start : kv_start + kv_width].view(
+            batch, length, self.num_kv_heads, self.head_dim
+        )
+        v_BLNkvH = qkv_BLD[..., kv_start + kv_width :].view(
+            batch, length, self.num_kv_heads, self.head_dim
+        )
         if positions is not None:
-            q_BLNH, k_BLNH = self.rope(q_BLNH, k_BLNH, positions)
-        out_BNLH = F.scaled_dot_product_attention(
-            q_BLNH.transpose(1, 2),
-            k_BLNH.transpose(1, 2),
-            v_BLNH.transpose(1, 2),
+            q_BLNqH, k_BLNkvH = self.rope(q_BLNqH, k_BLNkvH, positions)
+        out_BNqLH = F.scaled_dot_product_attention(
+            q_BLNqH.transpose(1, 2),
+            k_BLNkvH.transpose(1, 2),
+            v_BLNkvH.transpose(1, 2),
             attn_mask=attention_masks,
             scale=self.head_dim**-0.5,
+            enable_gqa=self.enable_gqa,
         )
-        out_BLD = out_BNLH.transpose(1, 2).reshape(batch, length, hidden)
+        out_BLD = out_BNqLH.transpose(1, 2).reshape(batch, length, hidden)
         return self.proj(out_BLD)
 
 
@@ -154,6 +202,11 @@ class RAEFeedForward(Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
+        self.gate = Linear.Config(
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
+            bias=True,
+        ).build()
         self.up = Linear.Config(
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
@@ -166,7 +219,7 @@ class RAEFeedForward(Module):
         ).build()
 
     def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
-        return self.down(F.gelu(self.up(x_BLD), approximate="tanh"))
+        return self.down(F.silu(self.gate(x_BLD)) * self.up(x_BLD))
 
 
 class RAEBlock(Module):
@@ -174,6 +227,7 @@ class RAEBlock(Module):
     class Config(Module.Config):
         hidden_size: int
         num_heads: int
+        num_kv_heads: int
         intermediate_size: int
         norm_eps: float = 1e-6
         attention_backend: Literal["sdpa", "varlen"] = "sdpa"
@@ -182,6 +236,7 @@ class RAEBlock(Module):
         spatial_merge_size: int = 2
         temporal_patch_size: int = 2
         reference_fps: float = 24.0
+        residual_dropout: float = 0.1
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -192,6 +247,7 @@ class RAEBlock(Module):
         self.attention = RAEAttention.Config(
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
+            num_kv_heads=config.num_kv_heads,
             attention_backend=config.attention_backend,
             rope_theta=config.rope_theta,
             rope_scale=config.rope_scale,
@@ -207,6 +263,9 @@ class RAEBlock(Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
         ).build()
+        if not 0.0 <= config.residual_dropout < 1.0:
+            raise ValueError("RAE residual_dropout must be in [0, 1)")
+        self.residual_dropout = config.residual_dropout
 
     def forward(
         self,
@@ -215,12 +274,21 @@ class RAEBlock(Module):
         positions: torch.Tensor | None = None,
         attention_masks: torch.Tensor | VarlenMetadata | None = None,
     ) -> torch.Tensor:
-        x = x + self.attention(
+        attention_output = self.attention(
             self.norm1(x),
             positions=positions,
             attention_masks=attention_masks,
         )
-        return x + self.feed_forward(self.norm2(x))
+        x = x + F.dropout(
+            attention_output,
+            p=self.residual_dropout,
+            training=self.training,
+        )
+        return x + F.dropout(
+            self.feed_forward(self.norm2(x)),
+            p=self.residual_dropout,
+            training=self.training,
+        )
 
 
 class RAEDecoder(BaseModel):
@@ -232,7 +300,8 @@ class RAEDecoder(BaseModel):
     inputs return patch logits; call :meth:`unpatchify_packed` to recover a
     list of variable-size clips. The encoder, GAN discriminator, and EMA copy
     intentionally live in the Stage 1 trainer so this model remains compatible
-    with TorchTitan meta construction.
+    with TorchTitan meta construction. Set ``Config.image_size=-1`` when
+    runtime grid metadata should determine the output resolution.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -248,7 +317,8 @@ class RAEDecoder(BaseModel):
         patch_size: int = 16
         hidden_size: int = 512
         num_layers: int = 8
-        num_heads: int = 16
+        num_heads: int = 8
+        num_kv_heads: int = 4
         intermediate_size: int = 2048
         norm_eps: float = 1e-6
         qkv_bias: bool = True
@@ -258,25 +328,42 @@ class RAEDecoder(BaseModel):
         spatial_merge_size: int = 2
         temporal_patch_size: int = 2
         reference_fps: float = 24.0
+        residual_dropout: float = 0.1
+        static_sequence_length: int = 0
         use_dmuon: bool = False
 
         def update_from_config(self, *, config, **kwargs) -> None:
             del kwargs
-            if self.image_size % self.patch_size != 0:
+            if self.image_size == 0 or self.image_size < -1:
+                raise ValueError("RAE image_size must be -1 or positive")
+            if self.image_size != -1 and self.image_size % self.patch_size != 0:
                 raise ValueError("RAE image_size must be divisible by patch_size")
             if self.attention_backend not in {"sdpa", "varlen"}:
                 raise ValueError(
                     f"Unsupported RAE attention backend: {self.attention_backend}"
                 )
+            if self.hidden_size % self.num_heads != 0:
+                raise ValueError("RAE hidden_size must be divisible by num_heads")
+            if self.num_kv_heads <= 0 or self.num_kv_heads > self.num_heads:
+                raise ValueError("RAE num_kv_heads must be between one and num_heads")
+            if self.num_heads % self.num_kv_heads != 0:
+                raise ValueError("RAE num_heads must be divisible by num_kv_heads")
+            if (self.hidden_size // self.num_heads) % 2:
+                raise ValueError("RAE attention head_dim must be even")
             if self.spatial_merge_size <= 0 or self.temporal_patch_size <= 0:
                 raise ValueError("RAE patch factors must be positive")
             if self.reference_fps <= 0:
                 raise ValueError("RAE reference_fps must be positive")
+            if not 0.0 <= self.residual_dropout < 1.0:
+                raise ValueError("RAE residual_dropout must be in [0, 1)")
+            if self.static_sequence_length < 0:
+                raise ValueError("RAE static_sequence_length must be non-negative")
             if not self.layers:
                 self.layers = [
                     RAEBlock.Config(
                         hidden_size=self.hidden_size,
                         num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
                         intermediate_size=self.intermediate_size,
                         norm_eps=self.norm_eps,
                         attention_backend=self.attention_backend,
@@ -285,6 +372,7 @@ class RAEDecoder(BaseModel):
                         spatial_merge_size=self.spatial_merge_size,
                         temporal_patch_size=self.temporal_patch_size,
                         reference_fps=self.reference_fps,
+                        residual_dropout=self.residual_dropout,
                     )
                     for _ in range(self.num_layers)
                 ]
@@ -304,10 +392,15 @@ class RAEDecoder(BaseModel):
         self.latent_dim = config.latent_dim
         self.image_size = config.image_size
         self.patch_size = config.patch_size
-        self.num_patches = (config.image_size // config.patch_size) ** 2
+        self.num_patches = (
+            None
+            if config.image_size == -1
+            else (config.image_size // config.patch_size) ** 2
+        )
         self.spatial_merge_size = config.spatial_merge_size
         self.temporal_patch_size = config.temporal_patch_size
         self.reference_fps = config.reference_fps
+        self.static_sequence_length = config.static_sequence_length
         self.input_projection = Linear.Config(
             in_features=config.latent_dim,
             out_features=config.hidden_size,
@@ -344,6 +437,34 @@ class RAEDecoder(BaseModel):
             patch_size=patch_size,
         )
 
+    def forward_padded(
+        self,
+        latents_TD: torch.Tensor,
+        positions_T3: torch.Tensor,
+        attention_masks: torch.Tensor | VarlenMetadata,
+    ) -> torch.Tensor:
+        """Run the fixed-shape packed decoder used by CUDA graph capture."""
+        return self._forward_padded_impl(latents_TD, positions_T3, attention_masks)
+
+    def _forward_padded_impl(
+        self,
+        latents_TD: torch.Tensor,
+        positions_T3: torch.Tensor,
+        attention_masks: torch.Tensor | VarlenMetadata,
+    ) -> torch.Tensor:
+        if latents_TD.ndim != 2 or latents_TD.shape[-1] != self.latent_dim:
+            raise ValueError("RAE padded latents must have shape (T, latent_dim)")
+        if positions_T3.shape != (latents_TD.shape[0], 3):
+            raise ValueError("RAE padded positions must match the latent sequence")
+        hidden_TD = self.input_projection(latents_TD)
+        for layer in self.layers:
+            hidden_TD = layer(
+                hidden_TD,
+                positions=positions_T3,
+                attention_masks=attention_masks,
+            )
+        return self.decoder_pred(self.decoder_norm(hidden_TD))
+
     def forward(
         self,
         latents: torch.Tensor,
@@ -352,17 +473,50 @@ class RAEDecoder(BaseModel):
         fps: torch.Tensor | float | None = None,
         temporal_start: torch.Tensor | float = 0.0,
         attention_masks: torch.Tensor | VarlenMetadata | None = None,
+        return_padded: bool = False,
+        padded_positions_T3: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if padded_positions_T3 is not None:
+            if attention_masks is None:
+                raise ValueError(
+                    "RAE padded decoding requires fixed varlen attention metadata"
+                )
+            return self._forward_padded_impl(
+                latents,
+                padded_positions_T3,
+                attention_masks,
+            )
         tokens, grid, packed = flatten_latents(
             latents,
             grid_thw,
             latent_dim=self.latent_dim,
             num_patches=self.num_patches,
         )
-        if packed:
+        packed_attention = packed or self.config.attention_backend == "varlen"
+        if packed_attention:
+            if not packed:
+                tokens = tokens.reshape(-1, tokens.shape[-1])
+            sequence_lengths = grid.prod(dim=-1)
+            static_length = self.static_sequence_length
+            valid_length = int(sequence_lengths.sum().item())
+            if static_length:
+                if self.config.attention_backend != "varlen":
+                    raise ValueError(
+                        "RAE static_sequence_length requires attention_backend='varlen'"
+                    )
+                if static_length <= valid_length:
+                    raise ValueError(
+                        "RAE static_sequence_length must exceed the packed token count"
+                    )
+                tokens = F.pad(tokens, (0, 0, 0, static_length - valid_length))
             if attention_masks is None:
-                sequence_lengths = grid.prod(dim=-1)
-                if self.config.attention_backend == "sdpa":
+                if static_length:
+                    attention_masks = create_rae_static_varlen_metadata(
+                        sequence_lengths,
+                        static_length,
+                        device=tokens.device,
+                    )
+                elif self.config.attention_backend == "sdpa":
                     attention_masks = create_rae_packed_attention_mask(
                         sequence_lengths, device=tokens.device
                     )
@@ -370,21 +524,36 @@ class RAEDecoder(BaseModel):
                     attention_masks = create_rae_varlen_metadata(
                         sequence_lengths, device=tokens.device
                     )
-            positions = self.layers[0].attention.rope.build_packed_positions(
+            elif static_length and (
+                not isinstance(attention_masks, VarlenMetadata)
+                or attention_masks.cu_seq_q.shape[0]
+                not in (grid.shape[0] + 1, grid.shape[0] + 2)
+            ):
+                raise ValueError(
+                    "RAE static_sequence_length requires matching fixed varlen metadata"
+                )
+            first_layer = cast(RAEBlock, self.layers[0])
+            positions = first_layer.attention.rope.build_packed_positions(
                 grid,
                 fps=fps,
                 temporal_start=temporal_start,
             )
-            hidden = self.input_projection(tokens)
-            for layer in self.layers:
-                hidden = layer(
-                    hidden,
-                    positions=positions,
-                    attention_masks=attention_masks,
+            if static_length:
+                positions = F.pad(
+                    positions,
+                    (0, 0, 0, static_length - positions.shape[0]),
                 )
-            return self.decoder_pred(self.decoder_norm(hidden))
+            patch_logits = self._forward_padded_impl(
+                tokens,
+                positions,
+                attention_masks,
+            )
+            if static_length and not return_padded:
+                patch_logits = patch_logits[:valid_length]
+            return patch_logits
 
-        positions = self.layers[0].attention.rope.build_positions(
+        first_layer = cast(RAEBlock, self.layers[0])
+        positions = first_layer.attention.rope.build_positions(
             grid,
             fps=fps,
             temporal_start=temporal_start,
@@ -416,5 +585,6 @@ __all__ = [
     "RAEFeedForward",
     "create_rae_padding_mask",
     "create_rae_packed_attention_mask",
+    "create_rae_static_varlen_metadata",
     "create_rae_varlen_metadata",
 ]
