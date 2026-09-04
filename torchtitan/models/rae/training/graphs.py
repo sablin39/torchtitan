@@ -58,8 +58,15 @@ class StaticCUDAGraph:
 
         self._pool = torch.cuda.graphs.graph_pool_handle()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._pool):
-            outputs = self.function(*self._static_inputs)
+        # Parameter AccumulateGrad nodes can retain a producer stream from a
+        # preceding eager discriminator update. Redirect such stale references
+        # to the capture stream instead of rejecting an otherwise valid graph.
+        torch.autograd.graph.set_override_stale_capture_stream(True)
+        try:
+            with torch.cuda.graph(graph, pool=self._pool):
+                outputs = self.function(*self._static_inputs)
+        finally:
+            torch.autograd.graph.set_override_stale_capture_stream(False)
         if not isinstance(outputs, tuple) or not outputs:
             raise TypeError("CUDA graph function must return a non-empty tensor tuple")
         if any(not torch.is_tensor(value) for value in outputs):

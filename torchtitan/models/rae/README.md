@@ -147,9 +147,10 @@ unpatchification, and image-shape grouping stay in eager wrappers and are
 implemented in `layout.py`, `position.py`, and `discriminator/dino.py`. DINO
 uses one native 224x224 letterboxed shape, so variable-resolution decoder
 outputs share one discriminator graph. The trainable spectral-normalized
-discriminator heads remain eager during discriminator updates because their
-power-iteration buffers are intentionally mutated in place; the frozen
-backbone is always in evaluation mode.
+discriminator heads remain eager in the non-graph compile path because their
+power-iteration buffers are intentionally mutated in place; in CUDA-graph
+mode those fixed-shape buffer updates are captured along with head backward.
+The frozen backbone is always in evaluation mode.
 
 When CUDA graphs are enabled, `training/graphs.py` captures the fixed-BCHW
 reconstruction, perceptual, frozen-discriminator generator loss, and
