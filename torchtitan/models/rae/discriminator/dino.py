@@ -164,6 +164,16 @@ class HFModelFeatureDiscriminator(nn.Module):
         )
         if len(self.image_mean) != 3 or len(self.image_std) != 3:
             raise ValueError("HF vision processor statistics must have three values")
+        self.register_buffer(
+            "image_mean_1C11",
+            torch.tensor(self.image_mean, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "image_std_1C11",
+            torch.tensor(self.image_std, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
         self.model_norm = getattr(self.model, "norm", nn.Identity())
         self.patch_size = int(getattr(model_config, "patch_size", 16))
         if self.patch_size <= 0:
@@ -240,13 +250,43 @@ class HFModelFeatureDiscriminator(nn.Module):
             raise ValueError(
                 "HF vision discriminator fixed path expects BCHW RGB images"
             )
-        if images_BCHW.shape[-2:] != (self.input_size, self.input_size):
-            raise ValueError(
-                "HF vision discriminator fixed path expects input_size x input_size"
+        height, width = images_BCHW.shape[-2:]
+        if (height, width) != (self.input_size, self.input_size):
+            scale = min(self.input_size / height, self.input_size / width)
+            target_height = max(
+                self.patch_size,
+                min(
+                    self.input_size,
+                    int(height * scale) // self.patch_size * self.patch_size,
+                ),
             )
-        mean_1C11 = images_BCHW.new_tensor(self.image_mean).view(1, -1, 1, 1)
-        std_1C11 = images_BCHW.new_tensor(self.image_std).view(1, 3, 1, 1)
-        return self._forward_group(((images_BCHW + 1.0) * 0.5 - mean_1C11) / std_1C11)
+            target_width = max(
+                self.patch_size,
+                min(
+                    self.input_size,
+                    int(width * scale) // self.patch_size * self.patch_size,
+                ),
+            )
+            resized_BCHW = torch.nn.functional.interpolate(
+                images_BCHW,
+                size=(target_height, target_width),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+            canvas_BCHW = images_BCHW.new_full(
+                (images_BCHW.shape[0], 3, self.input_size, self.input_size),
+                0.5,
+            )
+            top = (self.input_size - target_height) // 2
+            left = (self.input_size - target_width) // 2
+            canvas_BCHW[
+                :, :, top : top + target_height, left : left + target_width
+            ] = resized_BCHW
+            images_BCHW = canvas_BCHW
+        mean_1C11 = self.image_mean_1C11.to(dtype=images_BCHW.dtype)
+        std_1C11 = self.image_std_1C11.to(dtype=images_BCHW.dtype)
+        return self._forward_group((images_BCHW - mean_1C11) / std_1C11)
 
     def _resize_for_backbone(self, image_CHW: torch.Tensor) -> torch.Tensor:
         height, width = image_CHW.shape[-2:]
@@ -314,9 +354,7 @@ class HFModelFeatureDiscriminator(nn.Module):
             mean_1C11 = group_BCHW.new_tensor(self.image_mean).view(1, -1, 1, 1)
             std_1C11 = group_BCHW.new_tensor(self.image_std).view(1, 3, 1, 1)
             forward_group = self._get_forward_group(group_BCHW)
-            group_logits_BH = forward_group(
-                ((group_BCHW + 1.0) * 0.5 - mean_1C11) / std_1C11
-            )
+            group_logits_BH = forward_group((group_BCHW - mean_1C11) / std_1C11)
             for group_index, image_index in enumerate(indices):
                 outputs[image_index] = group_logits_BH[group_index]
         if any(output is None for output in outputs):
