@@ -42,8 +42,13 @@ _OPENIMAGES_ROOT = "/mnt/nas/OpenImages/media"
 _OPENIMAGES_TRAIN_FILES = "train_*/*.jpg"
 _OPENIMAGES_VALIDATION_FILES = "validation*/*.jpg"
 _OPENIMAGES_LOCAL_ROOT = "/home/rwkv/molin/openimages_local/data"
-_OPENIMAGES_LOCAL_TRAIN_FILES = "train_0/*.jpg"
 _OPENIMAGES_LOCAL_VALIDATION_FILES = "validation/*.jpg"
+# Full OpenImages train set as gzipped webdataset tars (16 shards, members
+# named <folder>/<hash>.jpg, row key "jpg"). The single validation.tar.gz has
+# one shard, too few to split across DP ranks, so validation stays on the
+# staged media folder.
+_OPENIMAGES_TAR_ROOT = "/mnt/sda1/OpenImages/tar"
+_OPENIMAGES_TAR_TRAIN_FILES = "train_*.tar.gz"
 _STATIC_QWEN_MIN_PIXELS = 256 * 256
 _STATIC_QWEN_MAX_PIXELS = 1024 * 1024
 _STATIC_QWEN_MAX_TOKENS_PER_ITEM = 1024
@@ -307,9 +312,8 @@ def _openimages_static(static_sequence_length: int) -> RAEStage1Trainer.Config:
     token_budget = static_sequence_length - _STATIC_QWEN_MAX_TOKENS_PER_ITEM
     config.dataloader = _image_dataloader(
         batch_size=None,
-        dataset_path=_OPENIMAGES_LOCAL_ROOT,
-        data_files=_OPENIMAGES_LOCAL_TRAIN_FILES,
-        image_key="image",
+        dataset_path=_OPENIMAGES_TAR_ROOT,
+        data_files=_OPENIMAGES_TAR_TRAIN_FILES,
         min_pixels=_STATIC_QWEN_MIN_PIXELS,
         max_pixels=_STATIC_QWEN_MAX_PIXELS,
         token_budget=token_budget,

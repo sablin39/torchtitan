@@ -83,9 +83,13 @@ torchrun --standalone --nproc_per_node=4 -m torchtitan.train \
   --module rae --config rae_stage1_openimages
 ```
 
-The checked-in launcher uses `rae_stage1_openimages_static` for the locally
-staged `train_0` and `validation` trees. It keeps the fixed token budget,
-compiled decoder/discriminator path, and CUDA graphs:
+The checked-in launcher uses `rae_stage1_openimages_static` for the full
+OpenImages train set staged as gzipped webdataset tars under
+`/mnt/sda1/OpenImages/tar` (16 `train_*.tar.gz` shards, row key `jpg`). The
+single-shard `validation.tar.gz` cannot be split across DP ranks, so
+validation keeps streaming the locally staged `validation/*.jpg` media folder.
+The recipe keeps the fixed token
+budget, compiled decoder/discriminator path, and CUDA graphs:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 -m torchtitan.train \
@@ -97,8 +101,21 @@ fragmentation when variable-resolution supervision changes the temporary
 activation sizes. If your environment already defines
 `PYTORCH_CUDA_ALLOC_CONF`, the launcher preserves that value.
 
-After staging all OpenImages folders, use `rae_stage1_openimages` for the
-dynamic NAS tree or change that recipe's paths to the complete local tree.
+The streaming dataloader detects a true epoch: when a rank's DP-sharded
+stream exhausts every matched file, its cursor counter wraps and re-shuffles.
+`GrainDataLoader.epochs_completed` exposes that counter (per rank). With
+`--epochs N` the RAE trainer stops after every rank has completed N epochs
+(`training.steps` still bounds the run and sizes the LR/GAN schedule
+horizon). Training logs `rae/epoch` each step and, at every epoch boundary,
+`rae/tokens_last_epoch`: the valid post-merger tokens the finished epoch
+contributed on this rank, which is the measured quantity for refining
+tokens-per-epoch schedule estimates. The boundary fires when the last row is
+pulled into the pipeline, so up to one shuffle window plus prefetched batches
+of the finished epoch may still be in flight and are counted into the next
+epoch; both effects are negligible at full-dataset scale.
+
+For the dynamic-resolution NAS tree instead of the static tar recipes, use
+`rae_stage1_openimages`.
 
 Override `dataloader.streaming_shuffle_buffer_size` to trade startup memory for
 shuffle quality. Set `validator.steps` to a positive number for a bounded

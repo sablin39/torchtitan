@@ -191,12 +191,24 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
         )
         self._repeat = dataset_iteration_policy.repeat
         self._shuffle = dataset_iteration_policy.shuffle
+        self._current_epoch = 0
+
+    @property
+    def current_epoch(self) -> int:
+        """Epochs completed by this rank's stream (1 after the first wrap).
+
+        The counter advances when the last row of the shard is pulled into the
+        downstream pipeline, so buffered rows of the finished epoch may still
+        be in flight.
+        """
+        return self._current_epoch
 
     def __iter__(self) -> grain.DatasetIterator:
         return _HuggingFaceCursorIterator(
             self._dataset,
             repeat=self._repeat,
             shuffle=self._shuffle,
+            source=self,
         )
 
 
@@ -226,11 +238,13 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
         *,
         repeat: bool,
         shuffle: bool,
+        source: HuggingFaceStreamingSource | None = None,
     ) -> None:
         super().__init__()
         self._dataset = dataset
         self._repeat = repeat
         self._shuffle = shuffle
+        self._source = source
         self._epoch = 0
         self._initial_state = dataset.state_dict()
         self._iterator = iter(dataset)
@@ -242,6 +256,8 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
             if not self._repeat:
                 raise
             self._epoch += 1
+            if self._source is not None:
+                self._source._current_epoch = self._epoch
             if self._shuffle:
                 self._dataset.set_epoch(self._epoch)
             self._dataset.load_state_dict(self._initial_state)
@@ -256,6 +272,8 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
 
     def set_state(self, state: dict[str, Any]) -> None:
         self._epoch = state["epoch"]
+        if self._source is not None:
+            self._source._current_epoch = self._epoch
         if self._shuffle:
             self._dataset.set_epoch(self._epoch)
         self._dataset.load_state_dict(state["hf"])

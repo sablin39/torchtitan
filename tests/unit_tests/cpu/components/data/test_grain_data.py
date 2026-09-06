@@ -1804,3 +1804,69 @@ def test_loader_passes_read_options_to_map_conversion(monkeypatch):
     loader.close()
 
     assert captured == [read_options]
+
+
+def test_loader_exposes_streaming_epoch_completion(tmp_path):
+    write_jsonl(
+        tmp_path / "rows.jsonl",
+        [{"tokens": [1, index + 10, index + 11, 2]} for index in range(10)],
+    )
+    config = GrainDataLoader.Config(
+        dataset=SingleDatasetConfig(
+            source=HuggingFaceStreamingSource.Config(
+                path="json",
+                split="train",
+                load_dataset_kwargs={"data_files": str(tmp_path / "rows.jsonl")},
+            ),
+            processor=RowToTokens.Config(),
+        ),
+        collator=TextCollator.Config(),
+        repeat=True,
+        shuffle=False,
+        num_prefetch_batches=1,
+    )
+    loader = config.build(
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=FakeTokenizer(),
+        max_context_length=8,
+        num_tokens_per_batch=16,
+    )
+    assert loader.epochs_completed == 0
+    iterator = iter(loader)
+    # Packing and prefetch buffer the 10-row stream; empirically the cursor
+    # wraps by the tenth pulled batch and stays in epoch 1 well past it.
+    for _ in range(12):
+        next(iterator)
+    assert loader.epochs_completed == 1
+
+    # Checkpoint restore keeps the exposed counter in sync.
+    state = loader.state_dict()
+    restored = config.build(
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=FakeTokenizer(),
+        max_context_length=8,
+        num_tokens_per_batch=16,
+    )
+    restored.load_state_dict(state)
+    assert restored.epochs_completed == 1
+
+
+def test_loader_epochs_completed_none_without_tracking_source():
+    config = GrainDataLoader.Config(
+        dataset=SingleDatasetConfig(
+            source=RowsSourceConfig(rows=tuple({"id": index} for index in range(4))),
+        ),
+        collator=TextCollator.Config(),
+        repeat=True,
+        num_prefetch_batches=1,
+    )
+    loader = config.build(
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=FakeTokenizer(),
+        max_context_length=8,
+        num_tokens_per_batch=16,
+    )
+    assert loader.epochs_completed is None

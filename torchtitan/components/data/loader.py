@@ -36,6 +36,27 @@ class DataloaderExhaustedError(Exception):
     pass
 
 
+def _find_epoch_source(dataset: Any) -> Any | None:
+    """Return the pipeline node that tracks epoch completion, if any.
+
+    Walks the Grain parent tree for a node exposing ``current_epoch`` (e.g.
+    ``HuggingFaceStreamingSource``). Returns None for pipelines without one.
+    """
+    seen: set[int] = set()
+    stack = [dataset]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(getattr(node, "current_epoch", None), int):
+            return node
+        parents = getattr(node, "parents", None)
+        if parents is not None:
+            stack.extend(parents)
+    return None
+
+
 class _TokenBudgetBatchIterator(grain.DatasetIterator):
     """Accumulate rows until the next row would exceed a token budget.
 
@@ -213,6 +234,7 @@ class GrainDataLoader(BaseDataLoader):
             context=context,
             dataset_iteration_policy=dataset_iteration_policy,
         )
+        self._epoch_source = _find_epoch_source(dataset)
         collator = config.collator.build(context=context)
 
         # TODO(data-multiprocessing): CPU-heavy processing should use multiple
@@ -254,6 +276,13 @@ class GrainDataLoader(BaseDataLoader):
 
     def __iter__(self) -> Iterator[TrainerBatch]:
         return self._iterator
+
+    @property
+    def epochs_completed(self) -> int | None:
+        """Epochs completed by this rank's source stream, if it tracks them."""
+        if self._epoch_source is None:
+            return None
+        return self._epoch_source.current_epoch
 
     def state_dict(self) -> dict[str, Any]:
         return {

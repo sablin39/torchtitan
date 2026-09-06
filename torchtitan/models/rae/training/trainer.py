@@ -262,6 +262,12 @@ class RAEStage1Trainer(Trainer):
         discriminator: RAEFeatureDiscriminator.Config = field(
             default_factory=RAEFeatureDiscriminator.Config
         )
+        epochs: int | None = None
+        """Stop once every rank's data stream has completed this many epochs.
+
+        None keeps step-only training. The LR/GAN schedule horizon stays
+        ``training.steps`` regardless; epochs only terminates the run.
+        """
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -340,6 +346,12 @@ class RAEStage1Trainer(Trainer):
         )
         self._discriminator_graphs: dict[tuple[int, ...], RAEDiscriminatorGraph] = {}
         self._graph_failures: set[tuple[str, tuple[Any, ...]]] = set()
+        if config.epochs is not None and config.epochs <= 0:
+            raise ValueError(f"epochs must be positive, got {config.epochs}")
+        self._tokens_current_epoch = 0
+        self._last_seen_epoch = 0
+        self._tokens_last_epoch: int | None = None
+        self._warned_epoch_tracking_missing = False
         if self._cuda_graphs_enabled:
             canvas = self.discriminator.input_canvas_size
             if canvas is not None:
@@ -1151,6 +1163,7 @@ class RAEStage1Trainer(Trainer):
                     total_loss = reconstruction_total
                 (total_loss / num_microbatches).backward()
             non_padding_tokens += batch_tokens
+            self._tokens_current_epoch += batch_tokens
             padding_capacity_tokens += (
                 self._static_sequence_length
                 if self._static_sequence_length > 0
@@ -1270,6 +1283,12 @@ class RAEStage1Trainer(Trainer):
             self.discriminator.eval()
             self.discriminator.set_head_requires_grad(False)
 
+        # The dataloader's epoch counter advances when the stream wraps, which
+        # runs ahead of trainer consumption by the shuffle window and prefetch
+        # buffer; the finished epoch's token count excludes that in-flight
+        # tail, which is instead counted into the next epoch.
+        epochs_completed = self._track_epoch_tokens()
+
         if self.metrics_processor.should_log(self.step):
             log_stage1_metrics(
                 self.step,
@@ -1291,7 +1310,70 @@ class RAEStage1Trainer(Trainer):
                 metrics_processor=self.metrics_processor,
                 non_padding_ratio=non_padding_tokens / padding_capacity_tokens,
                 num_images_per_step=float(num_images_per_step),
+                epoch=(
+                    None if epochs_completed is None else float(self._last_seen_epoch)
+                ),
+                tokens_last_epoch=self._tokens_last_epoch,
             )
+
+    def _track_epoch_tokens(self) -> int | None:
+        """Fold consumed tokens into per-epoch totals at stream boundaries.
+
+        Returns the dataloader's completed-epoch count, or None when the
+        dataloader does not track epochs.
+        """
+        epochs_completed = getattr(self.dataloader, "epochs_completed", None)
+        if epochs_completed is not None and epochs_completed > self._last_seen_epoch:
+            self._tokens_last_epoch = self._tokens_current_epoch
+            self._tokens_current_epoch = 0
+            self._last_seen_epoch = epochs_completed
+        return epochs_completed
+
+    def should_continue_training(self) -> bool:
+        if not super().should_continue_training():
+            return False
+        if self.config.epochs is None:
+            return True
+        epochs_completed = getattr(self.dataloader, "epochs_completed", None)
+        if epochs_completed is None:
+            if not self._warned_epoch_tracking_missing:
+                logger.warning(
+                    "epochs=%d requested but the dataloader does not track "
+                    "epoch completion; the epochs stop is disabled",
+                    self.config.epochs,
+                )
+                self._warned_epoch_tracking_missing = True
+            return True
+        # Every rank evaluates this hook once per loop iteration, so the
+        # all-reduce stays synchronized and all ranks stop at the same step.
+        if (
+            dist.is_available()
+            and dist.is_initialized()
+            and self.parallel_dims.dp_enabled
+        ):
+            batch_mesh = self.parallel_dims.get_mesh("batch")
+            if batch_mesh.size() > 1:
+                completed = torch.tensor(
+                    epochs_completed, device=self.device, dtype=torch.long
+                )
+                dist.all_reduce(
+                    completed, op=dist.ReduceOp.MIN, group=batch_mesh.get_group()
+                )
+                epochs_completed = int(completed.item())
+        return epochs_completed < self.config.epochs
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state["rae_tokens_current_epoch"] = self._tokens_current_epoch
+        state["rae_last_seen_epoch"] = self._last_seen_epoch
+        state["rae_tokens_last_epoch"] = self._tokens_last_epoch
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        super().load_state_dict(state_dict)
+        self._tokens_current_epoch = state_dict.get("rae_tokens_current_epoch", 0)
+        self._last_seen_epoch = state_dict.get("rae_last_seen_epoch", 0)
+        self._tokens_last_epoch = state_dict.get("rae_tokens_last_epoch")
 
     @staticmethod
     def _adaptive_weight(

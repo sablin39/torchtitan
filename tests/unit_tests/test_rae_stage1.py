@@ -784,13 +784,13 @@ def test_static_recipe_packs_multiple_images_into_fixed_token_budget() -> None:
     assert config.compile.components == ["model", "discriminator"]
 
 
-def test_openimages_static_recipe_keeps_token_budget_and_folder_patterns() -> None:
+def test_openimages_static_recipe_keeps_token_budget_and_tar_train_shards() -> None:
     config = rae_stage1_openimages_static()
     train_source = config.dataloader.dataset.source
     validation_source = config.validator.dataloader.dataset.source
-    assert train_source.path == "/home/rwkv/molin/openimages_local/data"
+    assert train_source.path == "/mnt/sda1/OpenImages/tar"
     assert train_source.load_dataset_kwargs == {
-        "data_files": {"train": "train_0/*.jpg"}
+        "data_files": {"train": "train_*.tar.gz"}
     }
     assert validation_source.path == "/home/rwkv/molin/openimages_local/data"
     assert validation_source.load_dataset_kwargs == {
@@ -998,3 +998,134 @@ def test_rae_cuda_loss_graph_replays_forward_and_gradients() -> None:
     ]
     for doubled, single in zip(second, first, strict=True):
         torch.testing.assert_close(doubled, single * 2)
+
+
+def test_streaming_source_tracks_epoch_completion(tmp_path) -> None:
+    from PIL import Image
+
+    from torchtitan.components.data.sources import HuggingFaceStreamingSource
+    from torchtitan.components.data.types import DatasetIterationPolicy
+
+    for index in range(4):
+        Image.new("RGB", (8, 8), color=(index * 40, 0, 0)).save(
+            tmp_path / f"{index}.jpg"
+        )
+    source = HuggingFaceStreamingSource(
+        HuggingFaceStreamingSource.Config(
+            path=str(tmp_path),
+            split="train",
+            load_dataset_kwargs={"data_files": {"train": "*.jpg"}},
+        ),
+        dataset_iteration_policy=DatasetIterationPolicy(
+            seed=42,
+            shuffle=False,
+            repeat=True,
+            dp_rank=0,
+            dp_world_size=1,
+            streaming_shuffle_buffer_size=4,
+        ),
+    )
+    assert source.current_epoch == 0
+    iterator = iter(source)
+    for _ in range(4):
+        next(iterator)
+    # The counter wraps when the first row of the next epoch is pulled.
+    assert source.current_epoch == 0
+    next(iterator)
+    assert source.current_epoch == 1
+    state = iterator.get_state()
+    for _ in range(4):
+        next(iterator)
+    assert source.current_epoch == 2
+    iterator.set_state(state)
+    assert source.current_epoch == 1
+
+
+def test_find_epoch_source_walks_grain_parents(tmp_path) -> None:
+    import grain.python as grain
+    from PIL import Image
+
+    from torchtitan.components.data.loader import _find_epoch_source
+    from torchtitan.components.data.sources import HuggingFaceStreamingSource
+    from torchtitan.components.data.types import DatasetIterationPolicy
+
+    Image.new("RGB", (8, 8)).save(tmp_path / "0.jpg")
+    source = HuggingFaceStreamingSource(
+        HuggingFaceStreamingSource.Config(
+            path=str(tmp_path),
+            split="train",
+            load_dataset_kwargs={"data_files": {"train": "*.jpg"}},
+        ),
+        dataset_iteration_policy=DatasetIterationPolicy(
+            seed=42,
+            shuffle=False,
+            repeat=True,
+            dp_rank=0,
+            dp_world_size=1,
+            streaming_shuffle_buffer_size=1,
+        ),
+    )
+    wrapped = source.map(lambda row: row).filter(lambda row: True)
+    assert _find_epoch_source(wrapped) is source
+    plain = grain.MapDataset.source([1, 2, 3]).to_iter_dataset()
+    assert _find_epoch_source(plain) is None
+
+
+def _epoch_trainer(epochs: int | None, epochs_completed: int | None):
+    trainer = object.__new__(RAEStage1Trainer)
+    trainer.config = SimpleNamespace(epochs=epochs, training=SimpleNamespace(steps=100))
+    trainer.step = 5
+    trainer.dataloader = SimpleNamespace(epochs_completed=epochs_completed)
+    trainer._tokens_current_epoch = 0
+    trainer._last_seen_epoch = 0
+    trainer._tokens_last_epoch = None
+    trainer._warned_epoch_tracking_missing = False
+    return trainer
+
+
+def test_track_epoch_tokens_records_finished_epoch() -> None:
+    trainer = _epoch_trainer(epochs=None, epochs_completed=0)
+    trainer._tokens_current_epoch = 500
+    assert trainer._track_epoch_tokens() == 0
+    assert trainer._tokens_last_epoch is None
+    assert trainer._tokens_current_epoch == 500
+
+    trainer._tokens_current_epoch += 700
+    trainer.dataloader.epochs_completed = 1
+    assert trainer._track_epoch_tokens() == 1
+    assert trainer._tokens_last_epoch == 1200
+    assert trainer._tokens_current_epoch == 0
+
+    trainer._tokens_current_epoch = 300
+    assert trainer._track_epoch_tokens() == 1
+    assert trainer._tokens_last_epoch == 1200
+    assert trainer._tokens_current_epoch == 300
+
+    # A dataloader without epoch tracking leaves the counters alone.
+    untracked = _epoch_trainer(epochs=None, epochs_completed=None)
+    untracked._tokens_current_epoch = 42
+    assert untracked._track_epoch_tokens() is None
+    assert untracked._tokens_last_epoch is None
+    assert untracked._tokens_current_epoch == 42
+
+
+def test_epochs_stop_uses_dataloader_epoch_counter() -> None:
+    trainer = _epoch_trainer(epochs=2, epochs_completed=1)
+    assert trainer.should_continue_training()
+    trainer.dataloader.epochs_completed = 2
+    assert not trainer.should_continue_training()
+
+    # The steps cap still applies when epochs are set.
+    trainer.dataloader.epochs_completed = 0
+    trainer.step = 100
+    assert not trainer.should_continue_training()
+
+    # No epochs configured: step-only training.
+    trainer = _epoch_trainer(epochs=None, epochs_completed=5)
+    trainer.step = 5
+    assert trainer.should_continue_training()
+
+    # Untracked dataloader: warn once and keep training.
+    trainer = _epoch_trainer(epochs=2, epochs_completed=None)
+    assert trainer.should_continue_training()
+    assert trainer._warned_epoch_tracking_missing

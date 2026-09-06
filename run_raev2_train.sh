@@ -19,6 +19,10 @@ DP_DEGREE=4
 ACCUM_STEPS=8
 # 96k static recipe: 98304-token padded capacity, 97280-token packed budget.
 TOKENS_PER_MICROBATCH=97280
+# Training stops after N_EPOCHS full passes over the dataset (--epochs).
+# TOKENS_PER_EPOCH is only an estimate that sizes the step-based LR/GAN
+# schedule horizon and the steps safety cap; the measured tokens per epoch
+# are logged as rae/tokens_last_epoch so the estimate can be refined.
 TOKENS_PER_EPOCH=1000000000
 RAE_CONFIG=${RAE_CONFIG:-rae_stage1_openimages_static_96k}
 
@@ -33,6 +37,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
   -m torchtitan.train \
   --module rae \
   --config "${RAE_CONFIG}" \
+  --epochs "${N_EPOCHS}" \
   --training.num_tokens_per_microbatch_per_dp_rank "${TOKENS_PER_MICROBATCH}" \
   --training.num_tokens_per_train_step "${TOKENS_PER_STEP}" \
   --training.steps "${TRAINING_STEPS}" \
