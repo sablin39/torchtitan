@@ -33,3 +33,4 @@ class DatasetIterationPolicy:
     dp_rank: int
     dp_world_size: int
     streaming_shuffle_buffer_size: int
+    num_processor_workers: int = 0

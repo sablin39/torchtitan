@@ -15,6 +15,7 @@ from typing import Any, cast, Protocol, TypeAlias
 import grain.python as grain
 import numpy as np
 
+from torchtitan.components.data.parallel_map import ProcessPoolMapIterDataset
 from torchtitan.components.data.sources import RandomAccessDataSource, SourceConfig
 from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy
 from torchtitan.config import Configurable
@@ -182,14 +183,27 @@ class SingleDatasetConfig:
                 seed=dataset_iteration_policy.seed,
             )
 
-        # Filter and process rows in stream order.
+        # Filter and process rows in stream order. With worker processes
+        # requested, the processor runs in a spawned pool that keeps row order
+        # and upstream cursor state in this process; otherwise map inline.
         for filter_fn in self.pre_filters:
             dataset = dataset.filter(filter_fn)
         if self.processor is not None:
-            dataset = dataset.random_map(
-                self.processor.build(context=context),
-                seed=dataset_iteration_policy.seed + dataset_iteration_policy.dp_rank,
-            )
+            if dataset_iteration_policy.num_processor_workers > 0:
+                dataset = ProcessPoolMapIterDataset(
+                    dataset,
+                    processor_config=self.processor,
+                    context=context,
+                    num_workers=dataset_iteration_policy.num_processor_workers,
+                    seed=dataset_iteration_policy.seed
+                    + dataset_iteration_policy.dp_rank,
+                )
+            else:
+                dataset = dataset.random_map(
+                    self.processor.build(context=context),
+                    seed=dataset_iteration_policy.seed
+                    + dataset_iteration_policy.dp_rank,
+                )
         for filter_fn in self.post_filters:
             dataset = dataset.filter(filter_fn)
         return dataset

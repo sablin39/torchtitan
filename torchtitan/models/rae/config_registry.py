@@ -112,6 +112,7 @@ def _image_dataloader(
     max_tokens_per_item: int | None = None,
     image_key: str = "jpg",
     num_prefetch_batches: int = 2,
+    num_processor_workers: int = 0,
 ) -> GrainDataLoader.Config:
     dataset = SingleDatasetConfig(
         source=HuggingFaceStreamingSource.Config(
@@ -138,6 +139,7 @@ def _image_dataloader(
         repeat=True,
         shuffle=True,
         num_prefetch_batches=num_prefetch_batches,
+        num_processor_workers=num_processor_workers,
     )
 
 
@@ -323,6 +325,9 @@ def _openimages_static(
         long_skip_connections=long_skip_connections,
     )
     token_budget = static_sequence_length - _STATIC_QWEN_MAX_TOKENS_PER_ITEM
+    # The Qwen row processor is CPU-heavy; fan it out over spawned worker
+    # processes so it does not starve the trainer's main thread.
+    num_processor_workers = 4
     config.dataloader = _image_dataloader(
         batch_size=None,
         dataset_path=_OPENIMAGES_TAR_ROOT,
@@ -332,6 +337,7 @@ def _openimages_static(
         token_budget=token_budget,
         max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
         num_prefetch_batches=4,
+        num_processor_workers=num_processor_workers,
     )
     config.validator.dataloader = _image_dataloader(
         batch_size=None,
@@ -343,6 +349,7 @@ def _openimages_static(
         token_budget=token_budget,
         max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
         num_prefetch_batches=4,
+        num_processor_workers=num_processor_workers,
     )
     config.validator.enable = True
     config.validator.steps = -1

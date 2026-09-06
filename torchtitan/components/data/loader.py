@@ -180,6 +180,8 @@ class GrainDataLoader(BaseDataLoader):
         repeat: Annotated[bool, tyro.conf.Suppress] = True
         streaming_shuffle_buffer_size: Annotated[int, tyro.conf.Suppress] = 1_000
         """Streaming rows retained per rank for approximate shuffling."""
+        num_processor_workers: Annotated[int, tyro.conf.Suppress] = 0
+        """Spawned worker processes applying the row processor; 0 maps inline."""
         read_options: Annotated[grain.ReadOptions, tyro.conf.Suppress] = field(
             default_factory=grain.ReadOptions
         )
@@ -228,8 +230,12 @@ class GrainDataLoader(BaseDataLoader):
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             streaming_shuffle_buffer_size=config.streaming_shuffle_buffer_size,
+            num_processor_workers=config.num_processor_workers,
         )
 
+        # CPU-heavy row processing for streaming sources runs in a spawned
+        # process pool when config.num_processor_workers > 0 (see
+        # ProcessPoolMapIterDataset); map-style datasets still process inline.
         dataset = config.dataset.build(
             context=context,
             dataset_iteration_policy=dataset_iteration_policy,
@@ -237,12 +243,6 @@ class GrainDataLoader(BaseDataLoader):
         self._epoch_source = _find_epoch_source(dataset)
         collator = config.collator.build(context=context)
 
-        # TODO(data-multiprocessing): CPU-heavy processing should use multiple
-        # processes rather than only threads. Grain can divide map-style data among
-        # workers, but packing and mixing map data with a stream produce an iterable
-        # before the loader sees it. Investigate an earlier boundary where one
-        # shared worker pool processes samples, instead of creating a pool per
-        # dataset or packing per worker.
         if isinstance(dataset, grain.MapDataset):
             dataset = dataset.to_iter_dataset(read_options=read_options)
 

@@ -121,6 +121,16 @@ Override `dataloader.streaming_shuffle_buffer_size` to trade startup memory for
 shuffle quality. Set `validator.steps` to a positive number for a bounded
 validation probe; the default `-1` consumes the validation stream once.
 
+The Qwen row processor (JPEG decode, resize, patchify) is CPU-heavy: inline it
+sustains only ~25 images/s per rank, well under what the static recipes
+consume, so the trainer reports high `time_metrics/data_loading(%)`.
+`dataloader.num_processor_workers` (set to 4 in the `_openimages_static`
+recipes) fans processing out to spawned worker processes behind a background
+pull thread (`ProcessPoolMapIterDataset`), roughly tripling per-rank throughput
+while keeping row order, per-row RNG, and checkpoint state identical to the
+inline path. It is a suppressed config field -- change it in the recipe, not
+via CLI.
+
 Enable the inherited `validator` section to run RAE reconstruction validation.
 The RAE trainer replaces the text validator with an image-aware validator that
 uses the configured Qwen media dataloader, reports reconstruction L1 and
