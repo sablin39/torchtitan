@@ -265,9 +265,8 @@ class NvmlGpuMetricsMonitor:
             for i, name in enumerate(self._gpm_metric_names):
                 metric = result.metrics[i]
                 value = float(metric.value)
-                if (
-                    getattr(metric, "nvmlReturn", success) == success
-                    and math.isfinite(value)
+                if getattr(metric, "nvmlReturn", success) == success and math.isfinite(
+                    value
                 ):
                     metrics[name] = value
 
