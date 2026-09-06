@@ -96,6 +96,8 @@ class RAEValidator(BaseValidator):
         comparison_image = None
         num_batches = 0
         num_tokens = 0
+        num_images = 0
+        padding_capacity_tokens = 0
         try:
             while self.config.steps == -1 or num_batches < self.config.steps:
                 try:
@@ -127,6 +129,12 @@ class RAEValidator(BaseValidator):
                     )
                 batch_tokens = int(grid_thw.prod(dim=-1).sum().item())
                 num_tokens += batch_tokens
+                num_images += len(self.trainer._image_items(images))
+                padding_capacity_tokens += (
+                    self.trainer._static_sequence_length
+                    if self.trainer._static_sequence_length > 0
+                    else batch_tokens
+                )
                 self.trainer.metrics_processor.ntokens_since_last_log += batch_tokens
                 target_sizes = [
                     tuple(reconstruction.shape[-2:])
@@ -159,6 +167,10 @@ class RAEValidator(BaseValidator):
         extras: dict[str, Any] = {
             "validation_metrics/num_tokens": num_tokens,
             "validation_metrics/num_batches": num_batches,
+            "validation_metrics/non_padding_ratio": (
+                num_tokens / padding_capacity_tokens
+            ),
+            "validation_metrics/num_images_per_step": num_images,
         }
         if comparison_image is not None:
             extras[

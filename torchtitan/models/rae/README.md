@@ -32,10 +32,11 @@ torchrun --standalone --nproc_per_node=4 -m torchtitan.train \
 For graph-enabled throughput, use `rae_stage1_dmuon_static`. Its central
 capacity is a 65536-token packed decoder budget, not an image count. Qwen keeps
 each image's aspect ratio while constraining its pixel area to at most
-1024x1024, and the collator caps each post-merger item at 1024 tokens. It then
-packs 63 rows per rank (64512 valid-token capacity), reserving the final 1024
-token slots for one isolated FA2 padding document. The decoder never pads a
-single image to the full budget:
+1024x1024, and the collator caps each post-merger item at 1024 tokens. Rows are
+accumulated by token cost until the 64512-token budget would overflow, so each
+microbatch carries a variable number of images at ~99% budget fill, reserving
+the final 1024 token slots for one isolated FA2 padding document. The decoder
+never pads a single image to the full budget:
 
 ```bash
 torchrun --standalone --nproc_per_node=1 -m torchtitan.train \
@@ -56,8 +57,13 @@ global tokens per optimizer step =
 For a different DP degree, override
 `training.num_tokens_per_train_step` with
 `64512 * DP_degree * accumulation_steps`; it must be divisible by
-`64512 * DP_degree`. The static row capacity is derived as
-`64512 // 1024 = 63` rows per rank. The conservative 65536-token setting leaves
+`64512 * DP_degree`. Token-budget packing is implemented by a generic
+`_TokenBudgetBatchIterDataset` in `torchtitan/components/data/loader.py`,
+engaged when a collator exposes `row_cost(row)` and `packing_token_budget()`;
+its iterator checkpoints at emitted-batch boundaries so variable row counts
+restore exactly. `rae_stage1_dmuon_static_128k` and
+`rae_stage1_openimages_static_128k` double the static capacity to 131072 tokens
+for higher device utilization. The conservative 65536-token setting leaves
 headroom on a 95 GiB RTX PRO 6000; lower the per-rank budget if the available
 device has less memory. The HF DINO adversarial input is independently
 letterboxed to its
@@ -102,7 +108,11 @@ Enable the inherited `validator` section to run RAE reconstruction validation.
 The RAE trainer replaces the text validator with an image-aware validator that
 uses the configured Qwen media dataloader, reports reconstruction L1 and
 post-merger token throughput, and restores the decoder's training mode after
-validation. With either `metrics.enable_wandb` or
+validation. Training logs include `rae/non_padding_ratio`, the fraction of the
+static decoder token capacity occupied by valid tokens, and
+`rae/num_images_per_step`, the number of media items consumed across gradient
+accumulation for that optimizer step. Validation reports the corresponding
+values under `validation_metrics/`. With either `metrics.enable_wandb` or
 `metrics.enable_swanlab`, it also logs
 `validation_images/ground_truth_vs_reconstruction` as an RGB side-by-side image
 (ground truth on the left, reconstruction on the right).
@@ -152,18 +162,23 @@ power-iteration buffers are intentionally mutated in place; in CUDA-graph
 mode those fixed-shape buffer updates are captured along with head backward.
 The frozen backbone is always in evaluation mode.
 
-When CUDA graphs are enabled, `training/graphs.py` captures the fixed-BCHW
-reconstruction, perceptual, frozen-discriminator generator loss, and
-discriminator forward/backward paths. Graphs are cached by batch and image
-shape, and the first occurrence of each shape includes capture and warmup.
-Mixed-resolution batches remain on the eager path because a CUDA graph cannot
-change tensor shapes. Graph mode bypasses DDP reducer hooks and explicitly
-averages discriminator gradients across the batch mesh; this keeps graph
-capture safe for replicated DP. DMuon and its optimizer step remain eager,
-while the returned reconstruction gradient is propagated through the decoder
-normally. On the RTX PRO 6000, a fixed `B=16, 256x256` loss path measured
-1.69x faster generator and 3.15x faster discriminator steady-state replay
-than eager execution (capture time excluded).
+When CUDA graphs are enabled, `training/graphs.py` captures the discriminator
+forward/backward path. The trainer letterboxes every real and generated image
+onto the backbone's fixed 224x224 canvas, pads the stacked batch to a multiple
+of 16 with a validity mask, and keys captured graphs by that fixed shape, so
+mixed-resolution batches use graphs every microbatch. Graph mode bypasses DDP
+reducer hooks and explicitly averages discriminator gradients across the batch
+mesh; this keeps graph capture safe for replicated DP. DMuon and its optimizer
+step remain eager. The frozen backbone is compiled during trainer
+initialization (covered by `comm.init_timeout_seconds`) rather than lazily at
+the first GAN step, and the static recipes loosen the NCCL watchdog to
+`init_timeout_seconds=3600` / `train_timeout_seconds=600` because four ranks
+compiling concurrently can drift apart by minutes. The generator loss (L1,
+LPIPS at native resolution, and the adversarial forward on the letterboxed
+canvas) stays eager; on the RTX PRO
+6000, a fixed `B=16, 256x256` loss path measured 1.69x faster generator and
+3.15x faster discriminator steady-state replay than eager execution (capture
+time excluded).
 
 RAE Stage 1 currently uses fully replicated data parallelism. Set
 `data_parallel_shard_degree=1`; sharded data parallelism is rejected by the RAE
@@ -178,14 +193,28 @@ local Qwen3.5-0.8B checkpoint at `~/models/Qwen3.5-0.8B`. Their Qwen processor
 leaves dynamic `image_size=-1`, so runtime aspect ratios and resolutions are
 retained and the collator packs unequal token grids. The frozen spatial merger
 converts the patch grid into post-merger tokens of width 1024. If
-`encoder.layer_indices` is non-empty, the selected zero-based block outputs are
-summed and passed through the same merger once. A merge size of two gives a
-post-merge grid with one quarter of the input spatial token area; the decoder
-reconstructs the corresponding runtime resolution.
+`encoder.layer_indices` is non-empty, the selected zero-based block outputs
+follow RAEv2 multi-layer-sum semantics: each is normalized by the merger's
+LayerNorm, the layers are averaged, and the per-item token mean of the final
+selected layer is added back as a global signal before one shared merger MLP.
+A merge size of two gives a post-merge grid with one quarter of the input
+spatial token area; the decoder reconstructs the corresponding runtime
+resolution. The tower runs flash-attention varlen over the packed documents
+(`encoder.attn_implementation`, default `flash_attention_2`); the HF default
+sdpa path instead splits the packed sequence and calls attention once per
+image per block. `encoder.dtype="bfloat16"` casts the frozen weights (the
+tower is inference-only). On the RTX PRO 6000 the bf16 + flash combination
+measured roughly 7x faster than the original fp32 sdpa path. `encoder.compile`
+(torch.compile with dynamic shapes) is available but off in the recipes: the
+per-batch packed token count and grid-row count re-specialize through HF's
+data-dependent graph breaks, which caused a multi-minute recompile storm when
+four ranks compiled concurrently.
 
 The decoder uses conservative grouped-query attention (GQA): the base recipe
-uses eight query heads and four KV heads with `head_dim=64`, while the debug
-recipe uses four query heads and two KV heads. Full Cosmos 3D RoPE is applied to
+is encoder-sized (~100M parameters: hidden 1024, eight layers, sixteen query
+heads and four KV heads with `head_dim=64`, MLP 3072), while the debug recipe
+uses four query heads and two KV heads. All linear layers are bias-free and all
+normalization is RMSNorm. Full Cosmos 3D RoPE is applied to
 Q and K independently before the attention kernel groups the KV heads. The
 query/KV ratio must remain integral when changing these values. Each block also
 applies configurable residual dropout independently after attention and after
@@ -218,9 +247,21 @@ DMuon EMA is maintained as a regular replicated decoder copy. Each generator
 update applies the EMA update to that local copy, so there is no FSDP state
 gather in the training path.
 
-The discriminator begins updating at step 6, two steps before its loss is added
-to the generator at step 8. This initializes and warms its spectral-normalized
-heads before they supply an adversarial gradient.
+The frozen encoder is deterministic, so each microbatch is encoded exactly
+once. The generator phase adds RAE noise (one scale per packed media item,
+`noise_tau=0.8`) to a copy of the clean latents; the discriminator phase
+re-decodes the cached clean latents after the optimizer step, matching RAEv2's
+no-grad, noise-free discriminator inputs without a second vision-tower pass.
+
+The GAN phase boundaries follow RAEv2's epoch fractions: discriminator updates
+begin at `gan.discriminator_update_start_fraction` (0.375) of training and the
+adversarial generator loss at `gan.discriminator_start_fraction` (0.5), so the
+first phase trains L1+LPIPS only. `gan.discriminator_*_step` pin absolute step
+boundaries instead when set. The discriminator LR warms up linearly over
+`gan.discriminator_warmup_steps` and cosine-decays to
+`gan.discriminator_final_lr_ratio` of its peak. The early updates initialize
+and warm the spectral-normalized heads before they supply an adversarial
+gradient.
 
 The discriminator backbone is permanently frozen. During the generator phase
 its trainable heads also have `requires_grad=False`; the discriminator forward
@@ -286,13 +327,17 @@ boundaries. It does not, by itself, batch variable RAE latents: use
 `RAEQwenProcessor` and `RAEQwenCollator` (or an equivalent model-side adapter)
 to keep Qwen's flattened `pixel_values` and `grid_thw` together. The Stage 1
 trainer keeps each image as a list, unpatchifies packed decoder outputs, resizes
-each target to its corresponding output grid, and groups only equal shapes for
-augmentation. Multi-frame media remains rejected by the 2D GAN trainer until a
-video discriminator/loss path is enabled.
+each target to its corresponding output grid, and applies DiffAugment on the
+letterboxed 224x224 discriminator canvas. Multi-frame media remains rejected by
+the 2D GAN trainer until a video discriminator/loss path is enabled.
 
 `RAEQwenCollator` now also emits `rae_grid_thw` (the post-merger grid),
 post-merger `sequence_lengths`, per-item `fps`, and canonical `media` tensors
-in `BTCHW` layout. Images use `T=1` and `fps=0`; video rows preserve their frame
+in `BTCHW` layout. Media is downscaled to at most the resolution the vision
+tower saw (grid * patch_size) before collation: supervision targets are the
+decoder outputs at half that resolution, so full-resolution originals would
+only inflate host memory (previously tens of GiB per prefetched batch).
+Images use `T=1` and `fps=0`; video rows preserve their frame
 rate for the decoder's temporal coordinates. Video FPS must be supplied by the
 sample or processor metadata; there is no encoder-level FPS default. The debug
 and DMuon recipes use the image path today, while multi-frame media remains

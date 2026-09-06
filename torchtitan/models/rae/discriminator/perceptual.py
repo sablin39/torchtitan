@@ -1,7 +1,14 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 # Tensor dimensions: B=batch, C=channel, H=height, W=width.
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -110,20 +117,15 @@ class LPIPSPerceptualLoss(nn.Module):
         norm_B1HW = torch.sqrt(torch.sum(features_BCHW.square(), dim=1, keepdim=True))
         return features_BCHW / (norm_B1HW + 1e-10)
 
-    def forward(
-        self,
-        input_BCHW: torch.Tensor,
-        target_BCHW: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_per_sample(input_BCHW, target_BCHW).mean()
+    def features(self, images_BCHW: torch.Tensor) -> list[torch.Tensor]:
+        return self.net(self.scaling_layer(images_BCHW))
 
-    def forward_per_sample(
+    def distance(
         self,
-        input_BCHW: torch.Tensor,
-        target_BCHW: torch.Tensor,
+        input_features: list[torch.Tensor],
+        target_features: list[torch.Tensor],
     ) -> torch.Tensor:
-        input_features = self.net(self.scaling_layer(input_BCHW))
-        target_features = self.net(self.scaling_layer(target_BCHW))
+        """Per-image calibrated distances for one equal-shape batch."""
         distances = []
         for input_features_BCHW, target_features_BCHW, calibration in zip(
             input_features,
@@ -137,5 +139,61 @@ class LPIPSPerceptualLoss(nn.Module):
             distances.append(calibration(difference_BCHW).mean((2, 3)).squeeze(1))
         return torch.stack(distances).sum(dim=0)
 
+    def forward(
+        self,
+        input_BCHW: torch.Tensor,
+        target_BCHW: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_per_sample(input_BCHW, target_BCHW).mean()
 
-__all__ = ["LPIPSPerceptualLoss"]
+    def forward_per_sample(
+        self,
+        input_BCHW: torch.Tensor,
+        target_BCHW: torch.Tensor,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            target_features = self.features(target_BCHW)
+        input_features = self.features(input_BCHW)
+        return self.distance(input_features, target_features)
+
+
+def grouped_per_image_loss(
+    features_fn,
+    distance_fn,
+    real_items: Sequence[torch.Tensor],
+    fake_items: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Per-image feature losses for variable-resolution CHW lists.
+
+    Equal-shape images are stacked so one backbone forward serves a whole
+    group instead of one call per image. Target features are computed under
+    ``no_grad`` -- the frozen backbone never needs gradients on the real
+    branch. Returns one loss per image in the original order.
+    """
+    if len(real_items) != len(fake_items):
+        raise ValueError("Perceptual loss inputs must have matching item counts")
+    if not real_items:
+        raise ValueError("Perceptual loss requires at least one item")
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index, image in enumerate(real_items):
+        if image.ndim != 3 or fake_items[index].shape != image.shape:
+            raise ValueError(
+                "Perceptual loss items must be CHW with matching fake shapes"
+            )
+        groups.setdefault((int(image.shape[-2]), int(image.shape[-1])), []).append(
+            index
+        )
+    device = real_items[0].device
+    losses = torch.empty(len(real_items), device=device)
+    for indices in groups.values():
+        real_BCHW = torch.stack([real_items[index] for index in indices])
+        fake_BCHW = torch.stack([fake_items[index] for index in indices])
+        with torch.no_grad():
+            real_features = features_fn(real_BCHW)
+        group_losses = distance_fn(features_fn(fake_BCHW), real_features)
+        for group_index, image_index in enumerate(indices):
+            losses[image_index] = group_losses[group_index]
+    return losses
+
+
+__all__ = ["LPIPSPerceptualLoss", "grouped_per_image_loss"]

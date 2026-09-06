@@ -26,6 +26,13 @@ pre-commit run --all-files
 pytest tests/ -x
 ```
 
+## Environment Setting
+
+If `.venv` is found in this project directory, it's probably the one you need to use. Typically binary files installed to it will need to add the env to PATH via
+```bash
+source .venv/bin/activate
+```
+
 ### Run GPU integration tests (requires GPUs)
 Integration tests override default config for Llama 3 debug model.
 See tests/integration_tests/ for `OverrideDefinitions`.

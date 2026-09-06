@@ -32,14 +32,66 @@ def _merge_qwen_hidden_states(
     outputs,
     merger: nn.Module,
     layer_indices: tuple[int, ...],
+    tokens_per_item: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Merge selected Qwen vision blocks with RAEv2 multi-layer-sum semantics.
+
+    Each selected block output is normalized by the merger's LayerNorm (the
+    Qwen vision tower has no separate final norm), the selected layers are
+    averaged, and the per-item token mean of the final selected layer is added
+    back as a global signal. The merger MLP runs once on the combined tokens.
+    ``tokens_per_item`` holds the pre-merger token counts of each packed media
+    item so the global mean stays within its own image or video.
+    """
     if not layer_indices:
         return outputs.pooler_output
     hidden_states = outputs.hidden_states
     if hidden_states is None:
         raise RuntimeError("Qwen vision model did not return hidden states")
+    for attribute in ("norm", "linear_fc1", "act_fn", "linear_fc2", "hidden_size"):
+        if not hasattr(merger, attribute):
+            raise ValueError(
+                "Qwen multi-layer merging requires a PatchMerger with norm, "
+                "linear_fc1, act_fn, linear_fc2, and hidden_size"
+            )
+    if getattr(merger, "use_postshuffle_norm", False):
+        raise ValueError("Qwen multi-layer merging requires a pre-shuffle merger norm")
     selected = [hidden_states[index + 1] for index in layer_indices]
-    return merger(torch.stack(selected).sum(dim=0))
+    normed = [merger.norm(hidden) for hidden in selected]
+    merged = torch.stack(normed).mean(dim=0)
+    global_signal = normed[-1]
+    if tokens_per_item is not None:
+        counts = tokens_per_item.reshape(-1).to(
+            device=global_signal.device, dtype=torch.long
+        )
+        if int(counts.sum().item()) != global_signal.shape[0]:
+            raise ValueError(
+                "Qwen tokens_per_item does not match the packed token count"
+            )
+        # Deterministic contiguous-segment means: a prefix sum keeps a fixed
+        # accumulation order (index_add_ would use non-deterministic atomics).
+        prefix = torch.cat(
+            [
+                global_signal.new_zeros(1, global_signal.shape[-1]),
+                global_signal.float().cumsum(dim=0),
+            ],
+            dim=0,
+        )
+        ends = counts.cumsum(dim=0)
+        starts = ends - counts
+        segment_sums = prefix[ends] - prefix[starts]
+        means = segment_sums / counts.clamp_min(1).unsqueeze(-1)
+        item_ids = torch.repeat_interleave(
+            torch.arange(counts.numel(), device=global_signal.device), counts
+        )
+        global_signal = means[item_ids].to(global_signal.dtype)
+    else:
+        global_signal = global_signal.mean(dim=0, keepdim=True)
+    merged = merged + global_signal
+    merged = merger.linear_fc2(
+        merger.act_fn(merger.linear_fc1(merged.view(-1, merger.hidden_size)))
+    )
+    return merged
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +108,9 @@ class RAEEncoderConfig:
     repository_path: str | None = None
     layer_indices: tuple[int, ...] = ()
     merge_size: int = 1
+    dtype: str = "float32"
+    attn_implementation: str = "flash_attention_2"
+    compile: bool = False
 
     def __post_init__(self) -> None:
         if self.image_size == 0 or (self.image_size < -1):
@@ -66,6 +121,8 @@ class RAEEncoderConfig:
             raise ValueError("encoder.merge_size must be positive")
         if self.image_size != -1 and self.image_size % self.merge_size:
             raise ValueError("encoder.image_size must be divisible by merge_size")
+        if self.dtype not in {"float32", "bfloat16"}:
+            raise ValueError(f"Unsupported encoder dtype: {self.dtype}")
 
 
 class FrozenRAEEncoder(nn.Module):
@@ -202,6 +259,10 @@ class FrozenRAEEncoder(nn.Module):
         self.to(device)
         self.eval()
         self.requires_grad_(False)
+        if config.compile:
+            if self.external is None:
+                raise ValueError("encoder.compile requires an external backbone")
+            self.external = torch.compile(self.external, dynamic=True)
 
     def _init_qwen(self, config: RAEEncoderConfig, device: torch.device) -> None:
         if not config.name:
@@ -225,6 +286,10 @@ class FrozenRAEEncoder(nn.Module):
         vision_config = getattr(full_config, "vision_config", None)
         if vision_config is None:
             raise ValueError("Qwen checkpoint does not contain a vision_config")
+        # The HF default (sdpa) splits the packed sequence per document and
+        # runs one attention call per image per block; flash attention consumes
+        # cu_seqlens in a single varlen kernel.
+        vision_config._attn_implementation = config.attn_implementation
         if vision_config.spatial_merge_size != config.merge_size:
             raise ValueError(
                 "encoder.merge_size does not match Qwen vision config: "
@@ -268,7 +333,8 @@ class FrozenRAEEncoder(nn.Module):
                 "Qwen vision checkpoint mismatch: "
                 f"missing={missing}, unexpected={unexpected}"
             )
-        self.external = visual.to(device=device).eval()
+        encoder_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
+        self.external = visual.to(device=device, dtype=encoder_dtype).eval()
         try:
             self.processor = AutoProcessor.from_pretrained(
                 str(model_directory), local_files_only=True
@@ -550,8 +616,13 @@ class FrozenRAEEncoder(nn.Module):
             )
             grid_thw = torch.as_tensor(processor_output[grid_key])
             external_device = next(self.external.parameters()).device
+            external_dtype = next(self.external.parameters()).dtype
             model_inputs = {
-                name: value.to(device=external_device)
+                name: (
+                    value.to(device=external_device, dtype=external_dtype)
+                    if name == pixel_key
+                    else value.to(device=external_device)
+                )
                 for name, value in processor_output.items()
                 if name == pixel_key or name == grid_key
             }
@@ -562,7 +633,10 @@ class FrozenRAEEncoder(nn.Module):
                     output_hidden_states=bool(self.layer_indices),
                 )
             merged_hidden_states = _merge_qwen_hidden_states(
-                outputs, self.external.merger, self.layer_indices
+                outputs,
+                self.external.merger,
+                self.layer_indices,
+                tokens_per_item=grid_thw.reshape(-1, 3).prod(dim=-1),
             )
             grid_thw = grid_thw.to(
                 device=merged_hidden_states.device, dtype=torch.long
@@ -726,16 +800,43 @@ class FrozenRAEEncoder(nn.Module):
             latents = (latents - latent_mean) / torch.sqrt(latent_var + 1e-5)
         if add_noise and self.noise_tau > 0:
             if latents.ndim == 4:
-                noise_shape = (latents.shape[0], 1, 1, 1)
+                noise_scale = self.noise_tau * torch.rand(
+                    (latents.shape[0], 1, 1, 1),
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
             elif latents.ndim == 3:
-                noise_shape = (latents.shape[0], 1, 1)
+                noise_scale = self.noise_tau * torch.rand(
+                    (latents.shape[0], 1, 1),
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
+            elif self.last_grid_thw is not None:
+                # Packed (T, C) latents: one noise scale per packed media item.
+                tokens_per_item = (
+                    self.last_grid_thw.reshape(-1, 3)
+                    .prod(dim=-1)
+                    .to(device=latents.device)
+                )
+                if int(tokens_per_item.sum().item()) != latents.shape[0]:
+                    raise ValueError(
+                        "Qwen grid metadata does not match the packed latent count"
+                    )
+                noise_scale = torch.repeat_interleave(
+                    self.noise_tau
+                    * torch.rand(
+                        tokens_per_item.numel(),
+                        device=latents.device,
+                        dtype=latents.dtype,
+                    ),
+                    tokens_per_item,
+                ).unsqueeze(-1)
             else:
-                noise_shape = (1, 1)
-            noise_scale = self.noise_tau * torch.rand(
-                noise_shape,
-                device=latents.device,
-                dtype=latents.dtype,
-            )
+                noise_scale = self.noise_tau * torch.rand(
+                    (1, 1),
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
             latents = latents + noise_scale * torch.randn_like(latents)
         if return_grid_thw:
             if self.last_grid_thw is None:

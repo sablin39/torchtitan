@@ -53,3 +53,6 @@ CLAUDE_CONTEXT/
 
 # Lychee (link checker) cache
 .lycheecache
+
+# Local pretrained weights (encoders, LPIPS)
+pretrained_models/

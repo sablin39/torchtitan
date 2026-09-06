@@ -22,7 +22,12 @@ from torchtitan.components.optimizer import (
     ParamGroupConfig,
 )
 from torchtitan.components.validate import Validator
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import (
+    CommConfig,
+    CompileConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.protocols.model_spec import ModelSpec
 from .data import RAEQwenCollator, RAEQwenProcessor
@@ -43,7 +48,6 @@ _STATIC_QWEN_MIN_PIXELS = 256 * 256
 _STATIC_QWEN_MAX_PIXELS = 1024 * 1024
 _STATIC_QWEN_MAX_TOKENS_PER_ITEM = 1024
 _STATIC_SEQUENCE_LENGTH = 65536
-_STATIC_TOKEN_BUDGET = _STATIC_SEQUENCE_LENGTH - _STATIC_QWEN_MAX_TOKENS_PER_ITEM
 
 
 def model_registry(
@@ -60,16 +64,16 @@ def model_registry(
         raise ValueError(f"Unknown RAE flavor: {flavor}")
     debug = flavor == "debug"
     model = RAEDecoder.Config(
-        latent_dim=(32 if debug else 768) if latent_dim is None else latent_dim,
-        image_size=(32 if debug else 256)
+        latent_dim=(32 if debug else 1024) if latent_dim is None else latent_dim,
+        image_size=(32 if debug else -1)
         if decoder_image_size is None
         else decoder_image_size,
         patch_size=8 if debug else 16,
-        hidden_size=64 if debug else 512,
+        hidden_size=64 if debug else 1024,
         num_layers=2 if debug else 8,
-        num_heads=4 if debug else 8,
+        num_heads=4 if debug else 16,
         num_kv_heads=2 if debug else 4,
-        intermediate_size=128 if debug else 2048,
+        intermediate_size=128 if debug else 3072,
         attention_backend=attention_backend,
         spatial_merge_size=2,
         temporal_patch_size=2,
@@ -156,6 +160,8 @@ def rae_stage1_debug() -> RAEStage1Trainer.Config:
         latent_dim=1024,
         image_size=-1,
         merge_size=2,
+        # The debug recipe trains in fp32; flash attention requires half precision.
+        attn_implementation="sdpa",
     )
     batch_size = 2
     config = RAEStage1Trainer.Config(
@@ -216,6 +222,12 @@ def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
         image_size=-1,
         layer_indices=(2, 5, 8, 11),
         merge_size=2,
+        dtype="bfloat16",
+        # torch.compile re-specializes on each batch's packed token count and
+        # grid-row count through HF's data-dependent graph breaks, causing a
+        # recompile storm across ranks; bf16 + flash varlen already gives
+        # ~7x over the fp32 sdpa default. Re-enable encoder.compile only with
+        # a static input shape.
     )
     config.encoder = encoder
     config.model_spec = model_registry(
@@ -224,6 +236,9 @@ def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
         decoder_image_size=-1,
         use_dmuon=True,
     )
+    # Post-merger documents are capped at 1024 tokens by max_pixels, which
+    # bounds the attention context for the decoder FLOPs estimate.
+    config.model_spec.model.flops_attention_context = 1024
     config.dataloader = _image_dataloader(
         batch_size=1,
     )
@@ -237,21 +252,25 @@ def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
         disable_cuda_graphs=True,
     )
     config.optimizer = _dmuon(2e-4)
+    config.lr_scheduler = LRSchedulersContainer.Config(
+        warmup_steps=625,
+        decay_type="cosine",
+        min_lr_factor=0.1,
+    )
     config.gan = RAEGANConfig(
-        discriminator_start_step=8,
-        discriminator_update_start_step=6,
-        perceptual_start_step=0,
         ema_decay=0.9978,
         perceptual_kind="lpips",
         lpips_calibration_checkpoint_path="pretrained_models/lpips/vgg_lpips.pth",
         lpips_vgg_checkpoint_path="pretrained_models/lpips/vgg16-397923af.pth",
         augment=RAEGANAugmentConfig(probability=1.0, cutout=0.0),
+        discriminator_warmup_steps=625,
     )
     config.discriminator = RAEFeatureDiscriminator.Config(
         feature_channels=768,
         backbone_kind="hf",
         hf_model_path="~/models/dinov3-vitb16-pretrain-lvd1689m",
         hf_key_depths=(2, 5, 8, 11),
+        backbone_batch_size=64,
     )
     config.parallelism = ParallelismConfig(
         data_parallel_replicate_degree=4,
@@ -282,9 +301,10 @@ def rae_stage1_openimages() -> RAEStage1Trainer.Config:
     return config
 
 
-def rae_stage1_openimages_static() -> RAEStage1Trainer.Config:
+def _openimages_static(static_sequence_length: int) -> RAEStage1Trainer.Config:
     """Locally staged OpenImages recipe with static token packing and graphs."""
-    config = rae_stage1_dmuon_static()
+    config = _dmuon_static(static_sequence_length)
+    token_budget = static_sequence_length - _STATIC_QWEN_MAX_TOKENS_PER_ITEM
     config.dataloader = _image_dataloader(
         batch_size=None,
         dataset_path=_OPENIMAGES_LOCAL_ROOT,
@@ -292,7 +312,7 @@ def rae_stage1_openimages_static() -> RAEStage1Trainer.Config:
         image_key="image",
         min_pixels=_STATIC_QWEN_MIN_PIXELS,
         max_pixels=_STATIC_QWEN_MAX_PIXELS,
-        token_budget=_STATIC_TOKEN_BUDGET,
+        token_budget=token_budget,
         max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
         num_prefetch_batches=4,
     )
@@ -303,7 +323,7 @@ def rae_stage1_openimages_static() -> RAEStage1Trainer.Config:
         image_key="image",
         min_pixels=_STATIC_QWEN_MIN_PIXELS,
         max_pixels=_STATIC_QWEN_MAX_PIXELS,
-        token_budget=_STATIC_TOKEN_BUDGET,
+        token_budget=token_budget,
         max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
         num_prefetch_batches=4,
     )
@@ -313,16 +333,30 @@ def rae_stage1_openimages_static() -> RAEStage1Trainer.Config:
     return config
 
 
-def rae_stage1_dmuon_static() -> RAEStage1Trainer.Config:
+def rae_stage1_openimages_static() -> RAEStage1Trainer.Config:
+    return _openimages_static(_STATIC_SEQUENCE_LENGTH)
+
+
+def rae_stage1_openimages_static_128k() -> RAEStage1Trainer.Config:
+    """Doubled 131072-token static capacity for high-utilization runs."""
+    return _openimages_static(2 * _STATIC_SEQUENCE_LENGTH)
+
+
+def rae_stage1_openimages_static_96k() -> RAEStage1Trainer.Config:
+    """98304-token static capacity with more allocator headroom than 128k."""
+    return _openimages_static(3 * _STATIC_SEQUENCE_LENGTH // 2)
+
+
+def _dmuon_static(static_sequence_length: int) -> RAEStage1Trainer.Config:
     """Throughput recipe with a fixed packed-token budget.
 
     Qwen keeps each image's aspect ratio while constraining its pixel area to
-    at most 1024x1024. The post-merge token ceiling is 1024 per row, so the
-    collator packs up to 64 rows into the 65536-token decoder capacity.
+    at most 1024x1024. The post-merge token ceiling is 1024 per row; the
+    collator fills the budget (static capacity minus one max-size item for the
+    isolated padding document) with a variable number of rows.
     """
     config = rae_stage1_dmuon()
-    static_sequence_length = _STATIC_SEQUENCE_LENGTH
-    token_budget = _STATIC_TOKEN_BUDGET
+    token_budget = static_sequence_length - _STATIC_QWEN_MAX_TOKENS_PER_ITEM
     config.model_spec = model_registry(
         "base",
         attention_backend="varlen",
@@ -331,6 +365,7 @@ def rae_stage1_dmuon_static() -> RAEStage1Trainer.Config:
         static_sequence_length=static_sequence_length,
         use_dmuon=True,
     )
+    config.model_spec.model.flops_attention_context = _STATIC_QWEN_MAX_TOKENS_PER_ITEM
     config.training = TrainingConfig(
         num_tokens_per_microbatch_per_dp_rank=token_budget,
         num_tokens_per_train_step=token_budget * 4,
@@ -359,14 +394,30 @@ def rae_stage1_dmuon_static() -> RAEStage1Trainer.Config:
     )
     config.activation_checkpoint = FullAC.Config()
     config.compile = CompileConfig(enable=True, components=["model", "discriminator"])
+    # Four ranks compile the encoder/decoder/discriminator concurrently on the
+    # first step, and mid-run CUDA-graph captures pause collectives; loosen the
+    # NCCL watchdog bounds accordingly.
+    config.comm = CommConfig(init_timeout_seconds=3600, train_timeout_seconds=600)
     return config
+
+
+def rae_stage1_dmuon_static() -> RAEStage1Trainer.Config:
+    return _dmuon_static(_STATIC_SEQUENCE_LENGTH)
+
+
+def rae_stage1_dmuon_static_128k() -> RAEStage1Trainer.Config:
+    """Doubled 131072-token static capacity for high-utilization runs."""
+    return _dmuon_static(2 * _STATIC_SEQUENCE_LENGTH)
 
 
 __all__ = [
     "model_registry",
     "rae_stage1_debug",
     "rae_stage1_dmuon",
+    "rae_stage1_dmuon_static",
+    "rae_stage1_dmuon_static_128k",
     "rae_stage1_openimages",
     "rae_stage1_openimages_static",
-    "rae_stage1_dmuon_static",
+    "rae_stage1_openimages_static_128k",
+    "rae_stage1_openimages_static_96k",
 ]

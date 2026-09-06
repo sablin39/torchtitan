@@ -172,13 +172,9 @@ def _process_mm_sample(
     processed_text = insert_vision_placeholders(
         texts,
         num_image_tokens,
-        # pyrefly: ignore [missing-attribute]
         vision_start_token=tokenizer.vision_start_token,
-        # pyrefly: ignore [missing-attribute]
         vision_token=tokenizer.image_token,
-        # pyrefly: ignore [missing-attribute]
         vision_end_token=tokenizer.vision_end_token,
-        # pyrefly: ignore [bad-argument-type]
         eos_token=tokenizer.eos_token,
     )
 
@@ -191,13 +187,9 @@ def _process_mm_sample(
 
     special_token_ids = torch.tensor(
         [
-            # pyrefly: ignore [missing-attribute]
             tokenizer.vision_start_id,
-            # pyrefly: ignore [missing-attribute]
             tokenizer.vision_end_id,
-            # pyrefly: ignore [missing-attribute]
             tokenizer.image_id,
-            # pyrefly: ignore [missing-attribute]
             tokenizer.video_id,
         ]
     )

@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .dino import HFModelFeatureDiscriminator
-from .perceptual import LPIPSPerceptualLoss
+from .perceptual import grouped_per_image_loss, LPIPSPerceptualLoss
 
 
 class FrozenImageFeatures(nn.Module):
@@ -54,6 +54,22 @@ class FrozenImageFeatures(nn.Module):
             hidden_BCHW = F.gelu(layer(hidden_BCHW))
             features.append(hidden_BCHW.flatten(2))
         return features
+
+    def features(self, images_BCHW: torch.Tensor) -> list[torch.Tensor]:
+        return self.forward(images_BCHW)
+
+    def distance(
+        self,
+        input_features: list[torch.Tensor],
+        target_features: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Per-image mean absolute feature distance for one batch."""
+        return torch.stack(
+            [
+                (fake - real).abs().flatten(1).mean(dim=1)
+                for fake, real in zip(input_features, target_features)
+            ]
+        ).mean(dim=0)
 
 
 class RAEFeatureDiscriminator(nn.Module):
@@ -143,6 +159,18 @@ class RAEFeatureDiscriminator(nn.Module):
             return self.backbone.heads
         assert self._heads is not None
         return self._heads
+
+    @property
+    def input_canvas_size(self) -> int | None:
+        """Fixed square canvas of the HF backbone; None for free-form backbones."""
+        return self.backbone.input_size if self._is_hf_model else None
+
+    @property
+    def canvas_patch_size(self) -> int:
+        """Patch grid unit used when letterboxing onto the canvas."""
+        if self._is_hf_model:
+            return self.backbone.patch_size
+        return 1
 
     def set_head_requires_grad(self, enabled: bool) -> None:
         if self._is_hf_model:
@@ -239,19 +267,28 @@ class RAEPerceptualLoss(nn.Module):
     def forward_per_sample(
         self, real_BCHW: torch.Tensor, fake_BCHW: torch.Tensor
     ) -> torch.Tensor:
-        if isinstance(self.backbone, FrozenImageFeatures):
-            real_features = self.backbone(real_BCHW)
-            fake_features = self.backbone(fake_BCHW)
-            return torch.stack(
-                [
-                    (fake - real).abs().flatten(1).mean(dim=1)
-                    for fake, real in zip(fake_features, real_features)
-                ]
-            ).mean(dim=0)
-        forward_per_sample = getattr(self.backbone, "forward_per_sample", None)
-        if forward_per_sample is None:
-            raise RuntimeError("Perceptual backbone lacks a per-sample loss path")
-        return forward_per_sample(real_BCHW, fake_BCHW)
+        # The real branch never needs gradients; computing it under no_grad
+        # halves the backward work and activation memory.
+        with torch.no_grad():
+            real_features = self.backbone.features(real_BCHW)
+        return self.backbone.distance(self.backbone.features(fake_BCHW), real_features)
+
+    def forward_per_sample_list(
+        self,
+        real_items: Sequence[torch.Tensor],
+        fake_items: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        """Per-image losses for variable-resolution CHW lists.
+
+        Equal-shape images are stacked into grouped backbone forwards instead
+        of one call per image.
+        """
+        return grouped_per_image_loss(
+            self.backbone.features,
+            self.backbone.distance,
+            real_items,
+            fake_items,
+        )
 
 
 def gan_generator_loss(logits_fake: torch.Tensor, loss_type: str) -> torch.Tensor:

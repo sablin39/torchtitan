@@ -17,9 +17,10 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
 N_EPOCHS=10
 DP_DEGREE=4
 ACCUM_STEPS=8
-TOKENS_PER_MICROBATCH=64512
+# 96k static recipe: 98304-token padded capacity, 97280-token packed budget.
+TOKENS_PER_MICROBATCH=97280
 TOKENS_PER_EPOCH=1000000000
-RAE_CONFIG=${RAE_CONFIG:-rae_stage1_openimages_static}
+RAE_CONFIG=${RAE_CONFIG:-rae_stage1_openimages_static_96k}
 
 TOKENS_PER_STEP=$((TOKENS_PER_MICROBATCH * DP_DEGREE * ACCUM_STEPS))
 TRAINING_STEPS=$(((
@@ -35,6 +36,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
   --training.num_tokens_per_microbatch_per_dp_rank "${TOKENS_PER_MICROBATCH}" \
   --training.num_tokens_per_train_step "${TOKENS_PER_STEP}" \
   --training.steps "${TRAINING_STEPS}" \
-  --checkpoint.folder checkpoint/rae_openimages_gqa_v2 \
-  --validator.freq 2000 \
+  --checkpoint.folder checkpoint/rae_openimages_v3 \
+  --validator.freq 500 \
   --validator.steps 16

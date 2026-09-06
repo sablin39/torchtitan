@@ -38,12 +38,13 @@ from torchtitan.models.rae.discriminator import (
 )
 from torchtitan.models.rae.encoder import FrozenRAEEncoder, RAEEncoderConfig
 from torchtitan.models.rae.encoder.encoder import _merge_qwen_hidden_states
-from torchtitan.models.rae.training import RAEStage1Trainer
+from torchtitan.models.rae.training import RAEGANConfig, RAEStage1Trainer
 from torchtitan.models.rae.training.augmentation import DiscriminatorAugmentation
 from torchtitan.models.rae.training.graphs import (
     RAEDiscriminatorGraph,
     RAEGeneratorLossGraph,
 )
+from torchtitan.models.rae.training.metrics import log_stage1_metrics
 from torchtitan.protocols.model_spec import ModelSpec
 
 
@@ -449,18 +450,62 @@ def test_frozen_encoder_keeps_input_gradient_path() -> None:
     assert all(parameter.grad is None for parameter in encoder.parameters())
 
 
-def test_qwen_mls_sums_selected_blocks_before_merger() -> None:
-    hidden_states = tuple(torch.full((4, 3), float(index)) for index in range(5))
+def test_qwen_mls_averages_normed_blocks_with_global_mean() -> None:
+    torch.manual_seed(0)
+
+    class _Merger(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hidden_size = 6
+            self.use_postshuffle_norm = False
+            self.norm = torch.nn.LayerNorm(3)
+            self.linear_fc1 = torch.nn.Linear(6, 6)
+            self.act_fn = torch.nn.GELU()
+            self.linear_fc2 = torch.nn.Linear(6, 3)
+
+    hidden_states = tuple(torch.randn(4, 3) for _ in range(5))
     outputs = SimpleNamespace(
         hidden_states=hidden_states,
         pooler_output=torch.full((1, 3), -1.0),
     )
-    merger = torch.nn.Sequential(torch.nn.Identity())
-    merged = _merge_qwen_hidden_states(outputs, merger, (0, 2))
-    assert torch.equal(merged, hidden_states[1] + hidden_states[3])
+    merger = _Merger()
+    merged = _merge_qwen_hidden_states(
+        outputs, merger, (0, 2), tokens_per_item=torch.tensor([1, 3])
+    )
+    normed = [merger.norm(hidden_states[1]), merger.norm(hidden_states[3])]
+    averaged = torch.stack(normed).mean(dim=0)
+    item_means = torch.stack([normed[1][0], normed[1][1:].mean(dim=0)])
+    expected = averaged + torch.repeat_interleave(
+        item_means, torch.tensor([1, 3]), dim=0
+    )
+    expected = merger.linear_fc2(merger.act_fn(merger.linear_fc1(expected.view(-1, 6))))
+    torch.testing.assert_close(merged, expected)
     assert torch.equal(
         _merge_qwen_hidden_states(outputs, merger, ()), outputs.pooler_output
     )
+
+
+def test_qwen_mls_rejects_mismatched_token_counts() -> None:
+    hidden_states = tuple(torch.randn(4, 3) for _ in range(5))
+    outputs = SimpleNamespace(
+        hidden_states=hidden_states,
+        pooler_output=torch.full((1, 3), -1.0),
+    )
+
+    class _Merger(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hidden_size = 6
+            self.use_postshuffle_norm = False
+            self.norm = torch.nn.LayerNorm(3)
+            self.linear_fc1 = torch.nn.Linear(6, 6)
+            self.act_fn = torch.nn.GELU()
+            self.linear_fc2 = torch.nn.Linear(6, 3)
+
+    with pytest.raises(ValueError, match="tokens_per_item"):
+        _merge_qwen_hidden_states(
+            outputs, _Merger(), (0, 2), tokens_per_item=torch.tensor([2, 2, 2])
+        )
 
 
 def test_merge_size_reduces_supervision_area() -> None:
@@ -506,6 +551,154 @@ def test_dmuon_recipe_uses_dinov3_vitb16_discriminator() -> None:
     assert discriminator.hf_model_path == "~/models/dinov3-vitb16-pretrain-lvd1689m"
     assert discriminator.feature_channels == 768
     assert discriminator.hf_key_depths == (2, 5, 8, 11)
+
+
+def test_qwen_collator_row_cost_counts_post_merge_tokens() -> None:
+    collator = RAEQwenCollator(
+        RAEQwenCollator.Config(
+            batch_size=None,
+            token_budget=64,
+            max_tokens_per_item=16,
+        ),
+        context=None,
+    )
+    row = {
+        "grid_thw": torch.tensor([[1, 8, 4]]),
+        "merge_size": 2,
+    }
+    assert collator.row_cost(row) == 8
+    assert collator.packing_token_budget() == 64
+    fixed = RAEQwenCollator(
+        RAEQwenCollator.Config(batch_size=2, media_kind="image"),
+        context=None,
+    )
+    assert fixed.packing_token_budget() is None
+
+
+def test_token_budget_batching_packs_by_cost_and_restores_state() -> None:
+    import grain.python as grain
+
+    from torchtitan.components.data.loader import _TokenBudgetBatchIterDataset
+
+    parent = grain.MapDataset.source(list(range(10))).to_iter_dataset()
+    dataset = _TokenBudgetBatchIterDataset(
+        parent, batch_fn=list, row_cost=lambda row: 1, token_budget=3
+    )
+    iterator = iter(dataset)
+    assert next(iterator) == [0, 1, 2]
+    assert next(iterator) == [3, 4, 5]
+    state = iterator.get_state()
+    assert next(iterator) == [6, 7, 8]
+    replay = iter(dataset)
+    next(replay)
+    next(replay)
+    replay.set_state(state)
+    assert next(replay) == [6, 7, 8]
+    assert next(iterator) == [9]
+    with pytest.raises(StopIteration):
+        next(iterator)
+
+    varied = grain.MapDataset.source([2, 2, 2, 1, 1]).to_iter_dataset()
+    dataset = _TokenBudgetBatchIterDataset(
+        varied, batch_fn=list, row_cost=lambda row: row, token_budget=5
+    )
+    iterator = iter(dataset)
+    assert next(iterator) == [2, 2]
+    assert next(iterator) == [2, 1, 1]
+    with pytest.raises(StopIteration):
+        next(iterator)
+
+
+def test_canvas_stacking_letterboxes_mixed_resolutions() -> None:
+    trainer = object.__new__(RAEStage1Trainer)
+    trainer.discriminator = SimpleNamespace(input_canvas_size=32, canvas_patch_size=16)
+    images = [torch.randn(3, 32, 32), torch.randn(3, 48, 24)]
+    stacked = trainer._stack_canvas_images(images)
+    assert stacked.shape == (2, 3, 32, 32)
+    # The 48x24 image scales to 32x16 and centers on a zero canvas.
+    torch.testing.assert_close(stacked[1, :, :, :8], torch.zeros(3, 32, 8))
+    torch.testing.assert_close(stacked[1, :, :, 24:], torch.zeros(3, 32, 8))
+    torch.testing.assert_close(stacked[0], images[0])
+    # No fixed canvas -> no stacking.
+    trainer.discriminator = SimpleNamespace(input_canvas_size=None, canvas_patch_size=1)
+    assert trainer._stack_canvas_images(images) is None
+
+
+def test_pad_to_bucket_pads_with_zero_mask() -> None:
+    images = torch.randn(5, 3, 8, 8)
+    padded, mask = RAEStage1Trainer._pad_to_bucket(images, 4)
+    assert padded.shape == (8, 3, 8, 8)
+    assert mask.tolist() == [1.0] * 5 + [0.0] * 3
+    assert torch.equal(padded[5:], torch.zeros(3, 3, 8, 8))
+    same, same_mask = RAEStage1Trainer._pad_to_bucket(images[:4], 4)
+    assert same.shape == (4, 3, 8, 8)
+    assert same_mask.sum().item() == 4.0
+
+
+def test_perceptual_list_path_groups_shapes_and_matches_loop() -> None:
+    torch.manual_seed(0)
+    loss = RAEPerceptualLoss(kind="fixed", channels=8)
+    real_items = [torch.rand(3, 32, 32), torch.rand(3, 24, 40), torch.rand(3, 32, 32)]
+    fake_items = [torch.rand_like(item, requires_grad=True) for item in real_items]
+    grouped = loss.forward_per_sample_list(real_items, fake_items)
+    looped = torch.stack(
+        [
+            loss.forward_per_sample(real.unsqueeze(0), fake.unsqueeze(0))[0]
+            for real, fake in zip(real_items, fake_items)
+        ]
+    )
+    torch.testing.assert_close(grouped, looped)
+    grouped.sum().backward()
+    assert all(item.grad is not None for item in fake_items)
+
+
+def test_lpips_list_path_matches_batched_and_skips_real_gradients() -> None:
+    vgg_path = "pretrained_models/lpips/vgg16-397923af.pth"
+    calibration_path = "pretrained_models/lpips/vgg_lpips.pth"
+    if not __import__("pathlib").Path(vgg_path).is_file():
+        pytest.skip("LPIPS checkpoints not available")
+    torch.manual_seed(0)
+    loss = RAEPerceptualLoss(
+        kind="lpips",
+        calibration_checkpoint_path=calibration_path,
+        vgg_checkpoint_path=vgg_path,
+    )
+    real_items = [torch.rand(3, 32, 32), torch.rand(3, 24, 40), torch.rand(3, 32, 32)]
+    fake_items = [torch.rand_like(item) for item in real_items]
+    grouped = loss.forward_per_sample_list(real_items, fake_items)
+    looped = torch.stack(
+        [
+            loss.forward_per_sample(real.unsqueeze(0), fake.unsqueeze(0))[0]
+            for real, fake in zip(real_items, fake_items)
+        ]
+    )
+    torch.testing.assert_close(grouped, looped, rtol=1e-4, atol=1e-5)
+    fake = fake_items[0].clone().requires_grad_(True)
+    per_sample = loss.forward_per_sample(real_items[0].unsqueeze(0), fake.unsqueeze(0))
+    per_sample.backward()
+    assert fake.grad is not None
+    assert all(parameter.grad is None for parameter in loss.parameters())
+
+
+def test_stage1_metrics_include_packing_stats() -> None:
+    logged: dict[str, object] = {}
+
+    class Metrics:
+        def log(self, *args, **kwargs) -> None:
+            del args
+            logged.update(kwargs)
+
+    log_stage1_metrics(
+        1,
+        [torch.zeros(()) for _ in range(11)],
+        metrics_processor=Metrics(),
+        non_padding_ratio=0.75,
+        num_images_per_step=16.0,
+    )
+    extra_metrics = cast(dict[str, float], logged["extra_metrics"])
+    assert extra_metrics["rae/non_padding_ratio"] == 0.75
+    assert extra_metrics["rae/num_images_per_step"] == 16.0
+    assert "rae/discriminator_accuracy" in extra_metrics
 
 
 def test_rae_recipe_enables_wandb_and_swanlab_tracking() -> None:
@@ -579,12 +772,31 @@ def test_static_recipe_uses_replicated_data_parallelism() -> None:
     assert config.parallelism.data_parallel_shard_degree == 1
 
 
-def test_base_recipe_uses_conservative_gqa() -> None:
+def test_base_recipe_matches_encoder_sized_gqa_decoder() -> None:
     config = cast(RAEDecoder.Config, model_registry("base").model)
-    assert config.hidden_size == 512
-    assert config.num_heads == 8
+    assert config.latent_dim == 1024
+    assert config.image_size == -1
+    assert config.patch_size == 16
+    assert config.hidden_size == 1024
+    assert config.num_layers == 8
+    assert config.num_heads == 16
     assert config.num_kv_heads == 4
+    assert config.intermediate_size == 3072
     assert config.hidden_size // config.num_heads == 64
+
+
+def test_base_recipe_decoder_is_bias_free_rmsnorm() -> None:
+    model_config = cast(RAEDecoder.Config, model_registry("base").model)
+    model_config.update_from_config(config=type("Config", (), {})())
+    with torch.device("meta"):
+        model = model_config.build()
+    linear_modules = [
+        module for module in model.modules() if isinstance(module, torch.nn.Linear)
+    ]
+    assert linear_modules
+    assert all(module.bias is None for module in linear_modules)
+    assert any(isinstance(module, torch.nn.RMSNorm) for module in model.modules())
+    assert not any(isinstance(module, torch.nn.LayerNorm) for module in model.modules())
 
 
 def test_model_registry_accepts_explicit_decoder_image_size() -> None:
@@ -625,6 +837,34 @@ def test_encoder_normalization_statistics_broadcast_channels(tmp_path) -> None:
     latents = encoder(images)
     assert latents.shape == (1, 8, 2, 2)
     assert torch.isfinite(latents).all()
+
+
+def test_gan_fraction_schedule_matches_raev2_phase_boundaries() -> None:
+    gan = RAEGANConfig()
+    assert gan.discriminator_update_start(10000) == 3750
+    assert gan.discriminator_start(10000) == 5000
+    pinned = RAEGANConfig(
+        discriminator_start_step=8,
+        discriminator_update_start_step=6,
+    )
+    assert pinned.discriminator_update_start(10000) == 6
+    assert pinned.discriminator_start(10000) == 8
+
+
+def test_discriminator_schedule_warms_up_then_cosine_decays() -> None:
+    config = rae_stage1_dmuon()
+    schedule = RAEStage1Trainer._make_discriminator_schedule(config)
+    assert schedule(0) == pytest.approx(1.0 / 625)
+    assert schedule(624) == pytest.approx(1.0)
+    assert schedule(625) == pytest.approx(1.0)
+    assert schedule(10000) == pytest.approx(0.1, abs=1e-3)
+    midpoint = schedule(5312)
+    assert 0.5 < midpoint < 0.6
+    # The default config schedules by fraction, so the debug recipe keeps
+    # absolute step overrides.
+    debug = rae_stage1_debug()
+    assert debug.gan.discriminator_start_step == 0
+    assert config.gan.discriminator_start_step is None
 
 
 def test_gan_losses_match_stage1_conventions() -> None:

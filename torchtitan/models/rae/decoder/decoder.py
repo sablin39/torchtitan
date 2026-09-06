@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 from torchtitan.models.common.attention import VarlenAttention, VarlenMetadata
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.nn_modules import LayerNorm
+from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleList
 from .layout import (
@@ -42,7 +42,6 @@ class RAEAttention(Module):
         hidden_size: int
         num_heads: int
         num_kv_heads: int
-        qkv_bias: bool = True
         attention_backend: Literal["sdpa", "varlen"] = "sdpa"
         rope_theta: float = 10000.0
         rope_scale: tuple[float, float, float] = (2.0, 1.0, 1.0)
@@ -74,12 +73,10 @@ class RAEAttention(Module):
         self.qkv = Linear.Config(
             in_features=config.hidden_size,
             out_features=(self.num_heads + 2 * self.num_kv_heads) * self.head_dim,
-            bias=config.qkv_bias,
         ).build()
         self.proj = Linear.Config(
             in_features=config.hidden_size,
             out_features=config.hidden_size,
-            bias=True,
         ).build()
         self.rope = Cosmos3DRotaryPositionEmbedding.Config(
             head_dim=self.head_dim,
@@ -205,17 +202,14 @@ class RAEFeedForward(Module):
         self.gate = Linear.Config(
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
-            bias=True,
         ).build()
         self.up = Linear.Config(
             in_features=config.hidden_size,
             out_features=config.intermediate_size,
-            bias=True,
         ).build()
         self.down = Linear.Config(
             in_features=config.intermediate_size,
             out_features=config.hidden_size,
-            bias=True,
         ).build()
 
     def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
@@ -240,7 +234,7 @@ class RAEBlock(Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.norm1 = LayerNorm.Config(
+        self.norm1 = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.norm_eps,
         ).build()
@@ -255,7 +249,7 @@ class RAEBlock(Module):
             temporal_patch_size=config.temporal_patch_size,
             reference_fps=config.reference_fps,
         ).build()
-        self.norm2 = LayerNorm.Config(
+        self.norm2 = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.norm_eps,
         ).build()
@@ -310,18 +304,17 @@ class RAEDecoder(BaseModel):
         vocab_size: int = 0
         lm_head: Linear.Config | None = None
         tok_embeddings: Any = None
-        norm: LayerNorm.Config | None = None
+        norm: RMSNorm.Config | None = None
         layers: list[RAEBlock.Config] = field(default_factory=list)
-        latent_dim: int = 768
-        image_size: int = 256
+        latent_dim: int = 1024
+        image_size: int = -1
         patch_size: int = 16
-        hidden_size: int = 512
+        hidden_size: int = 1024
         num_layers: int = 8
-        num_heads: int = 8
+        num_heads: int = 16
         num_kv_heads: int = 4
-        intermediate_size: int = 2048
+        intermediate_size: int = 3072
         norm_eps: float = 1e-6
-        qkv_bias: bool = True
         attention_backend: Literal["sdpa", "varlen"] = "sdpa"
         rope_theta: float = 10000.0
         rope_scale: tuple[float, float, float] = (2.0, 1.0, 1.0)
@@ -331,6 +324,12 @@ class RAEDecoder(BaseModel):
         residual_dropout: float = 0.1
         static_sequence_length: int = 0
         use_dmuon: bool = False
+        flops_attention_context: int = 0
+        """Document length assumed for the attention term of the FLOPs estimate.
+
+        Packed varlen batches give each token only its own document as
+        attention context, so using the packed sequence length would overstate
+        attention FLOPs by orders of magnitude. 0 falls back to seq_len."""
 
         def update_from_config(self, *, config, **kwargs) -> None:
             del kwargs
@@ -381,7 +380,16 @@ class RAEDecoder(BaseModel):
             self, model: torch.nn.Module, seq_len: int
         ) -> tuple[int, int]:
             parameter_count = sum(p.numel() for p in model.parameters())
-            attention_flops = 6 * self.num_layers * self.hidden_size * max(seq_len, 1)
+            head_dim = self.hidden_size // self.num_heads
+            context = self.flops_attention_context or seq_len
+            attention_flops = (
+                6
+                * self.num_layers
+                * self.num_heads
+                * 2
+                * head_dim
+                * min(context, max(seq_len, 1))
+            )
             return parameter_count, 6 * parameter_count + attention_flops
 
     def __init__(self, config: Config) -> None:
@@ -404,20 +412,18 @@ class RAEDecoder(BaseModel):
         self.input_projection = Linear.Config(
             in_features=config.latent_dim,
             out_features=config.hidden_size,
-            bias=True,
         ).build()
         self.trainable_cls_token = torch.nn.Parameter(
             torch.zeros(1, 1, config.hidden_size)
         )
         self.layers = ModuleList([layer.build() for layer in config.layers])
-        self.decoder_norm = LayerNorm.Config(
+        self.decoder_norm = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.norm_eps,
         ).build()
         self.decoder_pred = Linear.Config(
             in_features=config.hidden_size,
             out_features=config.patch_size * config.patch_size * 3,
-            bias=True,
         ).build()
         self._dmuon_enabled = config.use_dmuon
 

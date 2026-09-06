@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -255,6 +261,7 @@ class RAEDiscriminatorGraphOutput:
     loss: torch.Tensor
     real_logits_mean: torch.Tensor
     fake_logits_mean: torch.Tensor
+    accuracy: torch.Tensor
 
 
 class RAEDiscriminatorGraph:
@@ -315,11 +322,17 @@ class RAEDiscriminatorGraph:
                     + torch.nn.functional.softplus(fake_logits_BH).mean(dim=1)
                 )
             loss = (loss_per_image_B * mask_B).sum() / normalizer
+            real_per_image_B = real_logits_BH.mean(dim=1)
+            fake_per_image_B = fake_logits_BH.mean(dim=1)
+            accuracy = (
+                (real_per_image_B > fake_per_image_B).to(mask_B.dtype) * mask_B
+            ).sum() / normalizer
         loss.backward()
         return (
             loss.detach(),
             (real_logits_BH.mean(dim=1) * mask_B).sum().detach() / normalizer,
             (fake_logits_BH.mean(dim=1) * mask_B).sum().detach() / normalizer,
+            accuracy.detach(),
         )
 
     def __call__(

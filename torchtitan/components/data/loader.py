@@ -36,6 +36,100 @@ class DataloaderExhaustedError(Exception):
     pass
 
 
+class _TokenBudgetBatchIterator(grain.DatasetIterator):
+    """Accumulate rows until the next row would exceed a token budget.
+
+    ``row_cost`` prices each row before it joins the batch. The first row that
+    would overflow is buffered and becomes the next batch's first row, so no
+    row is dropped or duplicated. ``get_state`` reports the parent state at the
+    last emitted batch boundary (excluding the buffered row), which keeps
+    checkpoint restore exact for variable-size batches.
+    """
+
+    def __init__(
+        self,
+        parent: grain.DatasetIterator,
+        *,
+        batch_fn,
+        row_cost,
+        token_budget: int,
+    ) -> None:
+        super().__init__(parent)
+        self._batch_fn = batch_fn
+        self._row_cost = row_cost
+        self._token_budget = token_budget
+        self._buffered_row: Any | None = None
+        self._resume_state = self._parent.get_state()
+
+    def __next__(self):
+        rows: list[Any] = []
+        total_cost = 0
+        if self._buffered_row is not None:
+            rows.append(self._buffered_row)
+            total_cost = self._row_cost(self._buffered_row)
+            self._buffered_row = None
+        resume_state = None
+        while True:
+            pre_pull_state = self._parent.get_state()
+            try:
+                row = next(self._parent)
+            except StopIteration:
+                resume_state = self._parent.get_state()
+                break
+            cost = self._row_cost(row)
+            if rows and total_cost + cost > self._token_budget:
+                self._buffered_row = row
+                resume_state = pre_pull_state
+                break
+            rows.append(row)
+            total_cost += cost
+        if not rows:
+            raise StopIteration
+        self._resume_state = resume_state
+        with self._stats.record_self_time():
+            return self._stats.record_output_spec(self._batch_fn(rows))
+
+    def get_state(self):
+        return self._resume_state
+
+    def set_state(self, state) -> None:
+        self._buffered_row = None
+        self._parent.set_state(state)
+        self._resume_state = self._parent.get_state()
+
+
+class _TokenBudgetBatchIterDataset(grain.IterDataset):
+    """Batch rows by a token budget instead of a fixed row count.
+
+    Selected when the collator provides ``row_cost(row) -> int`` and
+    ``packing_token_budget() -> int``; the batch callable receives a variable
+    number of rows whose costs sum to at most the budget.
+    """
+
+    def __init__(
+        self,
+        parent: grain.IterDataset,
+        *,
+        batch_fn,
+        row_cost,
+        token_budget: int,
+    ) -> None:
+        super().__init__(parent)
+        if token_budget <= 0:
+            raise ValueError("token_budget must be positive")
+        self._batch_fn = batch_fn
+        self._row_cost = row_cost
+        self._token_budget = token_budget
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _TokenBudgetBatchIterator(
+            self._parent.__iter__(),
+            batch_fn=self._batch_fn,
+            row_cost=self._row_cost,
+            token_budget=self._token_budget,
+        )
+
+
 class BaseDataLoader(Stateful, ABC, Configurable):
     """Enforces the `Stateful`, `state_dict()`, and `load_state_dict()` contract."""
 
@@ -130,12 +224,27 @@ class GrainDataLoader(BaseDataLoader):
         if isinstance(dataset, grain.MapDataset):
             dataset = dataset.to_iter_dataset(read_options=read_options)
 
-        # Batch and collate samples.
-        dataset = dataset.batch(
-            collator.num_rows_per_batch(),
-            drop_remainder=config.repeat,
-            batch_fn=collator,
+        # Batch and collate samples. Collators that expose ``row_cost`` and a
+        # positive ``packing_token_budget()`` are batched by token budget with
+        # variable row counts; all others use a fixed row count.
+        row_cost = getattr(collator, "row_cost", None)
+        packing_token_budget = getattr(collator, "packing_token_budget", None)
+        token_budget = (
+            packing_token_budget() if packing_token_budget is not None else None
         )
+        if row_cost is not None and token_budget:
+            dataset = _TokenBudgetBatchIterDataset(
+                dataset,
+                batch_fn=collator,
+                row_cost=row_cost,
+                token_budget=token_budget,
+            )
+        else:
+            dataset = dataset.batch(
+                collator.num_rows_per_batch(),
+                drop_remainder=config.repeat,
+                batch_fn=collator,
+            )
 
         # Queue completed batches while the trainer consumes the previous batch.
         dataset = grain_experimental.ThreadPrefetchIterDataset(
