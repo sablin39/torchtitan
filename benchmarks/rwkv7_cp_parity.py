@@ -66,7 +66,9 @@ def _allreduce_grads(model) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument(
+        "--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"]
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--vocab-size", type=int, default=4096)
@@ -129,7 +131,9 @@ def main() -> None:
     _allreduce_grads(cp)
 
     max_grad_diff = torch.tensor(0.0, device=device)
-    for (_, ref_param), (_, cp_param) in zip(ref.named_parameters(), cp.named_parameters()):
+    for (_, ref_param), (_, cp_param) in zip(
+        ref.named_parameters(), cp.named_parameters()
+    ):
         if ref_param.grad is None or cp_param.grad is None:
             continue
         max_grad_diff = torch.maximum(
@@ -139,7 +143,9 @@ def main() -> None:
     if dist.is_initialized():
         dist.all_reduce(max_grad_diff, op=dist.ReduceOp.MAX)
 
-    ok_forward = bool(torch.allclose(ref_local_logits, cp_logits, atol=args.atol, rtol=args.rtol))
+    ok_forward = bool(
+        torch.allclose(ref_local_logits, cp_logits, atol=args.atol, rtol=args.rtol)
+    )
     ok_grad = bool(max_grad_diff.item() <= args.atol)
     ok = ok_forward and ok_grad
     if rank == 0:

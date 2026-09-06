@@ -87,7 +87,9 @@ def _time_steps(model, tokens, cu_seqlens_global, iters: int) -> tuple[float, fl
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument(
+        "--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"]
+    )
     parser.add_argument("--backend", default="inductor")
     parser.add_argument("--fullgraph", action="store_true")
     parser.add_argument("--cp", action="store_true")
