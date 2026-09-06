@@ -164,12 +164,19 @@ The frozen backbone is always in evaluation mode.
 
 When CUDA graphs are enabled, `training/graphs.py` captures the discriminator
 forward/backward path. The trainer letterboxes every real and generated image
-onto the backbone's fixed 224x224 canvas, pads the stacked batch to a multiple
-of 16 with a validity mask, and keys captured graphs by that fixed shape, so
-mixed-resolution batches use graphs every microbatch. Graph mode bypasses DDP
-reducer hooks and explicitly averages discriminator gradients across the batch
-mesh; this keeps graph capture safe for replicated DP. DMuon and its optimizer
-step remain eager. The frozen backbone is compiled during trainer
+onto the backbone's fixed 224x224 canvas, then processes the batch in chunks
+of `gan.discriminator_chunk_size` images (last chunk zero-padded with a
+validity mask). Every chunk replays a single fixed-shape graph, so the GAN
+phase holds exactly one private memory pool regardless of how many images a
+packed step contains; chunk gradients accumulate as masked sums and are
+divided by the total valid count once per update, matching the eager path's
+mean reduction. The graph is captured during trainer initialization with
+dummy inputs, so the GAN-phase memory footprint is allocated at startup and
+a capture failure surfaces before training begins rather than at the
+discriminator phase boundary. Graph mode bypasses DDP reducer hooks and
+explicitly averages discriminator gradients across the batch mesh; this keeps
+graph capture safe for replicated DP. DMuon and its optimizer step remain
+eager. The frozen backbone is compiled during trainer
 initialization (covered by `comm.init_timeout_seconds`) rather than lazily at
 the first GAN step, and the static recipes loosen the NCCL watchdog to
 `init_timeout_seconds=3600` / `train_timeout_seconds=600` because four ranks

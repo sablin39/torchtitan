@@ -635,6 +635,41 @@ def test_pad_to_bucket_pads_with_zero_mask() -> None:
     assert same_mask.sum().item() == 4.0
 
 
+def test_chunked_discriminator_update_matches_full_batch() -> None:
+    torch.manual_seed(0)
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    augmentation = DiscriminatorAugmentation(probability=0.0)
+    fake = torch.randn(11, 3, 16, 16)
+    real = torch.randn(11, 3, 16, 16)
+
+    def run(chunk_size: int):
+        trainer = object.__new__(RAEStage1Trainer)
+        trainer.config = SimpleNamespace(
+            gan=RAEGANConfig(discriminator_chunk_size=chunk_size)
+        )
+        trainer.discriminator_train = discriminator
+        trainer.discriminator_augmentation = augmentation
+        for parameter in discriminator.parameters():
+            parameter.grad = None
+        output = trainer._update_discriminator_fixed_eager(fake, real)
+        grads = [
+            parameter.grad.clone()
+            for parameter in discriminator.parameters()
+            if parameter.grad is not None
+        ]
+        return output, grads
+
+    # A chunk size larger than the batch degenerates to the full-batch update.
+    reference, reference_grads = run(16)
+    chunked, chunked_grads = run(4)
+    for got, expected in zip(chunked, reference, strict=True):
+        torch.testing.assert_close(got, expected)
+    for got, expected in zip(chunked_grads, reference_grads, strict=True):
+        torch.testing.assert_close(got, expected)
+
+
 def test_perceptual_list_path_groups_shapes_and_matches_loop() -> None:
     torch.manual_seed(0)
     loss = RAEPerceptualLoss(kind="fixed", channels=8)
@@ -938,5 +973,28 @@ def test_rae_cuda_loss_graph_replays_forward_and_gradients() -> None:
     output = discriminator_graph(
         torch.randn_like(fake), torch.randn_like(fake), torch.ones(2, device=device)
     )
-    assert output.loss.is_cuda
+    assert output.loss_sum.is_cuda
+    assert output.valid_count.item() == 2.0
     assert any(parameter.grad is not None for parameter in discriminator.parameters())
+
+    # Replays accumulate unnormalized gradient sums (chunked updates divide by
+    # the total valid count once, at the update boundary).
+    fake_in = torch.randn_like(fake)
+    real_in = torch.randn_like(fake)
+    mask = torch.ones(2, device=device)
+    for parameter in discriminator.parameters():
+        parameter.grad = None
+    discriminator_graph(fake_in, real_in, mask)
+    first = [
+        parameter.grad.clone()
+        for parameter in discriminator.parameters()
+        if parameter.grad is not None
+    ]
+    discriminator_graph(fake_in, real_in, mask)
+    second = [
+        parameter.grad
+        for parameter in discriminator.parameters()
+        if parameter.grad is not None
+    ]
+    for doubled, single in zip(second, first, strict=True):
+        torch.testing.assert_close(doubled, single * 2)

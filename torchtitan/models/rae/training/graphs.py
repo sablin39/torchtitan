@@ -26,11 +26,8 @@ class StaticCUDAGraph:
     def __init__(
         self,
         function: Callable[..., TensorTuple],
-        *,
-        before_replay: Callable[[], None] | None = None,
     ) -> None:
         self.function = function
-        self.before_replay = before_replay
         self._graph: torch.cuda.CUDAGraph | None = None
         self._pool: Any = None
         self._static_inputs: tuple[torch.Tensor, ...] | None = None
@@ -106,8 +103,6 @@ class StaticCUDAGraph:
                             "CUDA graph input shape, dtype, or device changed"
                         )
                     static.copy_(runtime)
-        if self.before_replay is not None:
-            self.before_replay()
         self._clear_input_grads()
         assert self._graph is not None
         self._graph.replay()
@@ -258,10 +253,18 @@ class RAEGeneratorLossGraph:
 
 @dataclass(frozen=True, slots=True)
 class RAEDiscriminatorGraphOutput:
-    loss: torch.Tensor
-    real_logits_mean: torch.Tensor
-    fake_logits_mean: torch.Tensor
-    accuracy: torch.Tensor
+    """Masked sums from one replayed chunk.
+
+    Replays accumulate gradients as unnormalized sums so a variable-size batch
+    can be processed in fixed-shape chunks; the caller divides parameters and
+    metrics by the accumulated ``valid_count`` once per update.
+    """
+
+    loss_sum: torch.Tensor
+    real_logits_sum: torch.Tensor
+    fake_logits_sum: torch.Tensor
+    accuracy_sum: torch.Tensor
+    valid_count: torch.Tensor
 
 
 class RAEDiscriminatorGraph:
@@ -281,11 +284,6 @@ class RAEDiscriminatorGraph:
         self.autocast_dtype = autocast_dtype
         self._graph: StaticCUDAGraph | None = None
         self._shape: tuple[int, ...] | None = None
-
-    def _clear_parameter_grads(self) -> None:
-        for parameter in self.discriminator.parameters():
-            if parameter.grad is not None:
-                parameter.grad.zero_()
 
     def _run(
         self,
@@ -310,7 +308,6 @@ class RAEDiscriminatorGraph:
                 self.augmentation(real_BCHW)
             )
             mask_B = valid_image_mask_B.to(dtype=fake_logits_BH.dtype)
-            normalizer = mask_B.sum().clamp_min(1.0)
             if self.discriminator_loss == "hinge":
                 loss_per_image_B = 0.5 * (
                     torch.relu(1.0 - real_logits_BH).mean(dim=1)
@@ -321,18 +318,19 @@ class RAEDiscriminatorGraph:
                     torch.nn.functional.softplus(-real_logits_BH).mean(dim=1)
                     + torch.nn.functional.softplus(fake_logits_BH).mean(dim=1)
                 )
-            loss = (loss_per_image_B * mask_B).sum() / normalizer
+            loss_sum = (loss_per_image_B * mask_B).sum()
             real_per_image_B = real_logits_BH.mean(dim=1)
             fake_per_image_B = fake_logits_BH.mean(dim=1)
-            accuracy = (
+            accuracy_sum = (
                 (real_per_image_B > fake_per_image_B).to(mask_B.dtype) * mask_B
-            ).sum() / normalizer
-        loss.backward()
+            ).sum()
+        loss_sum.backward()
         return (
-            loss.detach(),
-            (real_logits_BH.mean(dim=1) * mask_B).sum().detach() / normalizer,
-            (fake_logits_BH.mean(dim=1) * mask_B).sum().detach() / normalizer,
-            accuracy.detach(),
+            loss_sum.detach(),
+            (real_per_image_B * mask_B).sum().detach(),
+            (fake_per_image_B * mask_B).sum().detach(),
+            accuracy_sum.detach(),
+            valid_image_mask_B.sum().detach(),
         )
 
     def __call__(
@@ -348,10 +346,7 @@ class RAEDiscriminatorGraph:
         shape = tuple(fake_BCHW.shape)
         if self._shape is None:
             self._shape = shape
-            self._graph = StaticCUDAGraph(
-                self._run,
-                before_replay=self._clear_parameter_grads,
-            )
+            self._graph = StaticCUDAGraph(self._run)
         if shape != self._shape:
             raise ValueError("Discriminator CUDA graph cannot change BCHW shape")
         assert self._graph is not None
