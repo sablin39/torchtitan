@@ -323,6 +323,11 @@ class RAEDecoder(BaseModel):
         reference_fps: float = 24.0
         residual_dropout: float = 0.1
         static_sequence_length: int = 0
+        long_skip_connections: tuple[tuple[int, int], ...] = ()
+        """U-ViT-style long skips as explicit ``(source, target)`` block pairs:
+        the output of block ``source`` is concatenated into the input of block
+        ``target`` through a dedicated linear projection. Empty keeps the plain
+        ViT stack."""
         use_dmuon: bool = False
         flops_attention_context: int = 0
         """Document length assumed for the attention term of the FLOPs estimate.
@@ -357,6 +362,18 @@ class RAEDecoder(BaseModel):
                 raise ValueError("RAE residual_dropout must be in [0, 1)")
             if self.static_sequence_length < 0:
                 raise ValueError("RAE static_sequence_length must be non-negative")
+            skip_targets: set[int] = set()
+            for source, target in self.long_skip_connections:
+                if not 0 <= source < target < self.num_layers:
+                    raise ValueError(
+                        "RAE long_skip_connections pairs must satisfy "
+                        f"0 <= source < target < num_layers, got ({source}, {target})"
+                    )
+                if target in skip_targets:
+                    raise ValueError(
+                        "RAE long_skip_connections target block repeated: " f"{target}"
+                    )
+                skip_targets.add(target)
             if not self.layers:
                 self.layers = [
                     RAEBlock.Config(
@@ -417,6 +434,22 @@ class RAEDecoder(BaseModel):
             torch.zeros(1, 1, config.hidden_size)
         )
         self.layers = ModuleList([layer.build() for layer in config.layers])
+        self.skip_projections = ModuleList(
+            [
+                Linear.Config(
+                    in_features=2 * config.hidden_size,
+                    out_features=config.hidden_size,
+                ).build()
+                for _ in range(len(config.long_skip_connections))
+            ]
+        )
+        # Skip routing tables keyed by block index; one projection per pair,
+        # ordered as the pairs are declared.
+        self._skip_by_target = {
+            target: (index, source)
+            for index, (source, target) in enumerate(config.long_skip_connections)
+        }
+        self._skip_sources = {source for source, _ in config.long_skip_connections}
         self.decoder_norm = RMSNorm.Config(
             normalized_shape=config.hidden_size,
             eps=config.norm_eps,
@@ -452,6 +485,38 @@ class RAEDecoder(BaseModel):
         """Run the fixed-shape packed decoder used by CUDA graph capture."""
         return self._forward_padded_impl(latents_TD, positions_T3, attention_masks)
 
+    def _apply_blocks(
+        self,
+        hidden: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        attention_masks: torch.Tensor | VarlenMetadata | None,
+    ) -> torch.Tensor:
+        num_skips = len(self.skip_projections)
+        if not num_skips:
+            for layer in self.layers:
+                hidden = layer(
+                    hidden,
+                    positions=positions,
+                    attention_masks=attention_masks,
+                )
+            return hidden
+        skips: dict[int, torch.Tensor] = {}
+        for index, layer in enumerate(self.layers):
+            if index in self._skip_by_target:
+                projection, source = self._skip_by_target[index]
+                hidden = self.skip_projections[projection](
+                    torch.cat([hidden, skips.pop(source)], dim=-1)
+                )
+            hidden = layer(
+                hidden,
+                positions=positions,
+                attention_masks=attention_masks,
+            )
+            if index in self._skip_sources:
+                skips[index] = hidden
+        return hidden
+
     def _forward_padded_impl(
         self,
         latents_TD: torch.Tensor,
@@ -463,12 +528,11 @@ class RAEDecoder(BaseModel):
         if positions_T3.shape != (latents_TD.shape[0], 3):
             raise ValueError("RAE padded positions must match the latent sequence")
         hidden_TD = self.input_projection(latents_TD)
-        for layer in self.layers:
-            hidden_TD = layer(
-                hidden_TD,
-                positions=positions_T3,
-                attention_masks=attention_masks,
-            )
+        hidden_TD = self._apply_blocks(
+            hidden_TD,
+            positions=positions_T3,
+            attention_masks=attention_masks,
+        )
         return self.decoder_pred(self.decoder_norm(hidden_TD))
 
     def forward(
@@ -570,12 +634,11 @@ class RAEDecoder(BaseModel):
         cls_B1D = self.trainable_cls_token.expand(hidden.shape[0], -1, -1)
         hidden = torch.cat([cls_B1D, hidden], dim=1)
         positions = prepend_cls_positions(positions)
-        for layer in self.layers:
-            hidden = layer(
-                hidden,
-                positions=positions,
-                attention_masks=attention_masks,
-            )
+        hidden = self._apply_blocks(
+            hidden,
+            positions=positions,
+            attention_masks=attention_masks,
+        )
         patch_logits = self.decoder_pred(self.decoder_norm(hidden[:, 1:]))
         return unpatchify_batched(
             patch_logits,

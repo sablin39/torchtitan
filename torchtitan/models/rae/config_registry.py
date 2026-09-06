@@ -63,6 +63,7 @@ def model_registry(
     decoder_image_size: int | None = None,
     residual_dropout: float = 0.1,
     static_sequence_length: int = 0,
+    long_skip_connections: tuple[tuple[int, int], ...] = (),
     use_dmuon: bool | None = None,
 ) -> ModelSpec:
     if flavor not in {"base", "debug"}:
@@ -84,6 +85,7 @@ def model_registry(
         temporal_patch_size=2,
         residual_dropout=residual_dropout,
         static_sequence_length=static_sequence_length,
+        long_skip_connections=long_skip_connections,
         use_dmuon=debug if use_dmuon is None else use_dmuon,
     )
     return ModelSpec(
@@ -149,7 +151,11 @@ def _dmuon(lr: float) -> OptimizersContainer.Config:
                 optimizer_kwargs={
                     "lr": lr,
                     "momentum": 0.95,
-                    "weight_decay": 0.0,
+                    # Muon's updates are scale-invariant to the weight norm, so
+                    # a small decoupled decay keeps norms (and the effective
+                    # LR) from drifting over long runs. Norm-gain/cls params
+                    # route to the AdamW subgroup, which stays decay-free.
+                    "weight_decay": 0.01,
                     "adamw_lr": lr,
                     "adamw_weight_decay": 0.0,
                 },
@@ -306,9 +312,16 @@ def rae_stage1_openimages() -> RAEStage1Trainer.Config:
     return config
 
 
-def _openimages_static(static_sequence_length: int) -> RAEStage1Trainer.Config:
+def _openimages_static(
+    static_sequence_length: int,
+    *,
+    long_skip_connections: tuple[tuple[int, int], ...] = (),
+) -> RAEStage1Trainer.Config:
     """Locally staged OpenImages recipe with static token packing and graphs."""
-    config = _dmuon_static(static_sequence_length)
+    config = _dmuon_static(
+        static_sequence_length,
+        long_skip_connections=long_skip_connections,
+    )
     token_budget = static_sequence_length - _STATIC_QWEN_MAX_TOKENS_PER_ITEM
     config.dataloader = _image_dataloader(
         batch_size=None,
@@ -351,7 +364,19 @@ def rae_stage1_openimages_static_96k() -> RAEStage1Trainer.Config:
     return _openimages_static(3 * _STATIC_SEQUENCE_LENGTH // 2)
 
 
-def _dmuon_static(static_sequence_length: int) -> RAEStage1Trainer.Config:
+def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
+    """96k static recipe with U-ViT mirrored long skip connections."""
+    return _openimages_static(
+        3 * _STATIC_SEQUENCE_LENGTH // 2,
+        long_skip_connections=((0, 7), (1, 6), (2, 5), (3, 4)),
+    )
+
+
+def _dmuon_static(
+    static_sequence_length: int,
+    *,
+    long_skip_connections: tuple[tuple[int, int], ...] = (),
+) -> RAEStage1Trainer.Config:
     """Throughput recipe with a fixed packed-token budget.
 
     Qwen keeps each image's aspect ratio while constraining its pixel area to
@@ -367,6 +392,7 @@ def _dmuon_static(static_sequence_length: int) -> RAEStage1Trainer.Config:
         latent_dim=config.encoder.latent_dim,
         decoder_image_size=-1,
         static_sequence_length=static_sequence_length,
+        long_skip_connections=long_skip_connections,
         use_dmuon=True,
     )
     config.model_spec.model.flops_attention_context = _STATIC_QWEN_MAX_TOKENS_PER_ITEM
@@ -424,4 +450,5 @@ __all__ = [
     "rae_stage1_openimages_static",
     "rae_stage1_openimages_static_128k",
     "rae_stage1_openimages_static_96k",
+    "rae_stage1_openimages_static_96k_uvit",
 ]

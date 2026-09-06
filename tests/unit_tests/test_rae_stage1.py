@@ -19,6 +19,7 @@ from torchtitan.models.rae.config_registry import (
     rae_stage1_dmuon_static,
     rae_stage1_openimages,
     rae_stage1_openimages_static,
+    rae_stage1_openimages_static_96k_uvit,
 )
 from torchtitan.models.rae.data import RAEQwenCollator
 from torchtitan.models.rae.decoder import (
@@ -1129,3 +1130,85 @@ def test_epochs_stop_uses_dataloader_epoch_counter() -> None:
     trainer = _epoch_trainer(epochs=2, epochs_completed=None)
     assert trainer.should_continue_training()
     assert trainer._warned_epoch_tracking_missing
+
+
+def _debug_uvit_decoder(
+    long_skip_connections: tuple[tuple[int, int], ...],
+) -> RAEDecoder:
+    config = RAEDecoder.Config(
+        latent_dim=8,
+        image_size=32,
+        patch_size=8,
+        hidden_size=16,
+        num_layers=4,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=32,
+        long_skip_connections=long_skip_connections,
+    )
+    config.update_from_config(config=type("Config", (), {})())
+    with torch.device("meta"):
+        model = config.build()
+    model.to_empty(device="cpu")
+    model.init_states()
+    return model
+
+
+def test_rae_decoder_long_skip_connections_forward_shape() -> None:
+    model = _debug_uvit_decoder(((0, 3), (1, 2)))
+    assert len(model.skip_projections) == 2
+    assert "skip_projections.0.weight" in model.state_dict()
+    output = model(torch.randn(2, 8, 2, 2))
+    assert output.shape == (2, 3, 32, 32)
+
+
+def test_rae_decoder_long_skip_connections_route_declared_pairs() -> None:
+    model = _debug_uvit_decoder(((0, 3), (1, 2)))
+
+    class _IncrementBlock(torch.nn.Module):
+        def forward(self, hidden, *, positions, attention_masks):
+            del positions, attention_masks
+            return hidden + 1
+
+    model.layers = torch.nn.ModuleList([_IncrementBlock() for _ in range(4)])
+    # Identity concat projections: proj(cat([a, b])) = a + b.
+    with torch.no_grad():
+        for projection in model.skip_projections:
+            projection.weight.zero_()
+            projection.weight[:, :16] = torch.eye(16)
+            projection.weight[:, 16:] = torch.eye(16)
+
+    hidden_BLD = torch.randn(2, 5, 16)
+    output = model._apply_blocks(
+        hidden_BLD, positions=torch.zeros(2, 5, 3), attention_masks=None
+    )
+    # h1=h+2 enters block 2 paired with skip1=h+2 -> 2h+5 after block 2;
+    # then paired with skip0=h+1 -> 3h+7 after block 3.
+    torch.testing.assert_close(output, 3 * hidden_BLD + 7)
+
+
+def test_rae_decoder_rejects_invalid_long_skip_connections() -> None:
+    invalid = [
+        ((1, 1),),
+        ((3, 1),),
+        ((0, 4),),
+        ((0, 2), (1, 2)),
+    ]
+    for pairs in invalid:
+        config = RAEDecoder.Config(num_layers=4, long_skip_connections=pairs)
+        with pytest.raises(ValueError, match="long_skip_connections"):
+            config.update_from_config(config=type("Config", (), {})())
+
+
+def test_rae_decoder_default_has_no_skip_projection_parameters() -> None:
+    model = _debug_decoder()
+    assert not any("skip_projections" in key for key in model.state_dict())
+
+
+def test_openimages_static_uvit_recipe_records_skip_pairs_and_weight_decay() -> None:
+    config = rae_stage1_openimages_static_96k_uvit()
+    decoder = cast(RAEDecoder.Config, config.model_spec.model)
+    assert decoder.long_skip_connections == ((0, 7), (1, 6), (2, 5), (3, 4))
+    optimizer_kwargs = config.optimizer.param_groups[0].optimizer_kwargs
+    assert optimizer_kwargs["weight_decay"] == 0.01
+    assert optimizer_kwargs["adamw_weight_decay"] == 0.0

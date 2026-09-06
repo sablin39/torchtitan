@@ -245,6 +245,16 @@ applies configurable residual dropout independently after attention and after
 the feed-forward branch; the default is `residual_dropout=0.1`, and evaluation
 mode disables it.
 
+The decoder optionally takes U-ViT-style long skip connections through the
+`long_skip_connections` config entry, an explicit tuple of `(source, target)`
+block pairs: the output of block `source` is concatenated into the input of
+block `target` through a dedicated linear projection. The empty default keeps
+the plain ViT stack and loads existing checkpoints unchanged. The pairs are
+recorded verbatim in the recipe config, so different skip strategies are
+comparable from the configuration alone. `rae_stage1_openimages_static_96k_uvit`
+is the A/B variant of the 96k recipe with mirrored pairs
+`((0, 7), (1, 6), (2, 5), (3, 4))` over the eight blocks.
+
 The default recipe uses the local Hugging Face DINOv3 ViT-B/16 at
 `~/models/dinov3-vitb16-pretrain-lvd1689m` as the frozen discriminator backbone,
 with intermediate layers 2, 5, 8, and 11 and RAEv2-style residual spectral
@@ -254,7 +264,10 @@ discriminator accepts any compatible local Hugging Face vision model through
 `backbone_kind="hf"` and `hf_model_path`; its processor statistics are read from
 the model directory. No Python module from the checked-out `RAEv2/` tree is
 needed at runtime. DMuon dedicates and replicates its parameter groups through
-the regular DDP path.
+the regular DDP path. The recipes apply a decoupled `weight_decay=0.01` to the
+Muon-updated matrix parameters (Muon's updates are scale-invariant to the
+weight norm, so decay keeps the effective LR from drifting); norm gains and the
+cls token route to the AdamW subgroup, which stays decay-free.
 
 For RAEv2 parity, set `gan.perceptual_kind="lpips"` and provide
 `gan.lpips_calibration_checkpoint_path` (the RAEv2 `vgg.pth` calibration file).
