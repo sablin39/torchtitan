@@ -23,7 +23,11 @@ TOKENS_PER_MICROBATCH=97280
 # TOKENS_PER_EPOCH is only an estimate that sizes the step-based LR/GAN
 # schedule horizon and the steps safety cap; the measured tokens per epoch
 # are logged as rae/tokens_last_epoch so the estimate can be refined.
-TOKENS_PER_EPOCH=1000000000
+# Estimate: 1.75M train images (per-tar member counts sampled from the first
+# 2GB of each tar and scaled by file size; validated 0.3% against the exact
+# train_0 folder count) x 729 post-merge tokens/image measured through the
+# recipe's Qwen processor on a 400-image sample.
+TOKENS_PER_EPOCH=1274000000
 RAE_CONFIG=${RAE_CONFIG:-rae_stage1_openimages_static_96k}
 
 TOKENS_PER_STEP=$((TOKENS_PER_MICROBATCH * DP_DEGREE * ACCUM_STEPS))
