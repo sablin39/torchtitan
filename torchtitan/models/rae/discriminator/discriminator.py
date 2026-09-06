@@ -239,7 +239,14 @@ class RAEFeatureDiscriminator(nn.Module):
 
 
 class RAEPerceptualLoss(nn.Module):
-    """Frozen feature-distance loss used as the Stage 1 LPIPS substitute."""
+    """Frozen feature-distance loss used as the Stage 1 LPIPS substitute.
+
+    ``resize_long_side`` bounds the long image side before feature extraction.
+    VGG/LPIPS is calibrated around 224-256px inputs, so running it at the
+    native (often 700px+) reconstruction resolution both leaves the calibrated
+    regime and costs FLOPs proportional to H*W for no benefit. Images at or
+    below the bound pass through unchanged; 0 disables resizing.
+    """
 
     def __init__(
         self,
@@ -247,8 +254,12 @@ class RAEPerceptualLoss(nn.Module):
         channels: int = 64,
         calibration_checkpoint_path: str = "",
         vgg_checkpoint_path: str | None = None,
+        resize_long_side: int = 256,
     ) -> None:
         super().__init__()
+        if resize_long_side < 0:
+            raise ValueError("perceptual resize_long_side must be non-negative")
+        self.resize_long_side = resize_long_side
         if kind == "fixed":
             self.backbone = FrozenImageFeatures(channels)
         elif kind == "lpips":
@@ -261,6 +272,18 @@ class RAEPerceptualLoss(nn.Module):
         self.backbone.eval()
         self.requires_grad_(False)
 
+    def _resize(self, images: torch.Tensor) -> torch.Tensor:
+        """Downscale (..., H, W) images whose long side exceeds the bound."""
+        if self.resize_long_side == 0:
+            return images
+        height, width = images.shape[-2:]
+        long_side = max(height, width)
+        if long_side <= self.resize_long_side:
+            return images
+        scale = self.resize_long_side / long_side
+        new_hw = (max(1, round(height * scale)), max(1, round(width * scale)))
+        return F.interpolate(images, size=new_hw, mode="bilinear", antialias=True)
+
     def forward(self, real_BCHW: torch.Tensor, fake_BCHW: torch.Tensor) -> torch.Tensor:
         return self.forward_per_sample(real_BCHW, fake_BCHW).mean()
 
@@ -270,8 +293,10 @@ class RAEPerceptualLoss(nn.Module):
         # The real branch never needs gradients; computing it under no_grad
         # halves the backward work and activation memory.
         with torch.no_grad():
-            real_features = self.backbone.features(real_BCHW)
-        return self.backbone.distance(self.backbone.features(fake_BCHW), real_features)
+            real_features = self.backbone.features(self._resize(real_BCHW))
+        return self.backbone.distance(
+            self.backbone.features(self._resize(fake_BCHW)), real_features
+        )
 
     def forward_per_sample_list(
         self,
@@ -284,7 +309,7 @@ class RAEPerceptualLoss(nn.Module):
         of one call per image.
         """
         return grouped_per_image_loss(
-            self.backbone.features,
+            lambda images: self.backbone.features(self._resize(images)),
             self.backbone.distance,
             real_items,
             fake_items,

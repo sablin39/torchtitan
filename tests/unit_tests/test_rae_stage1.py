@@ -688,6 +688,32 @@ def test_perceptual_list_path_groups_shapes_and_matches_loop() -> None:
     assert all(item.grad is not None for item in fake_items)
 
 
+def test_perceptual_resize_bounds_long_side_and_keeps_grads() -> None:
+    torch.manual_seed(0)
+    loss = RAEPerceptualLoss(kind="fixed", channels=8, resize_long_side=32)
+    real_items = [torch.rand(3, 64, 48), torch.rand(3, 24, 30)]
+    fake_items = [torch.rand_like(item, requires_grad=True) for item in real_items]
+    grouped = loss.forward_per_sample_list(real_items, fake_items)
+    # Small images stay native; both paths must agree with the resize applied.
+    looped = torch.stack(
+        [
+            loss.forward_per_sample(real.unsqueeze(0), fake.unsqueeze(0))[0]
+            for real, fake in zip(real_items, fake_items)
+        ]
+    )
+    torch.testing.assert_close(grouped, looped)
+    grouped.sum().backward()
+    assert all(item.grad is not None for item in fake_items)
+    # Zero disables resizing and matches native-resolution evaluation.
+    torch.manual_seed(0)
+    native = RAEPerceptualLoss(kind="fixed", channels=8, resize_long_side=0)
+    reference = native.forward_per_sample_list(real_items, fake_items)
+    small_only = RAEPerceptualLoss(kind="fixed", channels=8, resize_long_side=64)
+    torch.testing.assert_close(
+        small_only.forward_per_sample_list(real_items, fake_items), reference
+    )
+
+
 def test_lpips_list_path_matches_batched_and_skips_real_gradients() -> None:
     vgg_path = "pretrained_models/lpips/vgg16-397923af.pth"
     calibration_path = "pretrained_models/lpips/vgg_lpips.pth"
@@ -1040,6 +1066,87 @@ def test_streaming_source_tracks_epoch_completion(tmp_path) -> None:
     assert source.current_epoch == 2
     iterator.set_state(state)
     assert source.current_epoch == 1
+
+
+def test_streaming_source_can_defer_image_decode(tmp_path) -> None:
+    from PIL import Image
+
+    from torchtitan.components.data.sources import HuggingFaceStreamingSource
+    from torchtitan.components.data.types import DatasetIterationPolicy
+    from torchtitan.models.rae.data import RAEQwenProcessor
+
+    for index in range(2):
+        Image.new("RGB", (12, 9), color=(index * 100, 10, 50)).save(
+            tmp_path / f"{index}.jpg"
+        )
+    policy = DatasetIterationPolicy(
+        seed=42,
+        shuffle=False,
+        repeat=False,
+        dp_rank=0,
+        dp_world_size=1,
+        streaming_shuffle_buffer_size=1,
+    )
+    config_kwargs = {
+        "path": str(tmp_path),
+        "split": "train",
+        "load_dataset_kwargs": {"data_files": {"train": "*.jpg"}},
+    }
+    decoded = HuggingFaceStreamingSource(
+        HuggingFaceStreamingSource.Config(**config_kwargs),
+        dataset_iteration_policy=policy,
+    )
+    deferred = HuggingFaceStreamingSource(
+        HuggingFaceStreamingSource.Config(**config_kwargs, decode_images=False),
+        dataset_iteration_policy=policy,
+    )
+    decoded_rows = list(iter(decoded))
+    deferred_rows = list(iter(deferred))
+    # Filesystem-backed rows carry just the path; tar-backed rows carry the
+    # encoded bytes. Both must decode to the reference pixels.
+    for row in deferred_rows:
+        media = row["image"]
+        assert set(media) == {"bytes", "path"}
+        assert media["path"] is not None or media["bytes"] is not None
+    for decoded_row, deferred_row in zip(decoded_rows, deferred_rows, strict=True):
+        reference = RAEQwenProcessor._as_btchw(decoded_row["image"])
+        deferred_media = RAEQwenProcessor._as_btchw(deferred_row["image"])
+        torch.testing.assert_close(deferred_media, reference)
+    # Cursor checkpointing is unaffected by the cast.
+    iterator = iter(deferred)
+    next(iterator)
+    state = iterator.get_state()
+    row = next(iterator)
+    iterator.set_state(state)
+    assert next(iterator)["image"]["path"] == row["image"]["path"]
+
+
+def test_webdataset_source_defers_image_bytes() -> None:
+    from torchtitan.components.data.sources import HuggingFaceStreamingSource
+    from torchtitan.components.data.types import DatasetIterationPolicy
+    from torchtitan.models.rae.data import RAEQwenProcessor
+
+    source = HuggingFaceStreamingSource(
+        HuggingFaceStreamingSource.Config(
+            path="tests/assets/cc12m_test",
+            split="train",
+            load_dataset_kwargs={"data_files": {"train": "cc12m-train-0000.tar"}},
+            decode_images=False,
+        ),
+        dataset_iteration_policy=DatasetIterationPolicy(
+            seed=42,
+            shuffle=False,
+            repeat=False,
+            dp_rank=0,
+            dp_world_size=1,
+            streaming_shuffle_buffer_size=1,
+        ),
+    )
+    row = next(iter(source))
+    assert set(row["jpg"]) == {"bytes", "path"}
+    assert row["jpg"]["bytes"][:2] == b"\xff\xd8"  # JPEG SOI marker
+    media = RAEQwenProcessor._as_btchw(row["jpg"])
+    assert media.ndim == 4 and media.shape[1] == 3
 
 
 def test_find_epoch_source_walks_grain_parents(tmp_path) -> None:

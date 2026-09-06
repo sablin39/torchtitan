@@ -91,6 +91,14 @@ class RAEQwenProcessor(SampleProcessor):
             import numpy as np
             from PIL import Image
 
+            if isinstance(media, dict):
+                # HF ``Image(decode=False)`` rows carry the encoded file, or
+                # just its path for filesystem-backed datasets.
+                if media["bytes"] is not None:
+                    media = media["bytes"]
+                else:
+                    with open(media["path"], "rb") as media_file:
+                        media = media_file.read()
             if isinstance(media, (bytes, bytearray)):
                 import io
 
@@ -238,6 +246,21 @@ class RAEQwenProcessor(SampleProcessor):
         }
 
 
+def _pin_for_h2d(value: Any) -> Any:
+    """Pin CPU tensors so the trainer's non_blocking H2D copies are async.
+
+    The collator runs on Grain's prefetch thread, so the pin copy stays off
+    the trainer's critical path.
+    """
+    if (
+        isinstance(value, torch.Tensor)
+        and value.device.type == "cpu"
+        and torch.cuda.is_available()
+    ):
+        return value.pin_memory()
+    return value
+
+
 class RAEQwenCollator(Collator):
     """Pack Qwen processor outputs without padding media tokens."""
 
@@ -344,14 +367,14 @@ class RAEQwenCollator(Collator):
         )
         labels = torch.zeros(len(rows), dtype=torch.long)
         return {
-            "input": packed_pixels,
-            "grid_thw": grid_thw,
-            "rae_grid_thw": rae_grid_thw,
-            "sequence_lengths": sequence_lengths,
-            "media": media,
+            "input": _pin_for_h2d(packed_pixels),
+            "grid_thw": _pin_for_h2d(grid_thw),
+            "rae_grid_thw": _pin_for_h2d(rae_grid_thw),
+            "sequence_lengths": _pin_for_h2d(sequence_lengths),
+            "media": [_pin_for_h2d(item) for item in media],
             "media_kind": self.media_kind,
-            "fps": fps,
-            "temporal_start": temporal_start,
+            "fps": _pin_for_h2d(fps),
+            "temporal_start": _pin_for_h2d(temporal_start),
         }, labels
 
 

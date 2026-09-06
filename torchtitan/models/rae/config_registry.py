@@ -119,6 +119,10 @@ def _image_dataloader(
             path=dataset_path,
             split="train",
             load_dataset_kwargs={"data_files": {"train": data_files}},
+            # Rows cross the process-pool boundary when num_processor_workers
+            # > 0; keep the image as encoded bytes so JPEG decode happens in
+            # the workers instead of at submit-pickle time.
+            decode_images=False,
         ),
         processor=RAEQwenProcessor.Config(
             model_name="~/models/Qwen3.5-0.8B",

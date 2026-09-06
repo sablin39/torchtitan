@@ -66,7 +66,12 @@ class StaticCUDAGraph:
         # to the capture stream instead of rejecting an otherwise valid graph.
         torch.autograd.graph.set_override_stale_capture_stream(True)
         try:
-            with torch.cuda.graph(graph, pool=self._pool):
+            # thread_local mode: the collator's pinned-memory allocations run
+            # on the dataloader prefetch thread, and cudaHostAlloc from another
+            # thread must neither invalidate capture nor raise during it.
+            with torch.cuda.graph(
+                graph, pool=self._pool, capture_error_mode="thread_local"
+            ):
                 outputs = self.function(*self._static_inputs)
         finally:
             torch.autograd.graph.set_override_stale_capture_stream(False)

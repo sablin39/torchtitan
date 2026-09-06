@@ -147,6 +147,11 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
         name: str | None = None
         revision: str | None = None
         load_dataset_kwargs: dict[str, Any] = field(default_factory=dict)
+        decode_images: bool = True
+        """When False, Image columns yield ``{"bytes": ..., "path": ...}``
+        instead of decoded PIL images (HF ``Image(decode=False)``). The row
+        processor then owns decoding; this keeps multi-MB pixel payloads out of
+        the trainer process when rows cross a process-pool boundary."""
 
         def __post_init__(self) -> None:
             duplicated = {"split", "name", "revision", "streaming"} & (
@@ -184,6 +189,17 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
             raise TypeError(
                 "Hugging Face streaming source does not support exact resume"
             )
+        if not config.decode_images:
+            features = dataset.features
+            if features is None:
+                raise ValueError(
+                    "decode_images=False requires a dataset with known features"
+                )
+            for column, feature in features.items():
+                if isinstance(feature, datasets.Image):
+                    dataset = dataset.cast_column(
+                        column, datasets.Image(mode=feature.mode, decode=False)
+                    )
         self._dataset = split_dataset_by_node(
             dataset,
             rank=dataset_iteration_policy.dp_rank,

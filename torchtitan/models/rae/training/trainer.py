@@ -6,8 +6,13 @@
 
 from __future__ import annotations
 
+import gc
 import math
-from collections.abc import Iterator, Mapping
+import os
+import time
+from collections import defaultdict
+from collections.abc import Generator, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,6 +46,70 @@ from .validation import RAEValidator
 
 
 ImageBatch = torch.Tensor | list[torch.Tensor]
+
+
+class _PhaseProfiler:
+    """Per-step phase timing: CPU wall time plus CUDA-event spans.
+
+    Enabled by the RAE_PROFILE_PHASES=1 environment variable. CUDA events are
+    recorded without synchronizing and read back once per step, so profiling
+    overhead is negligible. The GPU span of a phase includes stream idle time
+    spent waiting on the CPU, which is what exposes launch-bound phases.
+    """
+
+    def __init__(self, device: torch.device, *, enabled: bool) -> None:
+        self.enabled = enabled and device.type == "cuda"
+        self._device = device
+        self._cpu_totals: dict[str, float] = defaultdict(float)
+        self._pending: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self._open: dict[str, Any] = {}
+
+    @contextmanager
+    def phase(self, name: str) -> Generator[None]:
+        if not self.enabled:
+            yield
+            return
+        start_cpu = time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            yield
+        finally:
+            end.record()
+            self._pending.append((name, start, end))
+            self._cpu_totals[name] += time.perf_counter() - start_cpu
+
+    def record(self, name: str, cpu_seconds: float) -> None:
+        """Add externally measured CPU seconds to a phase's step total."""
+        if self.enabled:
+            self._cpu_totals[name] += cpu_seconds
+
+    def collect(self) -> dict[str, tuple[float, float]]:
+        """Return {phase: (cpu_seconds, gpu_seconds)} and reset for the step."""
+        if not self.enabled:
+            return {}
+        if self._pending:
+            torch.cuda.synchronize(self._device)
+        gpu_totals: dict[str, float] = defaultdict(float)
+        for name, start, end in self._pending:
+            gpu_totals[name] += start.elapsed_time(end) / 1e3
+        self._pending.clear()
+        report = {
+            name: (cpu, gpu_totals.get(name, 0.0))
+            for name, cpu in self._cpu_totals.items()
+        }
+        self._cpu_totals.clear()
+        return report
+
+    def start(self, name: str) -> None:
+        """Open a phase without a with-block; pair with ``stop``."""
+        manager = self.phase(name)
+        manager.__enter__()
+        self._open[name] = manager
+
+    def stop(self, name: str) -> None:
+        self._open.pop(name).__exit__(None, None, None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +159,11 @@ class RAEGANConfig:
     discriminator_warmup_steps: int = 0
     discriminator_final_lr_ratio: float = 0.1
     perceptual_kind: str = "fixed"
+    perceptual_resize_long_side: int = 256
+    """Long-side bound for perceptual-loss inputs; 0 keeps native resolution.
+    VGG/LPIPS is calibrated around 224-256px, so larger reconstructions are
+    downscaled (aspect preserved) before feature extraction. Native-resolution
+    LPIPS was measured at ~16-23 s/step of the ~50 s stage-1 step."""
     lpips_calibration_checkpoint_path: str = ""
     lpips_vgg_checkpoint_path: str | None = None
     augment: RAEGANAugmentConfig = field(default_factory=RAEGANAugmentConfig)
@@ -129,6 +203,8 @@ class RAEGANConfig:
             raise ValueError(
                 f"Unsupported perceptual loss kind: {self.perceptual_kind}"
             )
+        if self.perceptual_resize_long_side < 0:
+            raise ValueError("gan.perceptual_resize_long_side must be non-negative")
         if (
             self.perceptual_kind == "lpips"
             and not self.lpips_calibration_checkpoint_path
@@ -304,18 +380,6 @@ class RAEStage1Trainer(Trainer):
         )
         if config.compile.enable and "discriminator" in config.compile.components:
             self.discriminator.compile_forward(backend=config.compile.backend)
-            canvas = self.discriminator.input_canvas_size
-            if canvas is not None:
-                # Compile the frozen backbone during initialization (covered by
-                # the init timeout) instead of lazily at the first GAN step,
-                # where slow per-rank compilation can trip the train-timeout
-                # watchdog. The first call installs the compiled wrapper and
-                # the second triggers actual compilation.
-                with torch.no_grad():
-                    self.discriminator.eval()
-                    dummy_BCHW = torch.zeros(1, 3, canvas, canvas, device=self.device)
-                    self.discriminator.forward_fixed(dummy_BCHW)
-                    self.discriminator.forward_fixed(dummy_BCHW)
         if (
             dist.is_available()
             and dist.is_initialized()
@@ -339,15 +403,72 @@ class RAEStage1Trainer(Trainer):
             channels=config.discriminator.feature_channels,
             calibration_checkpoint_path=config.gan.lpips_calibration_checkpoint_path,
             vgg_checkpoint_path=config.gan.lpips_vgg_checkpoint_path,
+            resize_long_side=config.gan.perceptual_resize_long_side,
         ).to(self.device)
         self.discriminator_augmentation = DiscriminatorAugmentation(
             probability=config.gan.augment.probability,
             cutout=config.gan.augment.cutout,
         )
+        if (
+            config.compile.enable
+            and "discriminator" in config.compile.components
+            and config.gan.discriminator_weight > 0
+        ):
+            canvas = self.discriminator.input_canvas_size
+            if canvas is not None:
+                # Warm the generator-side compiled path during initialization
+                # (covered by the init timeout): the first GAN step would
+                # otherwise compile mid-run, and slow per-rank compilation can
+                # stall the DP collectives. The warmup must replicate the
+                # runtime guards (eval mode, frozen head, bf16 autocast,
+                # grad-enabled chunk of gan.discriminator_chunk_size rows) or
+                # dynamo compiles a separate variant and the warmup is wasted.
+                autocast_bf16 = (
+                    self.device.type == "cuda" and config.training.dtype == "bfloat16"
+                )
+                dummy_BCHW = torch.zeros(
+                    config.gan.discriminator_chunk_size,
+                    3,
+                    canvas,
+                    canvas,
+                    device=self.device,
+                    dtype=torch.bfloat16 if autocast_bf16 else torch.float32,
+                    requires_grad=True,
+                )
+                self.discriminator.eval()
+                self.discriminator.set_head_requires_grad(False)
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=torch.bfloat16,
+                    enabled=autocast_bf16,
+                ):
+                    self.discriminator(self.discriminator_augmentation(dummy_BCHW))
+                self.discriminator.set_head_requires_grad(True)
         self._discriminator_graphs: dict[tuple[int, ...], RAEDiscriminatorGraph] = {}
         self._graph_failures: set[tuple[str, tuple[Any, ...]]] = set()
         if config.epochs is not None and config.epochs <= 0:
             raise ValueError(f"epochs must be positive, got {config.epochs}")
+        self._phase_profiler = _PhaseProfiler(
+            self.device, enabled=os.environ.get("RAE_PROFILE_PHASES") == "1"
+        )
+        self._step_end_time: float | None = None
+        if self._phase_profiler.enabled:
+            # Surface full-GC pauses in the per-step report: a multi-second
+            # gen2 collection stalls the whole rank and (via DP collectives)
+            # paces every other rank.
+            gc_start: dict[str, float] = {}
+
+            def _gc_callback(phase: str, info: dict[str, int]) -> None:
+                if info["generation"] != 2:
+                    return
+                if phase == "start":
+                    gc_start["t"] = time.perf_counter()
+                elif phase == "stop" and "t" in gc_start:
+                    self._phase_profiler.record(
+                        "gc", time.perf_counter() - gc_start.pop("t")
+                    )
+
+            gc.callbacks.append(_gc_callback)
         self._tokens_current_epoch = 0
         self._last_seen_epoch = 0
         self._tokens_last_epoch: int | None = None
@@ -842,6 +963,29 @@ class RAEStage1Trainer(Trainer):
             letterboxed.append(canvas_image)
         return torch.stack(letterboxed)
 
+    def _discriminator_generator_logits(
+        self, images_BCHW: torch.Tensor
+    ) -> torch.Tensor:
+        """Generator-side discriminator logits over fixed-shape chunks.
+
+        The compiled backbone re-specializes on batch size, and a mid-training
+        recompile stalls one rank for tens of seconds while its DP peers wait
+        in the gradient collective. Chunking to gan.discriminator_chunk_size
+        keeps a single compiled shape, matching the discriminator-update path.
+        Padded rows are sliced off the concatenated logits.
+        """
+        chunk_size = self.config.gan.discriminator_chunk_size
+        num_images = images_BCHW.shape[0]
+        logit_chunks = []
+        for start in range(0, num_images, chunk_size):
+            valid = min(chunk_size, num_images - start)
+            chunk, _ = self._pad_to_bucket(
+                images_BCHW[start : start + chunk_size], chunk_size
+            )
+            logits = self.discriminator_train(self.discriminator_augmentation(chunk))
+            logit_chunks.append(logits[:valid])
+        return torch.cat(logit_chunks)
+
     @staticmethod
     def _pad_to_bucket(
         images_BCHW: torch.Tensor, bucket: int
@@ -1044,7 +1188,27 @@ class RAEStage1Trainer(Trainer):
                 augmented[image_index] = group[group_index]
         return augmented
 
+    def batch_generator(
+        self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+        # See the train_step note: NCCL pins this thread to the GPU-local
+        # NUMA node at comm init. Reset before iter() spawns the dataloader
+        # prefetch/pool threads so they inherit the full mask.
+        os.sched_setaffinity(0, range(os.cpu_count() or 1))
+        return super().batch_generator(data_iterable)
+
     def train_step(self, data_iterator: Iterator) -> None:
+        # NCCL pins the calling thread to the GPU-local NUMA node when a
+        # communicator initializes, and (in 2.29.x) does not restore the
+        # original mask afterwards. On this host two GPUs share a NUMA node,
+        # which confines those ranks and their dataloader threads to a few
+        # cores and starves their data supply. Reset to the full mask each
+        # step; late lazy comm inits can re-pin, and one syscall per step is
+        # negligible.
+        os.sched_setaffinity(0, range(os.cpu_count() or 1))
+        now = time.perf_counter()
+        if self._step_end_time is not None:
+            self._phase_profiler.record("between", now - self._step_end_time)
         decoder = self.model_parts[0]
         gan = self.config.gan
         step = self.step - 1
@@ -1075,13 +1239,17 @@ class RAEStage1Trainer(Trainer):
         padding_capacity_tokens = 0
         num_images_per_step = 0
         for _ in range(num_microbatches):
-            images, encoder_input = self._next_images(data_iterator)
+            with self._phase_profiler.phase("data"):
+                images, encoder_input = self._next_images(data_iterator)
             images_batches.append(images)
             image_items = self._image_items(images)
             # Encode once per microbatch; the encoder is frozen and
             # deterministic, so the discriminator phase below re-decodes these
             # cached clean latents instead of re-running the vision tower.
-            latents, grid_thw, fps, temporal_start = self._encode(images, encoder_input)
+            with self._phase_profiler.phase("encode"):
+                latents, grid_thw, fps, temporal_start = self._encode(
+                    images, encoder_input
+                )
             cached_latents.append((latents, grid_thw, fps, temporal_start))
             batch_tokens = int(grid_thw.prod(dim=-1).sum().item())
             self.metrics_processor.ntokens_since_last_log += batch_tokens
@@ -1091,77 +1259,93 @@ class RAEStage1Trainer(Trainer):
                 enabled=self.device.type == "cuda"
                 and self.config.training.dtype == "bfloat16",
             ):
-                recon_items = self._decode(
-                    decoder,
-                    self._add_latent_noise(latents, grid_thw, self.encoder.noise_tau),
-                    grid_thw,
-                    fps,
-                    temporal_start,
-                )
-                target_sizes = [
-                    tuple(reconstruction.shape[-2:]) for reconstruction in recon_items
-                ]
-                target_items = self._image_items(
-                    self._supervision_images(images, target_sizes)
-                )
-                reconstruction_loss = torch.stack(
-                    [
-                        F.l1_loss(reconstruction, target)
-                        for reconstruction, target in zip(
-                            recon_items, target_items, strict=True
-                        )
-                    ]
-                ).mean()
-                perceptual_loss = (
-                    self._perceptual_loss(
-                        [target * 2.0 - 1.0 for target in target_items],
-                        [reconstruction * 2.0 - 1.0 for reconstruction in recon_items],
+                with self._phase_profiler.phase("decode"):
+                    recon_items = self._decode(
+                        decoder,
+                        self._add_latent_noise(
+                            latents, grid_thw, self.encoder.noise_tau
+                        ),
+                        grid_thw,
+                        fps,
+                        temporal_start,
                     )
-                    if use_perceptual
-                    else reconstruction_loss.new_zeros(())
-                )
+                with self._phase_profiler.phase("supervision"):
+                    target_sizes = [
+                        tuple(reconstruction.shape[-2:])
+                        for reconstruction in recon_items
+                    ]
+                    target_items = self._image_items(
+                        self._supervision_images(images, target_sizes)
+                    )
+                    reconstruction_loss = torch.stack(
+                        [
+                            F.l1_loss(reconstruction, target)
+                            for reconstruction, target in zip(
+                                recon_items, target_items, strict=True
+                            )
+                        ]
+                    ).mean()
+                with self._phase_profiler.phase("perceptual"):
+                    perceptual_loss = (
+                        self._perceptual_loss(
+                            [target * 2.0 - 1.0 for target in target_items],
+                            [
+                                reconstruction * 2.0 - 1.0
+                                for reconstruction in recon_items
+                            ],
+                        )
+                        if use_perceptual
+                        else reconstruction_loss.new_zeros(())
+                    )
                 reconstruction_total = (
                     reconstruction_loss + gan.perceptual_weight * perceptual_loss
                 )
                 if use_gan:
-                    fake_canvas_BCHW = self._stack_canvas_images(
-                        [reconstruction * 2.0 - 1.0 for reconstruction in recon_items]
-                    )
-                    if fake_canvas_BCHW is not None:
-                        logits_fake = self.discriminator_train(
-                            self.discriminator_augmentation(fake_canvas_BCHW)
-                        )
-                    else:
-                        fake_augmented = self._augment_images(
+                    with self._phase_profiler.phase("gan"):
+                        fake_canvas_BCHW = self._stack_canvas_images(
                             [
                                 reconstruction * 2.0 - 1.0
                                 for reconstruction in recon_items
                             ]
                         )
-                        logits_fake = self.discriminator_train(fake_augmented)
-                    generator_logits_metric = logits_fake.detach().mean()
-                    adversarial_loss = gan_generator_loss(
-                        logits_fake, gan.generator_loss
-                    )
-                    adaptive_weight = (
-                        self._adaptive_weight(
-                            reconstruction_total,
-                            adversarial_loss,
-                            decoder.decoder_pred.weight,
-                            gan.max_adaptive_weight,
+                        if fake_canvas_BCHW is not None:
+                            logits_fake = self._discriminator_generator_logits(
+                                fake_canvas_BCHW
+                            )
+                        else:
+                            fake_augmented = self._augment_images(
+                                [
+                                    reconstruction * 2.0 - 1.0
+                                    for reconstruction in recon_items
+                                ]
+                            )
+                            logits_fake = self.discriminator_train(fake_augmented)
+                        generator_logits_metric = logits_fake.detach().mean()
+                        adversarial_loss = gan_generator_loss(
+                            logits_fake, gan.generator_loss
                         )
-                        if self._adaptive_weight_enabled
-                        else reconstruction_loss.new_ones(())
-                    )
-                    total_loss = (
-                        reconstruction_total
-                        + gan.discriminator_weight * adaptive_weight * adversarial_loss
-                    )
+                        adaptive_weight = (
+                            self._adaptive_weight(
+                                reconstruction_total,
+                                adversarial_loss,
+                                decoder.decoder_pred.weight,
+                                gan.max_adaptive_weight,
+                            )
+                            if self._adaptive_weight_enabled
+                            else reconstruction_loss.new_ones(())
+                        )
+                        total_loss = (
+                            reconstruction_total
+                            + gan.discriminator_weight
+                            * adaptive_weight
+                            * adversarial_loss
+                        )
                 else:
                     adversarial_loss = reconstruction_loss.new_zeros(())
                     adaptive_weight = reconstruction_loss.new_zeros(())
                     total_loss = reconstruction_total
-                (total_loss / num_microbatches).backward()
+                with self._phase_profiler.phase("backward"):
+                    (total_loss / num_microbatches).backward()
             non_padding_tokens += batch_tokens
             self._tokens_current_epoch += batch_tokens
             padding_capacity_tokens += (
@@ -1181,10 +1365,11 @@ class RAEStage1Trainer(Trainer):
             and adversarial_metric is not None
             and adaptive_metric is not None
         )
-        decoder_grad_norm = self._decoder_grad_norm()
-        self.optimizers.step()
-        self.lr_schedulers.step()
-        self._update_ema()
+        with self._phase_profiler.phase("optimizer"):
+            decoder_grad_norm = self._decoder_grad_norm()
+            self.optimizers.step()
+            self.lr_schedulers.step()
+            self._update_ema()
 
         image_items = [
             image for batch in images_batches for image in self._image_items(batch)
@@ -1197,6 +1382,7 @@ class RAEStage1Trainer(Trainer):
         )
         discriminator_accuracy_metric = metric_source.new_zeros(())
         if train_discriminator:
+            self._phase_profiler.start("disc")
             self.discriminator.set_head_requires_grad(True)
             self.discriminator_train.train()
             # RAEv2 decodes discriminator fakes with the generator in eval
@@ -1282,6 +1468,20 @@ class RAEStage1Trainer(Trainer):
             decoder.train(decoder_was_training)
             self.discriminator.eval()
             self.discriminator.set_head_requires_grad(False)
+            self._phase_profiler.stop("disc")
+
+        phase_report = self._phase_profiler.collect()
+        if phase_report:
+            rank = (
+                dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            )
+            summary = " ".join(
+                f"{name}={cpu:.2f}/{gpu:.2f}"
+                for name, (cpu, gpu) in sorted(phase_report.items())
+            )
+            logger.info(
+                f"[step {self.step} rank {rank}] phase cpu/gpu seconds: {summary}"
+            )
 
         # The dataloader's epoch counter advances when the stream wraps, which
         # runs ahead of trainer consumption by the shuffle window and prefetch
@@ -1315,6 +1515,7 @@ class RAEStage1Trainer(Trainer):
                 ),
                 tokens_last_epoch=self._tokens_last_epoch,
             )
+        self._step_end_time = time.perf_counter()
 
     def _track_epoch_tokens(self) -> int | None:
         """Fold consumed tokens into per-epoch totals at stream boundaries.
