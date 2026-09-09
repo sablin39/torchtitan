@@ -446,6 +446,9 @@ class _RAEModelState(Stateful):
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # Strict everywhere: a silently skipped key leaves randomly
+        # initialized weights behind (a past discriminator key rename would
+        # have done exactly that under strict=False).
         decoder_state = state_dict.get("decoder", state_dict)
         if getattr(self.decoder, "_dmuon_enabled", False) and hasattr(
             self.decoder, "_dedicated_comm_ctx"
@@ -454,18 +457,19 @@ class _RAEModelState(Stateful):
 
             dmuon.set_model_state_dict(self.decoder, decoder_state)
             for name, buffer in self.decoder.named_buffers():
-                if name in decoder_state:
-                    buffer.copy_(
-                        decoder_state[name].to(device=buffer.device, dtype=buffer.dtype)
+                if name not in decoder_state:
+                    raise RuntimeError(
+                        f"RAE checkpoint is missing decoder buffer: {name}"
                     )
+                buffer.copy_(
+                    decoder_state[name].to(device=buffer.device, dtype=buffer.dtype)
+                )
         else:
-            self.decoder.load_state_dict(decoder_state, strict=False)
-        if "discriminator" in state_dict:
-            self.discriminator.load_state_dict(
-                state_dict["discriminator"], strict=False
-            )
-        if "ema" in state_dict:
-            self.ema.load_state_dict(state_dict["ema"], strict=False)
+            self.decoder.load_state_dict(decoder_state, strict=True)
+        self.discriminator.load_state_dict(
+            state_dict["discriminator"], strict=True
+        )
+        self.ema.load_state_dict(state_dict["ema"], strict=True)
 
 
 class _RAEOptimizerState(Stateful):
@@ -732,12 +736,7 @@ class RAEStage1Trainer(Trainer):
             name.replace("._checkpoint_wrapped_module.", "."): value
             for name, value in state.items()
         }
-        missing, _unexpected = ema_model.load_state_dict(normalized_state, strict=False)
-        if missing:
-            raise RuntimeError(
-                "RAE EMA initialization is missing decoder parameters: "
-                + ", ".join(missing)
-            )
+        ema_model.load_state_dict(normalized_state, strict=True)
         ema_model.eval()
         ema_model.requires_grad_(False)
         return ema_model
