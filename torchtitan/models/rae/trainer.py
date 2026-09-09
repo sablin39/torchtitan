@@ -4,16 +4,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""RAE Stage 1 training loop, augmentation, and metric logging."""
+
 from __future__ import annotations
+
+# Tensor dimensions: B=batch, C=channel, H=height, W=width.
 
 import gc
 import math
 import os
 import time
 from collections import defaultdict
-from collections.abc import Generator, Iterable, Iterator, Mapping
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -24,14 +28,17 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.nn.parallel import DistributedDataParallel
 
 from torchtitan.components.checkpointer import LR_SCHEDULER, MODEL, OPTIMIZER
-from torchtitan.components.data.loader import DataloaderExhaustedError
+from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.optimizer import LRSchedulersContainer
 from torchtitan.components.optimizer.dmuon import load_dmuon
+from torchtitan.components.validate import BaseValidator, iterate_and_close_dataloader
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
-from ..decoder import create_rae_static_varlen_metadata
-from ..discriminator import (
+
+from .data import RAEQwenCollator
+from .decoder import create_rae_static_varlen_metadata
+from .discriminator import (
     gan_discriminator_loss,
     gan_generator_loss,
     gan_logits_mean,
@@ -39,11 +46,182 @@ from ..discriminator import (
     RAEFeatureDiscriminator,
     RAEPerceptualLoss,
 )
-from ..encoder import FrozenRAEEncoder, RAEEncoderConfig
+from .encoder import FrozenRAEEncoder, RAEEncoderConfig
 
-from .augmentation import DiscriminatorAugmentation
-from .metrics import log_stage1_metrics
-from .validation import RAEValidator
+
+class DiscriminatorAugmentation:
+    """Differentiable translation, color, and cutout augmentation."""
+
+    def __init__(self, probability: float = 1.0, cutout: float = 0.0) -> None:
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError("augmentation probability must be in [0, 1]")
+        if not 0.0 <= cutout <= 1.0:
+            raise ValueError("augmentation cutout must be in [0, 1]")
+        self.probability = probability
+        self.cutout = cutout
+        self._grids: dict[
+            tuple[int, int, int, torch.device], tuple[torch.Tensor, ...]
+        ] = {}
+
+    def _get_grids(
+        self,
+        batch_size: int,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, ...]:
+        key = (batch_size, height, width, device)
+        if key not in self._grids:
+            self._grids[key] = torch.meshgrid(
+                torch.arange(batch_size, dtype=torch.long, device=device),
+                torch.arange(height, dtype=torch.long, device=device),
+                torch.arange(width, dtype=torch.long, device=device),
+                indexing="ij",
+            )
+        return self._grids[key]
+
+    def __call__(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+        if images_BCHW.dtype != torch.float32:
+            images_BCHW = images_BCHW.float()
+        if self.probability < 1e-6:
+            return images_BCHW
+
+        apply_translate, apply_color, apply_cutout = (
+            torch.rand(3, device=images_BCHW.device) <= self.probability
+        )
+        batch_size, _, height, width = images_BCHW.shape
+        random_B = torch.rand(7, batch_size, 1, 1, device=images_BCHW.device)
+
+        height_delta = round(height * 0.125)
+        width_delta = round(width * 0.125)
+        height_offset_B11 = (
+            random_B[0].mul(2 * height_delta + 1).floor().long() - height_delta
+        )
+        width_offset_B11 = (
+            random_B[1].mul(2 * width_delta + 1).floor().long() - width_delta
+        )
+        batch_grid_BHW, height_grid_BHW, width_grid_BHW = self._get_grids(
+            batch_size, height, width, images_BCHW.device
+        )
+        height_grid_BHW = (
+            (height_grid_BHW + height_offset_B11).add(1).clamp(0, height + 1)
+        )
+        width_grid_BHW = (width_grid_BHW + width_offset_B11).add(1).clamp(0, width + 1)
+        padded_BCHW = F.pad(images_BCHW, (1, 1, 1, 1))
+        translated_BCHW = padded_BCHW.permute(0, 2, 3, 1)[
+            batch_grid_BHW,
+            height_grid_BHW,
+            width_grid_BHW,
+        ].permute(0, 3, 1, 2)
+        images_BCHW = torch.where(apply_translate, translated_BCHW, images_BCHW)
+
+        colored_BCHW = images_BCHW + random_B[2].unsqueeze(-1) - 0.5
+        channel_mean_B1HW = colored_BCHW.mean(dim=1, keepdim=True)
+        colored_BCHW = (colored_BCHW - channel_mean_B1HW) * random_B[3].unsqueeze(
+            -1
+        ).mul(2) + channel_mean_B1HW
+        image_mean_B111 = colored_BCHW.mean((1, 2, 3), keepdim=True)
+        colored_BCHW = (colored_BCHW - image_mean_B111) * random_B[4].unsqueeze(-1).add(
+            0.5
+        ) + image_mean_B111
+        images_BCHW = torch.where(apply_color, colored_BCHW, images_BCHW)
+
+        if self.cutout > 0:
+            cutout_height = round(height * self.cutout)
+            cutout_width = round(width * self.cutout)
+            height_offset_B11 = (
+                random_B[5].mul(height + (1 - cutout_height % 2)).floor().long()
+            )
+            width_offset_B11 = (
+                random_B[6].mul(width + (1 - cutout_width % 2)).floor().long()
+            )
+            batch_grid_BHW, height_grid_BHW, width_grid_BHW = self._get_grids(
+                batch_size,
+                cutout_height,
+                cutout_width,
+                images_BCHW.device,
+            )
+            height_grid_BHW = (
+                (height_grid_BHW + height_offset_B11)
+                .sub(cutout_height // 2)
+                .clamp(0, height - 1)
+            )
+            width_grid_BHW = (
+                (width_grid_BHW + width_offset_B11)
+                .sub(cutout_width // 2)
+                .clamp(0, width - 1)
+            )
+            mask_BHW = torch.ones(
+                batch_size,
+                height,
+                width,
+                dtype=images_BCHW.dtype,
+                device=images_BCHW.device,
+            )
+            mask_BHW[
+                batch_grid_BHW, height_grid_BHW, width_grid_BHW
+            ] = images_BCHW.new_zeros(())
+            cutout_BCHW = images_BCHW * mask_BHW.unsqueeze(1)
+            images_BCHW = torch.where(apply_cutout, cutout_BCHW, images_BCHW)
+
+        return images_BCHW.contiguous()
+
+
+def log_stage1_metrics(
+    step: int,
+    losses: Sequence[torch.Tensor],
+    *,
+    metrics_processor: Any | None = None,
+    non_padding_ratio: float = 1.0,
+    num_images_per_step: float = 0.0,
+    epoch: float | None = None,
+    tokens_last_epoch: int | None = None,
+) -> None:
+    """Log the scalar metrics emitted by one RAE Stage 1 update."""
+    values = [float(loss.detach().item()) for loss in losses]
+    if len(values) != 12:
+        raise ValueError(f"RAE Stage 1 metrics require 12 values, got {len(values)}")
+    if metrics_processor is not None:
+        extra_metrics: dict[str, float] = {
+            "rae/reconstruction_loss": values[0],
+            "rae/perceptual_loss": values[1],
+            "rae/adversarial_loss": values[2],
+            "rae/discriminator_loss": values[3],
+            "rae/adaptive_weight": values[4],
+            "rae/decoder_grad_norm": values[5],
+            "rae/discriminator_grad_norm": values[6],
+            "rae/generator_logit": values[7],
+            "rae/discriminator_real_logit": values[8],
+            "rae/discriminator_fake_logit": values[9],
+            "rae/discriminator_accuracy": values[10],
+            "rae/dino_feature_distance": values[11],
+            "rae/non_padding_ratio": non_padding_ratio,
+            "rae/num_images_per_step": num_images_per_step,
+        }
+        if epoch is not None:
+            extra_metrics["rae/epoch"] = epoch
+        if tokens_last_epoch is not None:
+            extra_metrics["rae/tokens_last_epoch"] = float(tokens_last_epoch)
+        metrics_processor.log(
+            step,
+            global_avg_loss=values[0],
+            global_max_loss=values[0],
+            grad_norm=values[5],
+            extra_metrics=extra_metrics,
+        )
+    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
+        epoch_suffix = f" epoch={int(epoch)}" if epoch is not None else ""
+        logger.info(
+            "[RAE Stage 1 | step %d] recon=%.5f perceptual=%.5f "
+            "gan=%.5f disc=%.5f adaptive=%.5f decoder_grad=%.5f "
+            "disc_grad=%.5f gen_logit=%.5f real_logit=%.5f fake_logit=%.5f "
+            "disc_acc=%.5f dino_dist=%.5f non_padding=%.5f images_per_step=%.2f%s",
+            step,
+            *values,
+            non_padding_ratio,
+            num_images_per_step,
+            epoch_suffix,
+        )
 
 
 ImageBatch = torch.Tensor | list[torch.Tensor]
@@ -238,13 +416,11 @@ class _RAEModelState(Stateful):
         self,
         decoder: nn.Module,
         discriminator: nn.Module,
-        ema: nn.Module | None,
-        ema_shadow: dict[str, torch.Tensor] | None,
+        ema: nn.Module,
     ):
         self.decoder = decoder
         self.discriminator = discriminator
         self.ema = ema
-        self.ema_shadow = ema_shadow
 
     def state_dict(self) -> dict[str, Any]:
         decoder_state = self.decoder.state_dict()
@@ -262,11 +438,7 @@ class _RAEModelState(Stateful):
                     for name, buffer in self.decoder.named_buffers()
                 }
             )
-        ema_state = (
-            self.ema.state_dict()
-            if self.ema is not None
-            else {name: value for name, value in (self.ema_shadow or {}).items()}
-        )
+        ema_state = self.ema.state_dict()
         return {
             "decoder": decoder_state,
             "discriminator": self.discriminator.state_dict(),
@@ -293,12 +465,7 @@ class _RAEModelState(Stateful):
                 state_dict["discriminator"], strict=False
             )
         if "ema" in state_dict:
-            if self.ema is not None:
-                self.ema.load_state_dict(state_dict["ema"], strict=False)
-            elif self.ema_shadow is not None:
-                for name, value in state_dict["ema"].items():
-                    if name in self.ema_shadow:
-                        self.ema_shadow[name].copy_(value)
+            self.ema.load_state_dict(state_dict["ema"], strict=False)
 
 
 class _RAEOptimizerState(Stateful):
@@ -506,14 +673,13 @@ class RAEStage1Trainer(Trainer):
             self.disc_optimizer,
             self._make_discriminator_schedule(config),
         )
-        self.ema_model, self.ema_shadow = self._build_ema(decoder)
+        self.ema_model = self._build_ema(decoder)
 
         if getattr(self.checkpointer, "enable", False):
             self.checkpointer.states[MODEL] = _RAEModelState(
                 decoder,
                 self.discriminator,
                 self.ema_model,
-                self.ema_shadow,
             )
             self.checkpointer.states[OPTIMIZER] = _RAEOptimizerState(
                 self.optimizers, self.disc_optimizer
@@ -543,9 +709,7 @@ class RAEStage1Trainer(Trainer):
 
         return schedule
 
-    def _build_ema(
-        self, decoder: nn.Module
-    ) -> tuple[nn.Module, dict[str, torch.Tensor] | None]:
+    def _build_ema(self, decoder: nn.Module) -> nn.Module:
         config = getattr(decoder, "config", None)
         if config is None:
             raise RuntimeError(
@@ -576,47 +740,44 @@ class RAEStage1Trainer(Trainer):
             )
         ema_model.eval()
         ema_model.requires_grad_(False)
-        return ema_model, None
+        return ema_model
 
     @torch.no_grad()
     def _update_ema(self) -> None:
         decoder = self.model_parts[0]
         decay = self.config.gan.ema_decay
-        if self.ema_model is not None:
-            if getattr(decoder, "_dmuon_enabled", False) and hasattr(
-                decoder, "_dedicated_comm_ctx"
-            ):
-                dmuon = load_dmuon()
-                state = dmuon.get_model_state_dict(
-                    decoder, cpu_offload=False, rank0_only=False
-                )
-                for name, ema_parameter in self.ema_model.named_parameters():
-                    parameter = state.get(name)
-                    if parameter is None and name.startswith("layers."):
-                        layer_prefix, layer_id, remainder = name.split(".", 2)
-                        wrapped_name = (
-                            f"{layer_prefix}.{layer_id}._checkpoint_wrapped_module."
-                            f"{remainder}"
-                        )
-                        parameter = state.get(wrapped_name)
-                    if parameter is None:
-                        raise RuntimeError(
-                            f"DMuon model state is missing EMA parameter {name!r}"
-                        )
-                    ema_parameter.mul_(decay).add_(
-                        parameter.to(
-                            device=ema_parameter.device,
-                            dtype=ema_parameter.dtype,
-                        ).detach(),
-                        alpha=1.0 - decay,
+        if getattr(decoder, "_dmuon_enabled", False) and hasattr(
+            decoder, "_dedicated_comm_ctx"
+        ):
+            dmuon = load_dmuon()
+            state = dmuon.get_model_state_dict(
+                decoder, cpu_offload=False, rank0_only=False
+            )
+            for name, ema_parameter in self.ema_model.named_parameters():
+                parameter = state.get(name)
+                if parameter is None and name.startswith("layers."):
+                    layer_prefix, layer_id, remainder = name.split(".", 2)
+                    wrapped_name = (
+                        f"{layer_prefix}.{layer_id}._checkpoint_wrapped_module."
+                        f"{remainder}"
                     )
-                return
-            for ema_parameter, parameter in zip(
-                self.ema_model.parameters(), decoder.parameters(), strict=True
-            ):
-                ema_parameter.mul_(decay).add_(parameter.detach(), alpha=1.0 - decay)
+                    parameter = state.get(wrapped_name)
+                if parameter is None:
+                    raise RuntimeError(
+                        f"DMuon model state is missing EMA parameter {name!r}"
+                    )
+                ema_parameter.mul_(decay).add_(
+                    parameter.to(
+                        device=ema_parameter.device,
+                        dtype=ema_parameter.dtype,
+                    ).detach(),
+                    alpha=1.0 - decay,
+                )
             return
-        raise RuntimeError("RAE EMA shadow state is no longer supported")
+        for ema_parameter, parameter in zip(
+            self.ema_model.parameters(), decoder.parameters(), strict=True
+        ):
+            ema_parameter.mul_(decay).add_(parameter.detach(), alpha=1.0 - decay)
 
     def _decoder_grad_norm(self) -> torch.Tensor:
         parameters = [p for p in self.model_parts[0].parameters() if p.requires_grad]
@@ -676,15 +837,9 @@ class RAEStage1Trainer(Trainer):
             encoder_input = {
                 name: value
                 for name, value in input_dict.items()
-                if torch.is_tensor(value) or name == "media_kind"
+                if torch.is_tensor(value)
             }
         if isinstance(images, torch.Tensor):
-            if images.ndim == 5:
-                if images.shape[1] != 1:
-                    raise ValueError(
-                        "RAE Stage 1 image training accepts only one-frame media"
-                    )
-                images = images[:, 0]
             if images.ndim != 4:
                 raise ValueError("RAE Stage 1 input must have BCHW shape")
             images = images.to(self.device, non_blocking=True)
@@ -723,21 +878,8 @@ class RAEStage1Trainer(Trainer):
                 self._resize_supervision_image(image, size)
                 for image, size in zip(image_items, target_sizes, strict=True)
             ]
-        if images_BCHW.ndim == 5:
-            batch_size, num_frames, channels, height, width = images_BCHW.shape
-            flattened = images_BCHW.reshape(
-                batch_size * num_frames, channels, height, width
-            )
-            supervised = self._supervision_images(flattened)
-            return supervised.reshape(
-                batch_size,
-                num_frames,
-                channels,
-                supervised.shape[-2],
-                supervised.shape[-1],
-            )
         if images_BCHW.ndim != 4:
-            raise ValueError("RAE supervision expects BCHW or BTCHW images")
+            raise ValueError("RAE supervision expects BCHW images")
         target_size = self.encoder.supervision_image_size
         if target_size is None:
             return images_BCHW.clamp(0, 1)
@@ -836,7 +978,6 @@ class RAEStage1Trainer(Trainer):
         encoder_source = encoder_input if encoder_input is not None else images
         encoded = self.encoder(
             encoder_source,
-            add_noise=False,
             return_grid_thw=True,
         )
         if not isinstance(encoded, tuple):
@@ -1404,4 +1545,175 @@ class RAEStage1Trainer(Trainer):
         )
 
 
-__all__ = ["RAEStage1Trainer", "RAEGANConfig"]
+class RAEValidator(BaseValidator):
+    """Validate RAE reconstructions and optionally log a comparison image."""
+
+    def __init__(self, config: BaseValidator.Config, trainer: RAEStage1Trainer) -> None:
+        super().__init__(config=config)
+        self.trainer = trainer
+
+    @staticmethod
+    def _comparison_image(
+        target_CHW: torch.Tensor,
+        reconstruction_CHW: torch.Tensor,
+        *,
+        step: int,
+    ) -> Any:
+        import wandb
+
+        comparison_CHW = torch.cat(
+            [target_CHW.float().clamp(0, 1), reconstruction_CHW.float().clamp(0, 1)],
+            dim=-1,
+        )
+        comparison_HWC = (
+            comparison_CHW.mul(255.0)
+            .round()
+            .to(dtype=torch.uint8)
+            .detach()
+            .cpu()
+            .permute(1, 2, 0)
+            .numpy()
+        )
+        return wandb.Image(
+            comparison_HWC,
+            caption=f"step {step}: ground truth | reconstruction",
+        )
+
+    def _validation_dataloader(self) -> BaseDataLoader:
+        config = self.config
+        dataloader_config = getattr(config, "dataloader", None)
+        if dataloader_config is None:
+            dataloader_config = self.trainer.config.dataloader
+        else:
+            # The base Trainer validator defaults to a text C4 loader. RAE
+            # validation must use the configured Qwen media loader instead.
+            collator = getattr(dataloader_config, "collator", None)
+            if not isinstance(collator, RAEQwenCollator.Config):
+                dataloader_config = self.trainer.config.dataloader
+        dataloader_config = replace(
+            dataloader_config,
+            repeat=self.config.steps != -1,
+            shuffle=False,
+        )
+        parallel_dims = self.trainer.parallel_dims
+        if parallel_dims.dp_enabled:
+            batch_mesh = parallel_dims.get_mesh("batch")
+            dp_world_size = batch_mesh.size()
+            dp_rank = batch_mesh.get_local_rank()
+        else:
+            dp_world_size = 1
+            dp_rank = 0
+        return dataloader_config.build(
+            dp_world_size=dp_world_size,
+            dp_rank=dp_rank,
+            tokenizer=self.trainer.tokenizer,
+            max_context_length=self.trainer.config.training.max_context_length,
+            num_tokens_per_batch=self.trainer.config.training.num_tokens_per_microbatch_per_dp_rank,
+        )
+
+    @torch.no_grad()
+    def validate(self, model_parts: list[torch.nn.Module], step: int) -> None:
+        decoder = model_parts[0]
+        was_training = decoder.training
+        decoder.eval()
+        validation_dataloader = self._validation_dataloader()
+        validation_iterator = iter(iterate_and_close_dataloader(validation_dataloader))
+        losses: list[torch.Tensor] = []
+        comparison_image = None
+        num_batches = 0
+        num_tokens = 0
+        num_images = 0
+        padding_capacity_tokens = 0
+        try:
+            while self.config.steps == -1 or num_batches < self.config.steps:
+                try:
+                    images, encoder_input = self.trainer._next_images(
+                        validation_iterator,
+                        count_training_stats=False,
+                    )
+                except StopIteration:
+                    break
+                with (
+                    self.trainer.train_context(),
+                    torch.autocast(
+                        device_type=self.trainer.device.type,
+                        dtype=torch.bfloat16,
+                        enabled=self.trainer.device.type == "cuda"
+                        and self.trainer.config.training.dtype == "bfloat16",
+                    ),
+                ):
+                    reconstructions = self.trainer._encode_decode(
+                        decoder,
+                        images,
+                        encoder_input,
+                        add_noise=False,
+                    )
+                grid_thw = self.trainer.encoder.last_grid_thw
+                if grid_thw is None:
+                    raise RuntimeError(
+                        "RAE validation encoder did not return grid metadata"
+                    )
+                batch_tokens = int(grid_thw.prod(dim=-1).sum().item())
+                num_tokens += batch_tokens
+                num_images += len(self.trainer._image_items(images))
+                padding_capacity_tokens += (
+                    self.trainer._static_sequence_length
+                    if self.trainer._static_sequence_length > 0
+                    else batch_tokens
+                )
+                self.trainer.metrics_processor.ntokens_since_last_log += batch_tokens
+                target_sizes = [
+                    tuple(reconstruction.shape[-2:])
+                    for reconstruction in reconstructions
+                ]
+                targets = self.trainer._image_items(
+                    self.trainer._supervision_images(images, target_sizes)
+                )
+                losses.extend(
+                    F.l1_loss(reconstruction, target).detach()
+                    for reconstruction, target in zip(
+                        reconstructions, targets, strict=True
+                    )
+                )
+                if comparison_image is None and (
+                    self.trainer.config.metrics.enable_wandb
+                    or self.trainer.config.metrics.enable_swanlab
+                ):
+                    comparison_image = self._comparison_image(
+                        targets[0],
+                        reconstructions[0],
+                        step=step,
+                    )
+                num_batches += 1
+        finally:
+            decoder.train(was_training)
+
+        if not losses:
+            raise RuntimeError("RAE validation dataloader produced no media batches")
+        extras: dict[str, Any] = {
+            "validation_metrics/num_tokens": num_tokens,
+            "validation_metrics/num_batches": num_batches,
+            "validation_metrics/non_padding_ratio": (
+                num_tokens / padding_capacity_tokens
+            ),
+            "validation_metrics/num_images_per_step": num_images,
+        }
+        if comparison_image is not None:
+            extras[
+                "validation_images/ground_truth_vs_reconstruction"
+            ] = comparison_image
+        self.trainer.metrics_processor.log_validation(
+            loss=float(torch.stack(losses).mean().item()),
+            step=step,
+            extra_metrics=extras,
+        )
+
+
+__all__ = [
+    "DiscriminatorAugmentation",
+    "RAEGANAugmentConfig",
+    "RAEGANConfig",
+    "RAEStage1Trainer",
+    "RAEValidator",
+    "log_stage1_metrics",
+]

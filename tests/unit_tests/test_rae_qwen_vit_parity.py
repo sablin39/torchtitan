@@ -55,10 +55,7 @@ def _build_hf(state, dtype, attn_implementation):
 
 
 def _build_ours(state, dtype):
-    from torchtitan.models.rae.encoder.qwen_vit import (
-        QwenVisionConfig,
-        QwenVisionEncoder,
-    )
+    from torchtitan.models.rae.encoder import QwenVisionConfig, QwenVisionEncoder
 
     model = QwenVisionEncoder(QwenVisionConfig(), layer_indices=LAYER_INDICES)
     model.load_state_dict(state, strict=True)
@@ -269,8 +266,10 @@ def _encoder_config(
 
 def test_frozen_encoder_integration(visual_state):
     """FrozenRAEEncoder(kind='qwen') with static padding matches the HF path."""
-    from torchtitan.models.rae.encoder import FrozenRAEEncoder
-    from torchtitan.models.rae.encoder.encoder import _merge_qwen_hidden_states
+    from torchtitan.models.rae.encoder import (
+        _merge_qwen_hidden_states,
+        FrozenRAEEncoder,
+    )
 
     generator = torch.Generator().manual_seed(4)
     grid_thw = _random_grid_thw(24, generator, max_side=32)
@@ -415,7 +414,7 @@ def test_frozen_encoder_rejects_over_budget(visual_state):
 
 def _build_aux_loop_reference(model, grid_thw, max_seqlen=None, max_docs=None):
     """The original per-document python-loop build_aux, kept as reference."""
-    from torchtitan.models.rae.encoder.qwen_vit import _axis_taps_weights, QwenVisionAux
+    from torchtitan.models.rae.encoder import _axis_taps_weights, QwenVisionAux
 
     grid_thw = torch.as_tensor(grid_thw, dtype=torch.long).reshape(-1, 3)
     merge = model.spatial_merge_size
@@ -488,10 +487,7 @@ def _build_aux_loop_reference(model, grid_thw, max_seqlen=None, max_docs=None):
 
 
 def test_build_aux_vectorized_bit_identical():
-    from torchtitan.models.rae.encoder.qwen_vit import (
-        QwenVisionConfig,
-        QwenVisionEncoder,
-    )
+    from torchtitan.models.rae.encoder import QwenVisionConfig, QwenVisionEncoder
 
     model = QwenVisionEncoder(QwenVisionConfig(), layer_indices=LAYER_INDICES)
     generator = torch.Generator().manual_seed(11)

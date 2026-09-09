@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Literal
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -36,12 +35,9 @@ from .decoder import RAEDecoder
 from .discriminator import RAEFeatureDiscriminator
 from .encoder import RAEEncoderConfig
 from .parallelize import parallelize_rae
-from .training import RAEGANAugmentConfig, RAEGANConfig, RAEStage1Trainer
+from .trainer import RAEGANAugmentConfig, RAEGANConfig, RAEStage1Trainer
 
 
-_OPENIMAGES_ROOT = "/mnt/nas/OpenImages/media"
-_OPENIMAGES_TRAIN_FILES = "train_*/*.jpg"
-_OPENIMAGES_VALIDATION_FILES = "validation*/*.jpg"
 # Full OpenImages train set as gzipped webdataset tars (16 shards, members
 # named <folder>/<hash>.jpg, row key "jpg"). The single validation.tar.gz has
 # one shard, too few to split across DP ranks, so validation reads a 25k-image
@@ -113,7 +109,6 @@ def _image_dataloader(
     data_files: str = "*.tar",
     min_pixels: int | None = None,
     max_pixels: int | None = None,
-    processor_image_size: int | None = None,
     token_budget: int | None = None,
     max_tokens_per_item: int | None = None,
     image_key: str = "jpg",
@@ -135,7 +130,6 @@ def _image_dataloader(
         processor=RAEQwenProcessor.Config(
             model_name="~/models/Qwen3.5-0.8B",
             image_key=image_key,
-            image_size=processor_image_size,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         ),
@@ -144,7 +138,6 @@ def _image_dataloader(
         dataset=dataset,
         collator=RAEQwenCollator.Config(
             batch_size=batch_size,
-            media_kind="image",
             token_budget=token_budget,
             max_tokens_per_item=max_tokens_per_item,
         ),
@@ -185,8 +178,6 @@ def rae_stage1_debug() -> RAEStage1Trainer.Config:
         latent_dim=1024,
         image_size=-1,
         merge_size=2,
-        # The debug recipe trains in fp32; flash attention requires half precision.
-        attn_implementation="sdpa",
     )
     batch_size = 2
     config = RAEStage1Trainer.Config(
@@ -238,269 +229,164 @@ def rae_stage1_debug() -> RAEStage1Trainer.Config:
     return config
 
 
-def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
-    config = rae_stage1_debug()
-    encoder = RAEEncoderConfig(
-        kind="qwen",
-        name="~/models/Qwen3.5-0.8B",
-        latent_dim=1024,
-        image_size=-1,
-        layer_indices=(2, 5, 8, 11),
-        merge_size=2,
-        dtype="bfloat16",
-        # torch.compile re-specializes on each batch's packed token count and
-        # grid-row count through HF's data-dependent graph breaks, causing a
-        # recompile storm across ranks; bf16 + flash varlen already gives
-        # ~7x over the fp32 sdpa default. Re-enable encoder.compile only with
-        # a static input shape.
-    )
-    config.encoder = encoder
-    config.model_spec = model_registry(
-        "base",
-        latent_dim=encoder.latent_dim,
-        decoder_image_size=-1,
-        use_dmuon=True,
-    )
-    # Post-merger documents are capped at 1024 tokens by max_pixels, which
-    # bounds the attention context for the decoder FLOPs estimate.
-    config.model_spec.model.flops_attention_context = 1024
-    config.dataloader = _image_dataloader(
-        batch_size=1,
-    )
-    config.training = TrainingConfig(
-        num_tokens_per_microbatch_per_dp_rank=1,
-        max_context_length=1,
-        max_norm=1.0,
-        steps=10000,
-        dtype="bfloat16",
-        mixed_precision_param="bfloat16",
-        disable_cuda_graphs=True,
-    )
-    config.optimizer = _dmuon(2e-4)
-    config.lr_scheduler = LRSchedulersContainer.Config(
-        warmup_steps=625,
-        decay_type="cosine",
-        min_lr_factor=0.1,
-    )
-    config.gan = RAEGANConfig(
-        ema_decay=0.9978,
-        perceptual_kind="lpips",
-        lpips_calibration_checkpoint_path="pretrained_models/lpips/vgg_lpips.pth",
-        lpips_vgg_checkpoint_path="pretrained_models/lpips/vgg16-397923af.pth",
-        augment=RAEGANAugmentConfig(probability=1.0, cutout=0.0),
-        # Half the decoder's dmuon LR: the DINOv3 backbone is frozen, so only
-        # the small spectral-norm heads train and 2e-4 over-rotates them.
-        discriminator_lr=1e-4,
-        discriminator_warmup_steps=625,
-        # The discriminator has fully separated real/fake by the time the
-        # adversarial term starts, so ramp its weight in instead of taking
-        # the full gradient spike on the first GAN step.
-        discriminator_weight_ramp_steps=625,
-    )
-    config.discriminator = RAEFeatureDiscriminator.Config(
-        feature_channels=768,
-        backbone_kind="hf",
-        hf_model_path="~/models/dinov3-vitb16-pretrain-lvd1689m",
-        hf_key_depths=(2, 5, 8, 11),
-        backbone_batch_size=64,
-        # bf16 backbone+heads: disc phase 20.0 -> 12.8 s/step and 84 -> 68 GiB
-        # (bench 2026-09-09); feature-space parity vs fp32 is ~1e-2 rel.
-        backbone_dtype="bfloat16",
-    )
-    config.parallelism = ParallelismConfig(
-        data_parallel_replicate_degree=4,
-        data_parallel_shard_degree=1,
-    )
-    config.checkpoint = CheckpointManager.Config(enable=True, interval=1000)
-    return config
-
-
-def rae_stage1_openimages() -> RAEStage1Trainer.Config:
-    """Full RAEv2 recipe streaming OpenImages train and validation folders."""
-    config = rae_stage1_dmuon()
-    config.dataloader = _image_dataloader(
-        batch_size=1,
-        dataset_path=_OPENIMAGES_ROOT,
-        data_files=_OPENIMAGES_TRAIN_FILES,
-        image_key="image",
-    )
-    config.validator.dataloader = _image_dataloader(
-        batch_size=1,
-        dataset_path=_OPENIMAGES_ROOT,
-        data_files=_OPENIMAGES_VALIDATION_FILES,
-        image_key="image",
-    )
-    config.validator.enable = True
-    config.validator.steps = -1
-    config.validator.freq = 1000
-    return config
-
-
-def _openimages_static(
-    static_sequence_length: int,
-    *,
-    long_skip_connections: tuple[tuple[int, int], ...] = (),
-) -> RAEStage1Trainer.Config:
-    """Locally staged OpenImages recipe with static token packing and graphs."""
-    config = _dmuon_static(
-        static_sequence_length,
-        long_skip_connections=long_skip_connections,
-    )
-    token_budget = static_sequence_length - _STATIC_QWEN_MAX_TOKENS_PER_ITEM
-    # The Qwen row processor is CPU-heavy; fan it out over spawned worker
-    # processes so it does not starve the trainer's main thread.
-    num_processor_workers = 4
-    config.dataloader = _image_dataloader(
-        batch_size=None,
-        dataset_path=_OPENIMAGES_TAR_ROOT,
-        data_files=_OPENIMAGES_TAR_TRAIN_FILES,
-        min_pixels=_STATIC_QWEN_MIN_PIXELS,
-        max_pixels=_STATIC_QWEN_MAX_PIXELS,
-        token_budget=token_budget,
-        max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
-        num_prefetch_batches=4,
-        num_processor_workers=num_processor_workers,
-        # /mnt/sda1 is a USB-attached NVMe: a single buffered stream tops out
-        # far below the device's aggregate bandwidth (the kernel readahead
-        # window is latency-bound), so keep the page cache warm with preads.
-        readahead_mb=2048,
-    )
-    config.validator.dataloader = _image_dataloader(
-        batch_size=None,
-        dataset_path=_OPENIMAGES_VALIDATION_SUBSET_ROOT,
-        data_files=_OPENIMAGES_VALIDATION_SUBSET_FILES,
-        image_key="image",
-        min_pixels=_STATIC_QWEN_MIN_PIXELS,
-        max_pixels=_STATIC_QWEN_MAX_PIXELS,
-        token_budget=token_budget,
-        max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
-        num_prefetch_batches=4,
-        num_processor_workers=num_processor_workers,
-    )
-    config.validator.enable = True
-    # 16 packed validation microbatches per round, every 500 steps: enough
-    # images to judge generation quality without stalling training for long.
-    config.validator.steps = 16
-    config.validator.freq = 500
-    return config
-
-
-def rae_stage1_openimages_static() -> RAEStage1Trainer.Config:
-    return _openimages_static(_STATIC_SEQUENCE_LENGTH)
-
-
-def rae_stage1_openimages_static_128k() -> RAEStage1Trainer.Config:
-    """Doubled 131072-token static capacity for high-utilization runs."""
-    return _openimages_static(2 * _STATIC_SEQUENCE_LENGTH)
-
-
-def rae_stage1_openimages_static_96k() -> RAEStage1Trainer.Config:
-    """98304-token static capacity with more allocator headroom than 128k."""
-    return _openimages_static(3 * _STATIC_SEQUENCE_LENGTH // 2)
-
-
 def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
-    """96k static recipe with U-ViT mirrored long skip connections."""
-    return _openimages_static(
-        3 * _STATIC_SEQUENCE_LENGTH // 2,
-        long_skip_connections=((0, 7), (1, 6), (2, 5), (3, 4)),
-    )
-
-
-def _dmuon_static(
-    static_sequence_length: int,
-    *,
-    long_skip_connections: tuple[tuple[int, int], ...] = (),
-) -> RAEStage1Trainer.Config:
-    """Throughput recipe with a fixed packed-token budget.
+    """Production recipe: 96k static OpenImages packing, U-ViT skips, bf16 dmuon.
 
     Qwen keeps each image's aspect ratio while constraining its pixel area to
     at most 1024x1024. The post-merge token ceiling is 1024 per row; the
     collator fills the budget (static capacity minus one max-size item for the
     isolated padding document) with a variable number of rows.
     """
-    config = rae_stage1_dmuon()
+    static_sequence_length = 3 * _STATIC_SEQUENCE_LENGTH // 2
     token_budget = static_sequence_length - _STATIC_QWEN_MAX_TOKENS_PER_ITEM
-    config.model_spec = model_registry(
-        "base",
-        attention_backend="varlen",
-        latent_dim=config.encoder.latent_dim,
-        decoder_image_size=-1,
-        static_sequence_length=static_sequence_length,
-        long_skip_connections=long_skip_connections,
-        use_dmuon=True,
-    )
-    config.model_spec.model.flops_attention_context = _STATIC_QWEN_MAX_TOKENS_PER_ITEM
-    # Pad the packed encoder input with one isolated document so the native
-    # Qwen ViT (encoder/qwen_vit.py, bitwise-parity with the HF tower)
-    # compiles with fully static shapes. The budget is in post-merge tokens;
-    # the encoder consumes pre-merge patches (merge_size**2 x).
-    config.encoder = dataclasses.replace(
-        config.encoder,
-        pad_tokens_to=token_budget * config.encoder.merge_size**2,
+    # The Qwen row processor is CPU-heavy; fan it out over spawned worker
+    # processes so it does not starve the trainer's main thread.
+    num_processor_workers = 4
+    merge_size = 2
+    encoder = RAEEncoderConfig(
+        kind="qwen",
+        name="~/models/Qwen3.5-0.8B",
+        latent_dim=1024,
+        image_size=-1,
+        layer_indices=(2, 5, 8, 11),
+        merge_size=merge_size,
+        # bf16 + flash varlen already gives ~7x over the fp32 sdpa default.
+        dtype="bfloat16",
+        # Pad the packed encoder input with one isolated document so the
+        # native Qwen ViT (encoder.py, bitwise-parity with the HF tower)
+        # compiles with fully static shapes. The budget is in post-merge
+        # tokens; the encoder consumes pre-merge patches (merge_size**2 x).
+        # Without the static shape, torch.compile re-specializes on each
+        # batch's packed token count and grid-row count through HF's
+        # data-dependent graph breaks, causing a recompile storm across ranks.
+        pad_tokens_to=token_budget * merge_size**2,
         # The longest varlen segment (padding doc included) stays below one
         # max-size row: packing slack is always < max_tokens_per_item.
-        max_tokens_per_doc=_STATIC_QWEN_MAX_TOKENS_PER_ITEM
-        * config.encoder.merge_size**2,
+        max_tokens_per_doc=_STATIC_QWEN_MAX_TOKENS_PER_ITEM * merge_size**2,
         compile=True,
     )
-    config.training = TrainingConfig(
-        num_tokens_per_microbatch_per_dp_rank=token_budget,
-        # token_budget x 8 accumulation microbatches x 4 DP ranks.
-        num_tokens_per_train_step=token_budget * 32,
-        max_context_length=1,
-        max_norm=1.0,
-        steps=10000,
-        dtype="bfloat16",
-        mixed_precision_param="bfloat16",
-        disable_cuda_graphs=False,
+    model_spec = model_registry(
+        "base",
+        attention_backend="varlen",
+        latent_dim=encoder.latent_dim,
+        decoder_image_size=-1,
+        static_sequence_length=static_sequence_length,
+        long_skip_connections=((0, 7), (1, 6), (2, 5), (3, 4)),
+        use_dmuon=True,
     )
-    config.dataloader = _image_dataloader(
-        batch_size=None,
-        min_pixels=_STATIC_QWEN_MIN_PIXELS,
-        max_pixels=_STATIC_QWEN_MAX_PIXELS,
-        token_budget=token_budget,
-        max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
-        num_prefetch_batches=4,
+    # Post-merger documents are capped at 1024 tokens by max_pixels, which
+    # bounds the attention context for the decoder FLOPs estimate.
+    model_spec.model.flops_attention_context = _STATIC_QWEN_MAX_TOKENS_PER_ITEM
+    return RAEStage1Trainer.Config(
+        hf_assets_path="./tests/assets/tokenizer",
+        model_spec=model_spec,
+        loss=MSELoss.Config(),
+        metrics=MetricsProcessor.Config(
+            log_freq=1,
+            enable_wandb=True,
+            enable_swanlab=True,
+            enable_nvml_metrics=True,
+        ),
+        dataloader=_image_dataloader(
+            batch_size=None,
+            dataset_path=_OPENIMAGES_TAR_ROOT,
+            data_files=_OPENIMAGES_TAR_TRAIN_FILES,
+            min_pixels=_STATIC_QWEN_MIN_PIXELS,
+            max_pixels=_STATIC_QWEN_MAX_PIXELS,
+            token_budget=token_budget,
+            max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
+            num_prefetch_batches=4,
+            num_processor_workers=num_processor_workers,
+            # /mnt/sda1 is a USB-attached NVMe: a single buffered stream tops
+            # out far below the device's aggregate bandwidth (the kernel
+            # readahead window is latency-bound), so keep the page cache warm
+            # with preads.
+            readahead_mb=2048,
+        ),
+        optimizer=_dmuon(2e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=625,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        training=TrainingConfig(
+            num_tokens_per_microbatch_per_dp_rank=token_budget,
+            # token_budget x 8 accumulation microbatches x 4 DP ranks.
+            num_tokens_per_train_step=token_budget * 32,
+            max_context_length=1,
+            max_norm=1.0,
+            steps=10000,
+            dtype="bfloat16",
+            mixed_precision_param="bfloat16",
+            disable_cuda_graphs=False,
+        ),
+        validator=Validator.Config(
+            enable=True,
+            # 16 packed validation microbatches per round, every 500 steps:
+            # enough images to judge generation quality without stalling
+            # training for long.
+            steps=16,
+            freq=500,
+            dataloader=_image_dataloader(
+                batch_size=None,
+                dataset_path=_OPENIMAGES_VALIDATION_SUBSET_ROOT,
+                data_files=_OPENIMAGES_VALIDATION_SUBSET_FILES,
+                image_key="image",
+                min_pixels=_STATIC_QWEN_MIN_PIXELS,
+                max_pixels=_STATIC_QWEN_MAX_PIXELS,
+                token_budget=token_budget,
+                max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
+                num_prefetch_batches=4,
+                num_processor_workers=num_processor_workers,
+            ),
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_replicate_degree=4,
+            data_parallel_shard_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(enable=True, interval=1000),
+        # Selective AC measured fastest at the 96k budget (benches 2026-09-09,
+        # GAN active from step 0): 55.4 s/step vs 57.4 full; none OOMs at 96k
+        # and none at 64k nets lower tokens/s despite fitting.
+        activation_checkpoint=SelectiveAC.Config(),
+        compile=CompileConfig(enable=True, components=["model", "discriminator"]),
+        # Four ranks compile the encoder/decoder/discriminator concurrently on
+        # the first step, and mid-run CUDA-graph captures pause collectives;
+        # loosen the NCCL watchdog bounds accordingly.
+        comm=CommConfig(init_timeout_seconds=3600, train_timeout_seconds=600),
+        encoder=encoder,
+        gan=RAEGANConfig(
+            ema_decay=0.9978,
+            perceptual_kind="lpips",
+            lpips_calibration_checkpoint_path="pretrained_models/lpips/vgg_lpips.pth",
+            lpips_vgg_checkpoint_path="pretrained_models/lpips/vgg16-397923af.pth",
+            augment=RAEGANAugmentConfig(probability=1.0, cutout=0.0),
+            # Half the decoder's dmuon LR: the DINOv3 backbone is frozen, so
+            # only the small spectral-norm heads train and 2e-4 over-rotates
+            # them.
+            discriminator_lr=1e-4,
+            discriminator_warmup_steps=625,
+            # The discriminator has fully separated real/fake by the time the
+            # adversarial term starts, so ramp its weight in instead of taking
+            # the full gradient spike on the first GAN step.
+            discriminator_weight_ramp_steps=625,
+        ),
+        discriminator=RAEFeatureDiscriminator.Config(
+            feature_channels=768,
+            backbone_kind="hf",
+            hf_model_path="~/models/dinov3-vitb16-pretrain-lvd1689m",
+            hf_key_depths=(2, 5, 8, 11),
+            backbone_batch_size=64,
+            # bf16 backbone+heads: disc phase 20.0 -> 12.8 s/step and
+            # 84 -> 68 GiB (bench 2026-09-09); feature-space parity vs fp32 is
+            # ~1e-2 rel.
+            backbone_dtype="bfloat16",
+        ),
     )
-    config.validator.dataloader = _image_dataloader(
-        batch_size=None,
-        min_pixels=_STATIC_QWEN_MIN_PIXELS,
-        max_pixels=_STATIC_QWEN_MAX_PIXELS,
-        token_budget=token_budget,
-        max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
-        num_prefetch_batches=4,
-    )
-    # Selective AC measured fastest at the 96k budget (benches 2026-09-09,
-    # GAN active from step 0): 55.4 s/step vs 57.4 full; none OOMs at 96k and
-    # none at 64k nets lower tokens/s despite fitting.
-    config.activation_checkpoint = SelectiveAC.Config()
-    config.compile = CompileConfig(enable=True, components=["model", "discriminator"])
-    # Four ranks compile the encoder/decoder/discriminator concurrently on the
-    # first step, and mid-run CUDA-graph captures pause collectives; loosen the
-    # NCCL watchdog bounds accordingly.
-    config.comm = CommConfig(init_timeout_seconds=3600, train_timeout_seconds=600)
-    return config
-
-
-def rae_stage1_dmuon_static() -> RAEStage1Trainer.Config:
-    return _dmuon_static(_STATIC_SEQUENCE_LENGTH)
-
-
-def rae_stage1_dmuon_static_128k() -> RAEStage1Trainer.Config:
-    """Doubled 131072-token static capacity for high-utilization runs."""
-    return _dmuon_static(2 * _STATIC_SEQUENCE_LENGTH)
 
 
 __all__ = [
     "model_registry",
     "rae_stage1_debug",
-    "rae_stage1_dmuon",
-    "rae_stage1_dmuon_static",
-    "rae_stage1_dmuon_static_128k",
-    "rae_stage1_openimages",
-    "rae_stage1_openimages_static",
-    "rae_stage1_openimages_static_128k",
-    "rae_stage1_openimages_static_96k",
     "rae_stage1_openimages_static_96k_uvit",
 ]

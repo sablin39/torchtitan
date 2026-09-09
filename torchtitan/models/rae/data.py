@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -20,27 +20,23 @@ from torchtitan.components.data.types import DatasetBuildContext
 
 
 class RAEQwenProcessor(SampleProcessor):
-    """Qwen3.5 media processor with a packed-media output contract.
+    """Qwen3.5 image processor with a packed-patch output contract.
 
     Qwen returns normalized flattened patch vectors and ``image_grid_thw``
-    metadata rather than a padded BCHW image. The ``media`` field always keeps
-    the original item as a one-item ``(B, T, C, H, W)`` tensor; an image uses
-    ``T=1`` and ``fps=0``. A downstream decoder can pass the packed vectors
-    directly to the RAE with FA2 varlen attention.
+    metadata rather than a padded BCHW image. The ``media`` field keeps the
+    original image as a one-item ``(1, 1, C, H, W)`` tensor with ``fps=0``.
+    The decoder consumes the packed vectors directly with FA2 varlen attention.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(SampleProcessor.Config):
         model_name: str
         image_key: str = "image"
-        video_key: str = "video"
         do_resize: bool = True
         do_rescale: bool = False
         do_normalize: bool = True
-        image_size: int | None = None
         min_pixels: int | None = None
         max_pixels: int | None = None
-        do_sample_frames: bool = False
         output_dtype: str = "bfloat16"
         """Host-side dtype for pixel_values and media. bf16 halves the host
         payload and device transfer; the frozen encoder consumes bf16 natively
@@ -67,16 +63,11 @@ class RAEQwenProcessor(SampleProcessor):
                 local_files_only=True,
             )
         self.image_key = config.image_key
-        self.video_key = config.video_key
         self.do_resize = config.do_resize
         self.do_rescale = config.do_rescale
         self.do_normalize = config.do_normalize
-        if config.image_size is not None and config.image_size <= 0:
-            raise ValueError("RAE Qwen image_size must be positive when provided")
-        self.image_size = config.image_size
         self.min_pixels = config.min_pixels
         self.max_pixels = config.max_pixels
-        self.do_sample_frames = config.do_sample_frames
         if config.output_dtype not in {"bfloat16", "float32"}:
             raise ValueError(
                 f"Unsupported RAE Qwen output_dtype: {config.output_dtype}"
@@ -87,6 +78,7 @@ class RAEQwenProcessor(SampleProcessor):
 
     @staticmethod
     def _as_btchw(media: Any) -> torch.Tensor:
+        """Normalize one image row to a single-frame (1, C, H, W) tensor."""
         if not isinstance(media, torch.Tensor):
             import numpy as np
             from PIL import Image
@@ -105,62 +97,27 @@ class RAEQwenProcessor(SampleProcessor):
                 media = Image.open(io.BytesIO(media)).convert("RGB")
             if hasattr(media, "convert"):
                 media = np.array(media.convert("RGB"), copy=True)
-            if isinstance(media, (list, tuple)):
-                frames = [RAEQwenProcessor._as_btchw(frame)[0] for frame in media]
-                return torch.stack(frames, dim=0)
             media = torch.from_numpy(np.asarray(media))
         media = media.float()
         if media.numel() and media.max() > 1:
             media = media / 255.0
-        if media.ndim == 3:
-            if media.shape[-1] in (1, 3, 4):
-                media = media[..., :3].permute(2, 0, 1)
-            elif media.shape[0] not in (1, 3, 4):
-                raise ValueError("RAE media must be HWC or CHW with three channels")
-            else:
-                media = media[:3]
-            return media.unsqueeze(0)
-        if media.ndim == 4:
-            if media.shape[1] in (1, 3, 4):
-                return media[:, :3]
-            if media.shape[-1] in (1, 3, 4):
-                return media[..., :3].permute(0, 3, 1, 2)
-            raise ValueError("RAE videos must use TCHW or THWC layout")
-        if media.ndim == 5:
-            if media.shape[0] != 1:
-                raise ValueError("RAE processor rows must contain one BTCHW media item")
-            if media.shape[2] not in (1, 3, 4):
-                raise ValueError("RAE videos must use BTCHW layout")
-            return media[0, :, :3]
-        raise ValueError("RAE media must have CHW, TCHW, or BTCHW dimensions")
-
-    @staticmethod
-    def _center_crop_resize(media_BTCHW: torch.Tensor, image_size: int) -> torch.Tensor:
-        height, width = media_BTCHW.shape[-2:]
-        scale = image_size / min(height, width)
-        resized_height = max(image_size, round(height * scale))
-        resized_width = max(image_size, round(width * scale))
-        media_BTCHW = F.interpolate(
-            media_BTCHW,
-            size=(resized_height, resized_width),
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        )
-        top = (resized_height - image_size) // 2
-        left = (resized_width - image_size) // 2
-        return media_BTCHW[..., top : top + image_size, left : left + image_size]
+        if media.ndim != 3:
+            raise ValueError("RAE processor images must have CHW or HWC dimensions")
+        if media.shape[-1] in (1, 3, 4):
+            media = media[..., :3].permute(2, 0, 1)
+        elif media.shape[0] not in (1, 3, 4):
+            raise ValueError("RAE media must be HWC or CHW with three channels")
+        else:
+            media = media[:3]
+        return media.unsqueeze(0)
 
     def __call__(self, sample: dict[str, Any], rng) -> dict[str, Any] | None:
         del rng
         if not isinstance(sample, dict):
             raise ValueError("RAEQwenProcessor expects dictionary samples")
         image = sample.get(self.image_key)
-        video = sample.get(self.video_key)
-        if image is None and video is None:
-            raise KeyError(
-                f"RAE sample must contain {self.image_key!r} or {self.video_key!r}"
-            )
+        if image is None:
+            raise KeyError(f"RAE sample must contain {self.image_key!r}")
         kwargs: dict[str, Any] = {
             "return_tensors": "pt",
             "do_resize": self.do_resize,
@@ -171,78 +128,41 @@ class RAEQwenProcessor(SampleProcessor):
             kwargs["min_pixels"] = self.min_pixels
         if self.max_pixels is not None:
             kwargs["max_pixels"] = self.max_pixels
-        media = image if image is not None else video
-        media_btchw = self._as_btchw(media)
-        if image is not None and self.image_size is not None:
-            media_btchw = self._center_crop_resize(media_btchw, self.image_size)
-        if image is not None:
-            output = self.processor(images=media_btchw, **kwargs)
-            grid_key = "image_grid_thw"
-            pixel_key = "pixel_values"
-            media_kind = "image"
-            fps = 0.0
-        else:
-            video_tchw = media_btchw
-            video_kwargs = dict(kwargs)
-            video_kwargs["do_sample_frames"] = self.do_sample_frames
-            video_kwargs["return_metadata"] = True
-            output = self.processor(videos=video_tchw, **video_kwargs)
-            grid_key = "video_grid_thw"
-            pixel_key = "pixel_values_videos"
-            media_kind = "video"
-            sample_fps = sample.get("fps")
-            metadata = output.get("video_metadata")
-            if sample_fps is None and metadata:
-                sample_fps = getattr(metadata[0], "fps", None)
-            if sample_fps is None or float(sample_fps) <= 0:
-                raise ValueError(
-                    "Video FPS must be provided with the sample or processor metadata"
-                )
-            fps = float(sample_fps)
-        if grid_key not in output or pixel_key not in output:
+        media_btchw = self._as_btchw(image)
+        output = self.processor(images=media_btchw, **kwargs)
+        if "image_grid_thw" not in output or "pixel_values" not in output:
             raise ValueError(
-                f"Qwen processor did not return {pixel_key} and {grid_key}"
+                "Qwen processor did not return pixel_values and image_grid_thw"
             )
-        grid_thw = output[grid_key]
-        pixel_values = output[pixel_key].to(self.output_dtype)
-        processor_for_media = (
-            getattr(self.processor, "image_processor", self.processor)
-            if image is not None
-            else getattr(self.processor, "video_processor", self.processor)
+        grid_thw = output["image_grid_thw"]
+        pixel_values = output["pixel_values"].to(self.output_dtype)
+        image_processor = getattr(self.processor, "image_processor", self.processor)
+        # Bound the host-side media payload: supervision targets are the
+        # decoder outputs at half the processed resolution, so the
+        # original full-resolution image is never needed. Keep at most the
+        # size the vision tower actually saw (grid * patch_size).
+        patch_size = int(getattr(image_processor, "patch_size", 1))
+        grid_row = grid_thw.reshape(-1, 3)[0]
+        processed_size = (
+            int(grid_row[1]) * patch_size,
+            int(grid_row[2]) * patch_size,
         )
-        if image is not None:
-            # Bound the host-side media payload: supervision targets are the
-            # decoder outputs at half the processed resolution, so the
-            # original full-resolution image is never needed. Keep at most the
-            # size the vision tower actually saw (grid * patch_size).
-            patch_size = int(getattr(processor_for_media, "patch_size", 1))
-            grid_row = grid_thw.reshape(-1, 3)[0]
-            processed_size = (
-                int(grid_row[1]) * patch_size,
-                int(grid_row[2]) * patch_size,
+        media_height, media_width = (int(value) for value in media_btchw.shape[-2:])
+        if media_height * media_width > processed_size[0] * processed_size[1]:
+            media_btchw = F.interpolate(
+                media_btchw,
+                size=processed_size,
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
             )
-            media_height, media_width = (int(value) for value in media_btchw.shape[-2:])
-            if media_height * media_width > processed_size[0] * processed_size[1]:
-                media_btchw = F.interpolate(
-                    media_btchw,
-                    size=processed_size,
-                    mode="bicubic",
-                    align_corners=False,
-                    antialias=True,
-                )
         return {
             "media": media_btchw.to(self.output_dtype).unsqueeze(0),
-            "media_kind": media_kind,
-            "merge_size": int(getattr(processor_for_media, "merge_size", 1)),
-            "temporal_patch_size": int(
-                getattr(processor_for_media, "temporal_patch_size", 1)
-            ),
-            "fps": torch.tensor(fps, dtype=torch.float32),
+            "merge_size": int(getattr(image_processor, "merge_size", 1)),
+            "fps": torch.tensor(0.0, dtype=torch.float32),
             "temporal_start": torch.tensor(0.0, dtype=torch.float32),
-            "pixel_values": pixel_values if image is not None else None,
-            "grid_thw": grid_thw if image is not None else None,
-            "pixel_values_videos": pixel_values if video is not None else None,
-            "grid_thw_videos": grid_thw if video is not None else None,
+            "pixel_values": pixel_values,
+            "grid_thw": grid_thw,
         }
 
 
@@ -267,7 +187,6 @@ class RAEQwenCollator(Collator):
     @dataclass(kw_only=True, slots=True)
     class Config(Collator.Config):
         batch_size: int | None = 1
-        media_kind: Literal["image", "video"] = "image"
         token_budget: int | None = None
         max_tokens_per_item: int | None = None
 
@@ -282,7 +201,6 @@ class RAEQwenCollator(Collator):
             raise ValueError(
                 "RAE Qwen requires batch_size or max_tokens_per_item when token packing"
             )
-        self.media_kind = config.media_kind
         context_token_budget = getattr(context, "num_tokens_per_batch", None)
         self.token_budget = config.token_budget or context_token_budget or 0
         self.max_tokens_per_item = config.max_tokens_per_item
@@ -313,25 +231,20 @@ class RAEQwenCollator(Collator):
         return None
 
     def row_cost(self, row: dict[str, Any]) -> int:
-        """Post-merger token count of one processed media row."""
-        grid_key = "grid_thw" if self.media_kind == "image" else "grid_thw_videos"
-        grid = row.get(grid_key)
+        """Post-merger token count of one processed image row."""
+        grid = row.get("grid_thw")
         if grid is None:
-            raise ValueError(f"RAE Qwen rows must contain {grid_key!r}")
+            raise ValueError("RAE Qwen rows must contain 'grid_thw'")
         grid = torch.as_tensor(grid).reshape(-1, 3)
         merge_size = int(row.get("merge_size", 1))
         return int((grid.prod(dim=-1) // merge_size**2).sum().item())
 
     def __call__(self, rows: Sequence[dict[str, Any]]) -> TrainerBatch:
         rows = list(rows)
-        pixel_key = (
-            "pixel_values" if self.media_kind == "image" else "pixel_values_videos"
-        )
-        grid_key = "grid_thw" if self.media_kind == "image" else "grid_thw_videos"
         pixel_values = [
-            row[pixel_key] for row in rows if row.get(pixel_key) is not None
+            row["pixel_values"] for row in rows if row.get("pixel_values") is not None
         ]
-        grids = [row[grid_key] for row in rows if row.get(grid_key) is not None]
+        grids = [row["grid_thw"] for row in rows if row.get("grid_thw") is not None]
         if len(pixel_values) != len(rows) or len(grids) != len(rows):
             raise ValueError(
                 "Every RAE Qwen row must contain one media tensor and grid"
@@ -372,7 +285,6 @@ class RAEQwenCollator(Collator):
             "rae_grid_thw": _pin_for_h2d(rae_grid_thw),
             "sequence_lengths": _pin_for_h2d(sequence_lengths),
             "media": [_pin_for_h2d(item) for item in media],
-            "media_kind": self.media_kind,
             "fps": _pin_for_h2d(fps),
             "temporal_start": _pin_for_h2d(temporal_start),
         }, labels

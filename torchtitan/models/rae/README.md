@@ -4,10 +4,10 @@ This package contains a TorchTitan-native Stage 1 decoder and the model-specific
 alternating GAN trainer. The frozen image encoder is kept in the trainer, while
 the decoder is built through TorchTitan's meta-device and `Module` protocols.
 
-The package is organized by ownership: `decoder/` contains the transformer,
-position encoding, layout, and packing helpers; `encoder/` contains the frozen
+The package is organized by ownership: `decoder.py` contains the transformer,
+position encoding, layout, and packing helpers; `encoder.py` contains the frozen
 Hugging Face vision adapter; `discriminator/` contains the frozen feature
-backbones, trainable heads, and perceptual loss; `training/` contains the Stage
+backbones, trainable heads, and perceptual loss; `trainer.py` contains the Stage
 1 trainer, DiffAug, and metric logging; `data.py` contains the Qwen media
 processor and collator; and `parallelize.py` contains the TorchTitan
 parallelization entry point. Qwen processing is the only shipped input path,
@@ -29,24 +29,24 @@ torchrun --standalone --nproc_per_node=4 -m torchtitan.train \
   --module rae --config rae_stage1_debug
 ```
 
-For graph-enabled throughput, use `rae_stage1_dmuon_static`. Its central
-capacity is a 65536-token packed decoder budget, not an image count. Qwen keeps
-each image's aspect ratio while constraining its pixel area to at most
-1024x1024, and the collator caps each post-merger item at 1024 tokens. Rows are
-accumulated by token cost until the 64512-token budget would overflow, so each
-microbatch carries a variable number of images at ~99% budget fill, reserving
-the final 1024 token slots for one isolated FA2 padding document. The decoder
-never pads a single image to the full budget:
+For graph-enabled throughput, use `rae_stage1_openimages_static_96k_uvit`. Its
+central capacity is a 98304-token packed decoder budget, not an image count.
+Qwen keeps each image's aspect ratio while constraining its pixel area to at
+most 1024x1024, and the collator caps each post-merger item at 1024 tokens.
+Rows are accumulated by token cost until the 97280-token budget would overflow,
+so each microbatch carries a variable number of images at ~99% budget fill,
+reserving the final 1024 token slots for one isolated FA2 padding document. The
+decoder never pads a single image to the full budget:
 
 ```bash
 torchrun --standalone --nproc_per_node=1 -m torchtitan.train \
-  --module rae --config rae_stage1_dmuon_static
+  --module rae --config rae_stage1_openimages_static_96k_uvit
 ```
 
-The decoder's static tensor capacity is 65536 tokens; the recipe sets
-`num_tokens_per_microbatch_per_dp_rank` to 64512 valid tokens and uses 258048
-tokens per train step for its four replicas, with one microbatch per rank and a
-fixed CUDA-graph input shape. For another replica
+The decoder's static tensor capacity is 98304 tokens; the recipe sets
+`num_tokens_per_microbatch_per_dp_rank` to 97280 valid tokens and uses 3112960
+tokens per train step for its four replicas with eight accumulation
+microbatches per rank and a fixed CUDA-graph input shape. For another replica
 count or accumulation setting, use the total-batch equation:
 
 ```
@@ -56,34 +56,18 @@ global tokens per optimizer step =
 
 For a different DP degree, override
 `training.num_tokens_per_train_step` with
-`64512 * DP_degree * accumulation_steps`; it must be divisible by
-`64512 * DP_degree`. Token-budget packing is implemented by a generic
+`97280 * DP_degree * accumulation_steps`; it must be divisible by
+`97280 * DP_degree`. Token-budget packing is implemented by a generic
 `_TokenBudgetBatchIterDataset` in `torchtitan/components/data/loader.py`,
 engaged when a collator exposes `row_cost(row)` and `packing_token_budget()`;
 its iterator checkpoints at emitted-batch boundaries so variable row counts
-restore exactly. `rae_stage1_dmuon_static_128k` and
-`rae_stage1_openimages_static_128k` double the static capacity to 131072 tokens
-for higher device utilization. The conservative 65536-token setting leaves
-headroom on a 95 GiB RTX PRO 6000; lower the per-rank budget if the available
-device has less memory. The HF DINO discriminator scores images at the
-decoder's native output resolution, so high-resolution decoder outputs
-consume proportionally more discriminator activation memory.
+restore exactly. Lower the per-rank budget if the available
+device has less memory than a 95 GiB RTX PRO 6000. The HF DINO discriminator
+scores images at the decoder's native output resolution, so high-resolution
+decoder outputs consume proportionally more discriminator activation memory.
 
-The full OpenImages recipe uses the same Hugging Face streaming source, but
-selects every `train_*/*.jpg` folder for training and every `validation*/*.jpg`
-folder for validation. It streams image rows without materializing image bytes;
-Hugging Face still enumerates matching file paths at startup, so very large
-trees may benefit from a prebuilt manifest or shard list. The stream is shuffled
-with Grain's bounded window buffer for training, while validation is
-deterministic and finite:
-
-```bash
-torchrun --standalone --nproc_per_node=4 -m torchtitan.train \
-  --module rae --config rae_stage1_openimages
-```
-
-The checked-in launcher uses `rae_stage1_openimages_static` for the full
-OpenImages train set staged as gzipped webdataset tars under
+The checked-in launcher uses `rae_stage1_openimages_static_96k_uvit` for the
+full OpenImages train set staged as gzipped webdataset tars under
 `/mnt/sda1/OpenImages/tar` (16 `train_*.tar.gz` shards, row key `jpg`). The
 single-shard `validation.tar.gz` cannot be split across DP ranks, so
 validation keeps streaming the locally staged `validation/*.jpg` media folder.
@@ -92,7 +76,7 @@ budget, compiled decoder/discriminator path, and CUDA graphs:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 -m torchtitan.train \
-  --module rae --config rae_stage1_openimages_static
+  --module rae --config rae_stage1_openimages_static_96k_uvit
 ```
 
 The launcher also enables CUDA allocator expandable segments to reduce
@@ -113,12 +97,8 @@ pulled into the pipeline, so up to one shuffle window plus prefetched batches
 of the finished epoch may still be in flight and are counted into the next
 epoch; both effects are negligible at full-dataset scale.
 
-For the dynamic-resolution NAS tree instead of the static tar recipes, use
-`rae_stage1_openimages`.
-
 Override `dataloader.streaming_shuffle_buffer_size` to trade startup memory for
-shuffle quality. Set `validator.steps` to a positive number for a bounded
-validation probe; the default `-1` consumes the validation stream once.
+shuffle quality.
 
 The Qwen row processor (JPEG decode, resize, patchify) is CPU-heavy: inline it
 sustains only ~25 images/s per rank, well under what the static recipes
@@ -178,7 +158,7 @@ sequence offsets without materializing an `T x T` mask.
 
 `--compile.enable --compile.components '["model", "discriminator"]'` compiles
 every decoder transformer block and the frozen HF DINO backbone feature
-extraction (`discriminator/dino.py`). The discriminator is compiled with
+extraction (`discriminator/dinov3.py`). The discriminator is compiled with
 dynamic shapes: images are scored at their native decoder resolution, so
 batch, height, and width stay symbolic and variable-resolution microbatches
 share one compiled graph without recompilation. The trainable
@@ -193,8 +173,8 @@ step. The static recipes loosen the NCCL watchdog to
 `init_timeout_seconds=3600` / `train_timeout_seconds=600` because four ranks
 compiling concurrently can drift apart by minutes. Variable-grid
 normalization, position construction, unpatchification, and image-shape
-grouping stay in eager wrappers (`layout.py`, `position.py`,
-`discriminator/dino.py`). The frozen backbone is always in evaluation mode.
+grouping stay in eager wrappers (`decoder.py`, `discriminator/dinov3.py`). The
+frozen backbone is always in evaluation mode.
 
 The decoder keeps its fixed-shape CUDA graphs (`training.disable_cuda_graphs`
 controls them). The discriminator does not use CUDA graphs: capture requires
@@ -221,16 +201,13 @@ LayerNorm, the layers are averaged, and the per-item token mean of the final
 selected layer is added back as a global signal before one shared merger MLP.
 A merge size of two gives a post-merge grid with one quarter of the input
 spatial token area; the decoder reconstructs the corresponding runtime
-resolution. The tower runs flash-attention varlen over the packed documents
-(`encoder.attn_implementation`, default `flash_attention_2`); the HF default
-sdpa path instead splits the packed sequence and calls attention once per
-image per block. `encoder.dtype="bfloat16"` casts the frozen weights (the
+resolution. The tower runs flash-attention varlen over the packed documents in
+half precision, and per-document SDPA in fp32.
+`encoder.dtype="bfloat16"` casts the frozen weights (the
 tower is inference-only). On the RTX PRO 6000 the bf16 + flash combination
 measured roughly 7x faster than the original fp32 sdpa path. `encoder.compile`
-(torch.compile with dynamic shapes) is available but off in the recipes: the
-per-batch packed token count and grid-row count re-specialize through HF's
-data-dependent graph breaks, which caused a multi-minute recompile storm when
-four ranks compiled concurrently.
+(torch.compile with fully static shapes under `pad_tokens_to`) is enabled by
+the static recipe.
 
 The decoder uses conservative grouped-query attention (GQA): the base recipe
 is encoder-sized (~100M parameters: hidden 1024, eight layers, sixteen query
@@ -250,8 +227,7 @@ block `target` through a dedicated linear projection. The empty default keeps
 the plain ViT stack and loads existing checkpoints unchanged. The pairs are
 recorded verbatim in the recipe config, so different skip strategies are
 comparable from the configuration alone. `rae_stage1_openimages_static_96k_uvit`
-is the A/B variant of the 96k recipe with mirrored pairs
-`((0, 7), (1, 6), (2, 5), (3, 4))` over the eight blocks.
+runs mirrored pairs `((0, 7), (1, 6), (2, 5), (3, 4))` over the eight blocks.
 
 The default recipe uses the local Hugging Face DINOv3 ViT-B/16 at
 `~/models/dinov3-vitb16-pretrain-lvd1689m` as the frozen discriminator backbone,
@@ -263,7 +239,7 @@ encoder input), and each head emits one logit per 16x16 patch token. GAN
 losses apply their nonlinearity per patch and reduce image-weighted (per-image
 mean first, then batch mean), so large images do not dominate the loss. The
 discriminator runs a torchtitan-native DINOv3 ViT-B/16 backbone
-(`torchtitan/models/rae/discriminator/dinov3_vit.py`) selected through
+(`torchtitan/models/rae/discriminator/dinov3.py`) selected through
 `backbone_kind="hf"` and `hf_model_path`; the weights load strictly from the
 `model.safetensors` in that directory and inputs get fixed ImageNet
 normalization. No Python module from the checked-out `RAEv2/` tree is
@@ -337,7 +313,7 @@ reconstruction = decoder(
 )
 ```
 
-The decoder uses `Cosmos3DRotaryPositionEmbedding` from `position.py`. Its
+The decoder uses `Cosmos3DRotaryPositionEmbedding` from `decoder.py`. Its
 frequency allocation, per-axis NTK scaling (default `rope_scale=(2, 1, 1)`),
 FPS normalization, and contiguous-half real rotation follow NVIDIA Cosmos'
 public implementation as mirrored in Hugging Face Diffusers:
@@ -365,9 +341,8 @@ clips = decoder.unpatchify_packed(
 
 Set `attention_backend="varlen"` in `RAEDecoder.Config` to route this packed
 path through TorchTitan's `VarlenAttention` wrapper (FA2/FA3/FA4 depending on the
-active PyTorch kernel). `create_rae_padding_mask` is available for callers that
-must retain a padded `(B,L,C)` batch, but packed metadata avoids the padding
-overhead and is the recommended path for variable resolution.
+active PyTorch kernel); packed metadata avoids the padding overhead of a padded
+`(B,L,C)` batch and is the recommended path for variable resolution.
 
 TorchTitan's existing `MMSamplePackingConfig` already packs complete
 multimodal documents and preserves their image/video lists and position-reset
@@ -376,8 +351,7 @@ boundaries. It does not, by itself, batch variable RAE latents: use
 to keep Qwen's flattened `pixel_values` and `grid_thw` together. The Stage 1
 trainer keeps each image as a list, unpatchifies packed decoder outputs, resizes
 each target to its corresponding output grid, and applies DiffAugment on the
-native-resolution discriminator inputs. Multi-frame media remains rejected by
-the 2D GAN trainer until a video discriminator/loss path is enabled.
+native-resolution discriminator inputs.
 
 `RAEQwenCollator` now also emits `rae_grid_thw` (the post-merger grid),
 post-merger `sequence_lengths`, per-item `fps`, and canonical `media` tensors
@@ -385,8 +359,5 @@ in `BTCHW` layout. Media is downscaled to at most the resolution the vision
 tower saw (grid * patch_size) before collation: supervision targets are the
 decoder outputs at half that resolution, so full-resolution originals would
 only inflate host memory (previously tens of GiB per prefetched batch).
-Images use `T=1` and `fps=0`; video rows preserve their frame
-rate for the decoder's temporal coordinates. Video FPS must be supplied by the
-sample or processor metadata; there is no encoder-level FPS default. The debug
-and DMuon recipes use the image path today, while multi-frame media remains
-available to packed generation.
+Images use `T=1` and `fps=0`; multi-frame media remains rejected by the 2D GAN
+trainer until a video discriminator/loss path is enabled.

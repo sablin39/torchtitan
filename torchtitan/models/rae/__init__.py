@@ -8,7 +8,6 @@ from .data import RAEQwenCollator, RAEQwenProcessor
 from .decoder import (
     Cosmos3DRotaryPositionEmbedding,
     create_rae_packed_attention_mask,
-    create_rae_padding_mask,
     create_rae_static_varlen_metadata,
     create_rae_varlen_metadata,
     RAEAttention,
@@ -24,7 +23,6 @@ __all__ = [
     "RAEBlock",
     "RAEFeedForward",
     "Cosmos3DRotaryPositionEmbedding",
-    "create_rae_padding_mask",
     "create_rae_packed_attention_mask",
     "create_rae_static_varlen_metadata",
     "create_rae_varlen_metadata",
@@ -36,34 +34,15 @@ __all__ = [
 
 def __getattr__(name: str):
     if name in {"RAEStage1Trainer", "RAEGANConfig"}:
-        from .training import RAEGANConfig, RAEStage1Trainer
+        from . import trainer
 
-        return {"RAEStage1Trainer": RAEStage1Trainer, "RAEGANConfig": RAEGANConfig}[
-            name
-        ]
+        return getattr(trainer, name)
     if name in {
         "model_registry",
         "rae_stage1_debug",
-        "rae_stage1_dmuon",
-        "rae_stage1_openimages",
-        "rae_stage1_openimages_static",
-        "rae_stage1_dmuon_static",
+        "rae_stage1_openimages_static_96k_uvit",
     }:
-        from .config_registry import (
-            model_registry,
-            rae_stage1_debug,
-            rae_stage1_dmuon,
-            rae_stage1_dmuon_static,
-            rae_stage1_openimages,
-            rae_stage1_openimages_static,
-        )
+        from . import config_registry
 
-        return {
-            "model_registry": model_registry,
-            "rae_stage1_debug": rae_stage1_debug,
-            "rae_stage1_dmuon": rae_stage1_dmuon,
-            "rae_stage1_openimages": rae_stage1_openimages,
-            "rae_stage1_openimages_static": rae_stage1_openimages_static,
-            "rae_stage1_dmuon_static": rae_stage1_dmuon_static,
-        }[name]
+        return getattr(config_registry, name)
     raise AttributeError(name)

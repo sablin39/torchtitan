@@ -15,17 +15,12 @@ from torchtitan.components.optimizer.dmuon import load_dmuon
 from torchtitan.models.rae.config_registry import (
     model_registry,
     rae_stage1_debug,
-    rae_stage1_dmuon,
-    rae_stage1_dmuon_static,
-    rae_stage1_openimages,
-    rae_stage1_openimages_static,
     rae_stage1_openimages_static_96k_uvit,
 )
 from torchtitan.models.rae.data import RAEQwenCollator
 from torchtitan.models.rae.decoder import (
     Cosmos3DRotaryPositionEmbedding,
     create_rae_packed_attention_mask,
-    create_rae_padding_mask,
     create_rae_static_varlen_metadata,
     create_rae_varlen_metadata,
     RAEAttention,
@@ -37,11 +32,17 @@ from torchtitan.models.rae.discriminator import (
     RAEFeatureDiscriminator,
     RAEPerceptualLoss,
 )
-from torchtitan.models.rae.encoder import FrozenRAEEncoder, RAEEncoderConfig
-from torchtitan.models.rae.encoder.encoder import _merge_qwen_hidden_states
-from torchtitan.models.rae.training import RAEGANConfig, RAEStage1Trainer
-from torchtitan.models.rae.training.augmentation import DiscriminatorAugmentation
-from torchtitan.models.rae.training.metrics import log_stage1_metrics
+from torchtitan.models.rae.encoder import (
+    _merge_qwen_hidden_states,
+    FrozenRAEEncoder,
+    RAEEncoderConfig,
+)
+from torchtitan.models.rae.trainer import (
+    DiscriminatorAugmentation,
+    log_stage1_metrics,
+    RAEGANConfig,
+    RAEStage1Trainer,
+)
 from torchtitan.protocols.model_spec import ModelSpec
 
 
@@ -158,9 +159,8 @@ def test_rae_ema_builds_unsharded_copy_from_decoder_state() -> None:
     trainer = object.__new__(RAEStage1Trainer)
     trainer.device = torch.device("cpu")
 
-    ema_model, ema_shadow = trainer._build_ema(decoder)
+    ema_model = trainer._build_ema(decoder)
 
-    assert ema_shadow is None
     assert ema_model is not decoder
     for ema_parameter, parameter in zip(
         ema_model.parameters(), decoder.parameters(), strict=True
@@ -288,16 +288,12 @@ def test_rae_decoder_varlen_gqa_forwards_enable_gqa() -> None:
     assert patch_logits.shape == (5, 192)
 
 
-def test_rae_varlen_metadata_and_padding_mask() -> None:
+def test_rae_varlen_metadata() -> None:
     metadata = create_rae_varlen_metadata([3, 5])
     assert metadata.cu_seq_q_host == (0, 3, 8)
     assert metadata.cu_seq_q.dtype == torch.int32
     assert metadata.cu_seq_k.dtype == torch.int32
     assert metadata.max_q == metadata.max_k == 5
-    mask = create_rae_padding_mask([3, 5])
-    assert mask.shape == (2, 5, 5)
-    assert mask[0, 0, 2]
-    assert not mask[0, 0, 3]
 
 
 def test_rae_packed_attention_mask_is_document_isolated_and_bidirectional() -> None:
@@ -359,30 +355,28 @@ def test_rae_static_varlen_decoder_fills_multiple_sequences() -> None:
 
 
 def test_qwen_collator_tracks_post_merge_lengths_and_btchw_media() -> None:
-    collator = RAEQwenCollator(
-        RAEQwenCollator.Config(batch_size=2, media_kind="video"), context=None
-    )
+    collator = RAEQwenCollator(RAEQwenCollator.Config(batch_size=2), context=None)
     rows = [
         {
-            "pixel_values_videos": torch.randn(8, 6),
-            "grid_thw_videos": torch.tensor([[2, 2, 2]]),
-            "media": torch.randn(1, 4, 3, 8, 8),
+            "pixel_values": torch.randn(8, 6),
+            "grid_thw": torch.tensor([[1, 2, 4]]),
+            "media": torch.randn(1, 1, 3, 8, 8),
             "merge_size": 2,
-            "fps": torch.tensor(12.0),
+            "fps": torch.tensor(0.0),
         },
         {
-            "pixel_values_videos": torch.randn(16, 6),
-            "grid_thw_videos": torch.tensor([[2, 2, 4]]),
-            "media": torch.randn(1, 4, 3, 8, 8),
+            "pixel_values": torch.randn(16, 6),
+            "grid_thw": torch.tensor([[1, 4, 4]]),
+            "media": torch.randn(1, 1, 3, 8, 8),
             "merge_size": 2,
-            "fps": torch.tensor(12.0),
+            "fps": torch.tensor(0.0),
         },
     ]
     batch, _ = collator(rows)
     assert batch["input"].shape == (24, 6)
-    assert torch.equal(batch["rae_grid_thw"], torch.tensor([[2, 1, 1], [2, 1, 2]]))
+    assert torch.equal(batch["rae_grid_thw"], torch.tensor([[1, 1, 2], [1, 2, 2]]))
     assert torch.equal(batch["sequence_lengths"], torch.tensor([2, 4]))
-    assert batch["media"][0].shape == (1, 4, 3, 8, 8)
+    assert batch["media"][0].shape == (1, 1, 3, 8, 8)
 
 
 def test_qwen_collator_derives_rows_from_token_budget() -> None:
@@ -545,11 +539,10 @@ def test_debug_recipe_uses_qwen_variable_resolution_and_dmuon() -> None:
     assert config.encoder.kind == "qwen"
     assert config.encoder.image_size == -1
     assert model.image_size == -1
-    assert config.dataloader.dataset.processor.image_size is None
 
 
 def test_dmuon_recipe_uses_dinov3_vitb16_discriminator() -> None:
-    config = rae_stage1_dmuon()
+    config = rae_stage1_openimages_static_96k_uvit()
     discriminator = config.discriminator
     assert discriminator.backbone_kind == "hf"
     assert discriminator.hf_model_path == "~/models/dinov3-vitb16-pretrain-lvd1689m"
@@ -573,7 +566,7 @@ def test_qwen_collator_row_cost_counts_post_merge_tokens() -> None:
     assert collator.row_cost(row) == 8
     assert collator.packing_token_budget() == 64
     fixed = RAEQwenCollator(
-        RAEQwenCollator.Config(batch_size=2, media_kind="image"),
+        RAEQwenCollator.Config(batch_size=2),
         context=None,
     )
     assert fixed.packing_token_budget() is None
@@ -799,50 +792,30 @@ def test_rae_recipe_enables_wandb_and_swanlab_tracking() -> None:
     assert config.metrics.enable_swanlab
 
 
-def test_openimages_recipe_streams_train_and_validation_folders() -> None:
-    config = rae_stage1_openimages()
-    decoder = cast(RAEDecoder.Config, config.model_spec.model)
-    train_source = config.dataloader.dataset.source
-    validation_source = config.validator.dataloader.dataset.source
-    assert decoder.image_size == -1
-    assert config.encoder.image_size == -1
-    assert decoder.latent_dim == config.encoder.latent_dim
-    assert train_source.path == "/mnt/nas/OpenImages/media"
-    assert train_source.load_dataset_kwargs == {
-        "data_files": {"train": "train_*/*.jpg"}
-    }
-    assert validation_source.path == "/mnt/nas/OpenImages/media"
-    assert validation_source.load_dataset_kwargs == {
-        "data_files": {"train": "validation*/*.jpg"}
-    }
-    assert config.validator.enable
-    assert config.validator.steps == -1
-
-
 def test_static_recipe_packs_multiple_images_into_fixed_token_budget() -> None:
-    config = rae_stage1_dmuon_static()
+    config = rae_stage1_openimages_static_96k_uvit()
     decoder = cast(RAEDecoder.Config, config.model_spec.model)
     collator = config.dataloader.collator
     validation_collator = config.validator.dataloader.collator
     runtime_collator = RAEQwenCollator(
         collator,
-        context=SimpleNamespace(num_tokens_per_batch=64512),
+        context=SimpleNamespace(num_tokens_per_batch=97280),
     )
     assert collator.batch_size is None
     assert validation_collator.batch_size is None
-    assert runtime_collator.num_rows_per_batch() == 63
-    assert collator.token_budget == 64512
+    assert runtime_collator.num_rows_per_batch() == 95
+    assert collator.token_budget == 97280
     assert collator.max_tokens_per_item == 1024
-    assert config.training.num_tokens_per_microbatch_per_dp_rank == 64512
-    assert config.training.num_tokens_per_train_step == 2064384
-    assert decoder.static_sequence_length == 65536
+    assert config.training.num_tokens_per_microbatch_per_dp_rank == 97280
+    assert config.training.num_tokens_per_train_step == 3112960
+    assert decoder.static_sequence_length == 98304
     assert decoder.attention_backend == "varlen"
     assert not config.training.disable_cuda_graphs
     assert config.compile.components == ["model", "discriminator"]
 
 
 def test_openimages_static_recipe_keeps_token_budget_and_tar_train_shards() -> None:
-    config = rae_stage1_openimages_static()
+    config = rae_stage1_openimages_static_96k_uvit()
     train_source = config.dataloader.dataset.source
     validation_source = config.validator.dataloader.dataset.source
     assert train_source.path == "/mnt/sda1/OpenImages/tar"
@@ -853,15 +826,15 @@ def test_openimages_static_recipe_keeps_token_budget_and_tar_train_shards() -> N
     assert validation_source.load_dataset_kwargs == {
         "data_files": {"train": "validation/*.jpg"}
     }
-    assert config.training.num_tokens_per_microbatch_per_dp_rank == 64512
-    assert config.training.num_tokens_per_train_step == 2064384
+    assert config.training.num_tokens_per_microbatch_per_dp_rank == 97280
+    assert config.training.num_tokens_per_train_step == 3112960
     assert config.validator.enable
     assert config.validator.steps == 16
     assert config.validator.freq == 500
 
 
 def test_static_recipe_uses_replicated_data_parallelism() -> None:
-    config = rae_stage1_dmuon_static()
+    config = rae_stage1_openimages_static_96k_uvit()
     assert config.parallelism.data_parallel_replicate_degree == 4
     assert config.parallelism.data_parallel_shard_degree == 1
 
@@ -946,7 +919,7 @@ def test_gan_fraction_schedule_matches_raev2_phase_boundaries() -> None:
 
 
 def test_discriminator_schedule_warms_up_then_cosine_decays() -> None:
-    config = rae_stage1_dmuon()
+    config = rae_stage1_openimages_static_96k_uvit()
     schedule = RAEStage1Trainer._make_discriminator_schedule(config)
     assert schedule(0) == pytest.approx(1.0 / 625)
     assert schedule(624) == pytest.approx(1.0)

@@ -1,0 +1,775 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""DINOv3 ViT-B/16 feature discriminator for RAE Stage 1.
+
+``DINOv3ViTBackbone`` reimplements the Hugging Face ``DINOv3ViTModel``
+forward pass (transformers ``models/dinov3_vit``) without the HF dependency,
+loading the same safetensors checkpoint (keys ``embeddings.*``, ``layer.N.*``,
+``norm.*``) with ``load_state_dict(..., strict=True)``. The backbone is a
+frozen feature extractor: it always runs in eval mode and accepts a variable
+input resolution per call (sides divisible by the patch size).
+
+``RAEFeatureDiscriminator`` stacks trainable spectral-norm heads on the frozen
+backbone. Images pass through the backbone unresized (the RoPE generalizes to
+any resolution), so the discriminator scores the reconstruction at the
+decoder's output resolution. Each head emits one logit per patch token:
+forward returns a (B, H, L) tensor for a stacked BCHW batch and a list of
+(H, L_i) tensors for a variable-resolution CHW sequence.
+``backbone_kind='fixed'`` substitutes a small deterministic conv pyramid for
+CPU smoke tests.
+
+Tensor dimension legend (letters are scoped to this file):
+    B = batch, C = channels (3 for the image, hidden_size for tokens),
+    H = image height, W = image width, L = tokens (prefix + patches),
+    P = patch tokens, N = attention heads, D = head dim,
+    K = flattened patch pixels (C*ph*pw).
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable, Generator, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from safetensors.torch import load_file
+
+from .discriminator import FrozenImageFeatures
+from .perceptual import grouped_per_image_loss
+
+
+class DINOv3ViTEmbeddings(nn.Module):
+    """Patch embedding plus cls/register prefix tokens.
+
+    ``mask_token`` exists in the checkpoint but is only used for masked
+    pre-training; it is kept as a parameter so a strict load succeeds and is
+    never read at inference.
+
+    The patch embedding is a strided Conv2d in the checkpoint, but is
+    implemented here as a pixel-unshuffle reshape plus a Linear: under
+    torch.compile(dynamic=True) an inductor convolution backward installs
+    shape-equality guards on the frame, re-specializing (and recompiling) for
+    every new input resolution, which blows dynamo's recompile limit during
+    native-resolution discrimination. Reshape+Linear stays dynamic across
+    shapes.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_channels: int,
+        patch_size: int,
+        num_register_tokens: int,
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.register_tokens = nn.Parameter(
+            torch.zeros(1, num_register_tokens, hidden_size)
+        )
+        self.patch_embeddings = nn.Linear(
+            num_channels * patch_size * patch_size, hidden_size
+        )
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        weight_key = prefix + "patch_embeddings.weight"
+        weight = state_dict.get(weight_key)
+        if weight is not None and weight.ndim == 4:
+            # The checkpoint stores the patch embedding as a Conv2d kernel
+            # (O, C, ph, pw); flatten to the equivalent Linear weight
+            # (O, C*ph*pw), matching the (C, ph, pw) inner order produced by
+            # the pixel unshuffle in forward.
+            state_dict[weight_key] = weight.flatten(1)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def forward(self, pixel_values_B3HW: torch.Tensor) -> torch.Tensor:
+        batch_size, num_channels, height, width = pixel_values_B3HW.shape
+        patch = self.patch_size
+        # Pixel unshuffle: (B, C, Hp, ph, Wp, pw) -> (B, Hp, Wp, C, ph, pw)
+        # -> (B, Hp*Wp, C*ph*pw), row-major patch order, (C, ph, pw) inner.
+        patches_BPK = (
+            pixel_values_B3HW.view(
+                batch_size, num_channels, height // patch, patch, width // patch, patch
+            )
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(batch_size, -1, num_channels * patch * patch)
+        )
+        patches_BPC = self.patch_embeddings(patches_BPK)
+        cls_B1C = self.cls_token.expand(batch_size, -1, -1)
+        registers_BRC = self.register_tokens.expand(batch_size, -1, -1)
+        return torch.cat([cls_B1C, registers_BRC, patches_BPC], dim=1)
+
+
+def _rotate_half(x_BHLD: torch.Tensor) -> torch.Tensor:
+    half = x_BHLD.shape[-1] // 2
+    return torch.cat((-x_BHLD[..., half:], x_BHLD[..., :half]), dim=-1)
+
+
+def _apply_rope(
+    q_BHLD: torch.Tensor,
+    k_BHLD: torch.Tensor,
+    cos_PD: torch.Tensor,
+    sin_PD: torch.Tensor,
+    num_prefix_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # RoPE applies to patch tokens only; the cls/register prefix is untouched.
+    q_prefix_BHTD, q_patches_BHPD = q_BHLD.split(
+        (num_prefix_tokens, cos_PD.shape[0]), dim=-2
+    )
+    k_prefix_BHTD, k_patches_BHPD = k_BHLD.split(
+        (num_prefix_tokens, cos_PD.shape[0]), dim=-2
+    )
+    q_patches_BHPD = q_patches_BHPD * cos_PD + _rotate_half(q_patches_BHPD) * sin_PD
+    k_patches_BHPD = k_patches_BHPD * cos_PD + _rotate_half(k_patches_BHPD) * sin_PD
+    return (
+        torch.cat((q_prefix_BHTD, q_patches_BHPD), dim=-2),
+        torch.cat((k_prefix_BHTD, k_patches_BHPD), dim=-2),
+    )
+
+
+class DINOv3ViTAttention(nn.Module):
+    def __init__(
+        self, *, hidden_size: int, num_heads: int, num_prefix_tokens: int
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scaling = self.head_dim**-0.5
+        self.num_prefix_tokens = num_prefix_tokens
+        # The DINOv3 checkpoint carries no key projection bias.
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+
+    def forward(
+        self,
+        x_BLC: torch.Tensor,
+        cos_PD: torch.Tensor,
+        sin_PD: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, num_tokens, _ = x_BLC.shape
+        q_BHLD = (
+            self.q_proj(x_BLC)
+            .view(batch_size, num_tokens, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k_BHLD = (
+            self.k_proj(x_BLC)
+            .view(batch_size, num_tokens, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v_BHLD = (
+            self.v_proj(x_BLC)
+            .view(batch_size, num_tokens, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        q_BHLD, k_BHLD = _apply_rope(
+            q_BHLD, k_BHLD, cos_PD, sin_PD, self.num_prefix_tokens
+        )
+        out_BHLD = F.scaled_dot_product_attention(
+            q_BHLD, k_BHLD, v_BHLD, scale=self.scaling
+        )
+        out_BLC = out_BHLD.transpose(1, 2).reshape(batch_size, num_tokens, -1)
+        return self.o_proj(out_BLC)
+
+
+class DINOv3ViTLayerScale(nn.Module):
+    def __init__(self, *, hidden_size: int) -> None:
+        super().__init__()
+        self.lambda1 = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x_BLC: torch.Tensor) -> torch.Tensor:
+        return x_BLC * self.lambda1
+
+
+class DINOv3ViTMLP(nn.Module):
+    def __init__(self, *, hidden_size: int, intermediate_size: int) -> None:
+        super().__init__()
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=True)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=True)
+
+    def forward(self, x_BLC: torch.Tensor) -> torch.Tensor:
+        # DINOv3 uses the exact (erf) GELU, the F.gelu default.
+        return self.down_proj(F.gelu(self.up_proj(x_BLC)))
+
+
+class DINOv3ViTLayer(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_heads: int,
+        num_prefix_tokens: int,
+        intermediate_size: int,
+        layer_norm_eps: float,
+    ) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.attention = DINOv3ViTAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            num_prefix_tokens=num_prefix_tokens,
+        )
+        self.layer_scale1 = DINOv3ViTLayerScale(hidden_size=hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.mlp = DINOv3ViTMLP(
+            hidden_size=hidden_size, intermediate_size=intermediate_size
+        )
+        self.layer_scale2 = DINOv3ViTLayerScale(hidden_size=hidden_size)
+
+    def forward(
+        self,
+        x_BLC: torch.Tensor,
+        cos_PD: torch.Tensor,
+        sin_PD: torch.Tensor,
+    ) -> torch.Tensor:
+        x_BLC = x_BLC + self.layer_scale1(
+            self.attention(self.norm1(x_BLC), cos_PD, sin_PD)
+        )
+        x_BLC = x_BLC + self.layer_scale2(self.mlp(self.norm2(x_BLC)))
+        return x_BLC
+
+
+class DINOv3ViTBackbone(nn.Module):
+    """Frozen DINOv3 ViT-B/16 feature extractor for the RAE discriminator.
+
+    ``forward`` returns the normed final-block output followed by the normed
+    output of each block in ``key_depths`` (0-indexed), each with the prefix
+    tokens dropped and transposed to (B, hidden_size, num_patches) -- the
+    layout the discriminator heads consume.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int = 768,
+        num_layers: int = 12,
+        num_heads: int = 12,
+        intermediate_size: int = 3072,
+        num_channels: int = 3,
+        patch_size: int = 16,
+        num_register_tokens: int = 4,
+        layer_norm_eps: float = 1e-5,
+        rope_theta: float = 100.0,
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_prefix_tokens = 1 + num_register_tokens
+        self.rope_theta = rope_theta
+        self.hidden_size = hidden_size
+        self.head_dim = hidden_size // num_heads
+        self.embeddings = DINOv3ViTEmbeddings(
+            hidden_size=hidden_size,
+            num_channels=num_channels,
+            patch_size=patch_size,
+            num_register_tokens=num_register_tokens,
+        )
+        self.layer = nn.ModuleList(
+            DINOv3ViTLayer(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                num_prefix_tokens=self.num_prefix_tokens,
+                intermediate_size=intermediate_size,
+                layer_norm_eps=layer_norm_eps,
+            )
+            for _ in range(num_layers)
+        )
+        self.norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+
+    def _rope_cos_sin(
+        self, num_patches_h: int, num_patches_w: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Computed fresh in fp32 every forward so torch.compile keeps the
+        # frequencies in fp32 (a stored buffer could be cast to bf16 by an
+        # outer mixed-precision wrapper).
+        coords_h_1d = (
+            torch.arange(0.5, num_patches_h, dtype=torch.float32, device=device)
+            / num_patches_h
+        )
+        coords_w_1d = (
+            torch.arange(0.5, num_patches_w, dtype=torch.float32, device=device)
+            / num_patches_w
+        )
+        coords_P2 = torch.stack(
+            torch.meshgrid(coords_h_1d, coords_w_1d, indexing="ij"), dim=-1
+        ).flatten(0, 1)
+        coords_P2 = 2.0 * coords_P2 - 1.0
+        inv_freq_F = 1.0 / self.rope_theta ** torch.arange(
+            0, 1, 4 / self.head_dim, dtype=torch.float32, device=device
+        )
+        angles_P2F = 2 * math.pi * coords_P2[:, :, None] * inv_freq_F[None, None, :]
+        angles_PD = angles_P2F.flatten(1, 2).tile(2)
+        return torch.cos(angles_PD), torch.sin(angles_PD)
+
+    def forward(
+        self,
+        pixel_values_B3HW: torch.Tensor,
+        key_depths: tuple[int, ...] = (2, 5, 8, 11),
+    ) -> list[torch.Tensor]:
+        height, width = pixel_values_B3HW.shape[-2:]
+        if height % self.patch_size != 0 or width % self.patch_size != 0:
+            raise ValueError(
+                "DINOv3 backbone image sides must be divisible by the patch "
+                f"size {self.patch_size}, got {(height, width)}"
+            )
+        if any(not 0 <= depth < len(self.layer) for depth in key_depths):
+            raise ValueError(
+                f"DINOv3 backbone key_depths must index blocks 0..{len(self.layer) - 1}, "
+                f"got {key_depths}"
+            )
+        cos_PD, sin_PD = self._rope_cos_sin(
+            height // self.patch_size,
+            width // self.patch_size,
+            pixel_values_B3HW.device,
+        )
+        # Match the module compute dtype (fp32 by default, bf16 when the
+        # discriminator casts the frozen backbone): inputs arrive in the
+        # caller's dtype, and the fp32 RoPE tables cast at application.
+        compute_dtype = self.embeddings.patch_embeddings.weight.dtype
+        pixel_values_B3HW = pixel_values_B3HW.to(compute_dtype)
+        cos_PD = cos_PD.to(compute_dtype)
+        sin_PD = sin_PD.to(compute_dtype)
+        x_BLC = self.embeddings(pixel_values_B3HW)
+        block_outputs_BLC = []
+        for block in self.layer:
+            x_BLC = block(x_BLC, cos_PD, sin_PD)
+            block_outputs_BLC.append(x_BLC)
+        normed_BLC = [self.norm(block_outputs_BLC[-1])]
+        normed_BLC += [self.norm(block_outputs_BLC[depth]) for depth in key_depths]
+        return [
+            activation_BLC[:, self.num_prefix_tokens :].transpose(1, 2)
+            for activation_BLC in normed_BLC
+        ]
+
+
+class _ResidualBlock(nn.Module):
+    def __init__(self, function: nn.Module) -> None:
+        super().__init__()
+        self.fn = function
+        self.ratio = 1.0 / (2.0**0.5)
+
+    def forward(self, x_BCL: torch.Tensor) -> torch.Tensor:
+        return (self.fn(x_BCL).add(x_BCL)).mul_(self.ratio)
+
+
+class _BatchNormLocal(nn.Module):
+    def __init__(self, num_features: int, eps: float) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+
+    def forward(self, x_BCL: torch.Tensor) -> torch.Tensor:
+        input_dtype = x_BCL.dtype
+        shape = x_BCL.shape
+        x_BCL = x_BCL.float()
+        grouped_B1CL = x_BCL.view(shape[0], 1, shape[1], shape[2])
+        mean_B11L = grouped_B1CL.mean((1, 3), keepdim=True)
+        variance_B11L = grouped_B1CL.var((1, 3), keepdim=True, unbiased=False)
+        grouped_B1CL = (grouped_B1CL - mean_B11L) / torch.sqrt(variance_B11L + self.eps)
+        grouped_B1CL = (
+            grouped_B1CL * self.weight[None, :, None] + self.bias[None, :, None]
+        )
+        # The statistics accumulate in fp32; cast back so the surrounding
+        # conv stack keeps the module's compute dtype.
+        return grouped_B1CL.view(shape).to(input_dtype)
+
+
+def _make_head_block(
+    channels: int,
+    *,
+    kernel_size: int,
+    norm_type: str,
+    norm_eps: float,
+    using_spec_norm: bool,
+) -> nn.Module:
+    if norm_type == "bn":
+        normalization = _BatchNormLocal(channels, norm_eps)
+    elif norm_type == "gn":
+        normalization = nn.GroupNorm(32, channels, eps=norm_eps, affine=True)
+    else:
+        raise ValueError(f"Unsupported HF vision discriminator norm type: {norm_type}")
+    convolution = nn.Conv1d(
+        channels,
+        channels,
+        kernel_size=kernel_size,
+        padding=kernel_size // 2,
+        padding_mode="circular",
+    )
+    if using_spec_norm:
+        convolution = nn.utils.spectral_norm(convolution)
+    return nn.Sequential(
+        convolution,
+        normalization,
+        nn.LeakyReLU(negative_slope=0.2, inplace=True),
+    )
+
+
+class RAEFeatureDiscriminator(nn.Module):
+    """Trainable heads on top of a frozen visual feature extractor.
+
+    ``backbone_kind='hf'`` evaluates a frozen DINOv3 backbone at native image
+    resolution (sides must be divisible by the patch size) with one spectral-
+    norm head per probed depth. ``backbone_kind='fixed'`` substitutes the
+    deterministic conv pyramid from ``discriminator.py`` for CPU smoke tests.
+    Each head emits one logit per patch token: forward returns a (B, H, L)
+    tensor for a stacked BCHW batch and a list of (H, L_i) tensors for a
+    variable-resolution CHW sequence.
+    """
+
+    @dataclass(frozen=True, slots=True)
+    class Config:
+        feature_channels: int = 64
+        num_heads: int = 3
+        backbone_kind: str = "fixed"
+        hf_model_path: str = ""
+        hf_key_depths: tuple[int, ...] = (2, 5, 8, 11)
+        hf_kernel_size: int = 9
+        hf_norm_type: str = "bn"
+        hf_using_spec_norm: bool = True
+        hf_norm_eps: float = 1e-6
+        backbone_batch_size: int = 8
+        backbone_dtype: Literal["float32", "bfloat16"] = "float32"
+
+        def __post_init__(self) -> None:
+            if self.feature_channels <= 0:
+                raise ValueError("discriminator.feature_channels must be positive")
+            if self.num_heads <= 0:
+                raise ValueError("discriminator.num_heads must be positive")
+            if self.backbone_kind == "hf" and not self.hf_model_path:
+                raise ValueError(
+                    "discriminator.hf_model_path is required for backbone_kind='hf'"
+                )
+            if self.hf_kernel_size <= 0 or self.hf_kernel_size % 2 == 0:
+                raise ValueError(
+                    "discriminator.hf_kernel_size must be positive and odd"
+                )
+            if self.hf_norm_eps <= 0:
+                raise ValueError("discriminator.hf_norm_eps must be positive")
+            if self.backbone_batch_size <= 0:
+                raise ValueError("discriminator.backbone_batch_size must be positive")
+            if self.backbone_dtype not in ("float32", "bfloat16"):
+                raise ValueError(
+                    "discriminator.backbone_dtype must be 'float32' or 'bfloat16', "
+                    f"got {self.backbone_dtype!r}"
+                )
+
+    def __init__(
+        self,
+        config: Config | None = None,
+        *,
+        device: torch.device | None = None,
+    ) -> None:
+        super().__init__()
+        config = config or self.Config()
+        device = device or torch.device("cpu")
+        self._is_hf_model = config.backbone_kind == "hf"
+        if config.backbone_kind == "fixed":
+            self.backbone = FrozenImageFeatures(config.feature_channels)
+            self.heads = nn.ModuleList(
+                [
+                    nn.Conv1d(config.feature_channels, 1, 1)
+                    for _ in range(config.num_heads)
+                ]
+            )
+            if config.num_heads != len(self.backbone.layers):
+                raise ValueError(
+                    "RAE discriminator num_heads must equal backbone layers"
+                )
+        elif config.backbone_kind == "hf":
+            model_directory = Path(config.hf_model_path).expanduser()
+            if not model_directory.is_dir():
+                raise ValueError(
+                    f"HF model directory does not exist: {model_directory}"
+                )
+            checkpoint_path = model_directory / "model.safetensors"
+            if not checkpoint_path.is_file():
+                raise ValueError(f"DINOv3 checkpoint does not exist: {checkpoint_path}")
+            backbone = DINOv3ViTBackbone()
+            # Weights load in fp32 (the checkpoint dtype); the bf16 cast
+            # happens below together with the heads.
+            backbone.load_state_dict(load_file(str(checkpoint_path)), strict=True)
+            backbone.to(device=device).eval().requires_grad_(False)
+            self.backbone = backbone
+            self.num_prefix_tokens = backbone.num_prefix_tokens
+            hidden_size = backbone.hidden_size
+            num_layers = len(backbone.layer)
+            self.key_depths = tuple(
+                index for index in config.hf_key_depths if 0 <= index < num_layers
+            )
+            heads = []
+            for _ in range(len(self.key_depths) + 1):
+                output = nn.Conv1d(hidden_size, 1, kernel_size=1)
+                if config.hf_using_spec_norm:
+                    output = nn.utils.spectral_norm(output)
+                heads.append(
+                    nn.Sequential(
+                        _make_head_block(
+                            hidden_size,
+                            kernel_size=1,
+                            norm_type=config.hf_norm_type,
+                            norm_eps=config.hf_norm_eps,
+                            using_spec_norm=config.hf_using_spec_norm,
+                        ),
+                        _ResidualBlock(
+                            _make_head_block(
+                                hidden_size,
+                                kernel_size=config.hf_kernel_size,
+                                norm_type=config.hf_norm_type,
+                                norm_eps=config.hf_norm_eps,
+                                using_spec_norm=config.hf_using_spec_norm,
+                            )
+                        ),
+                        output,
+                    )
+                )
+            self.heads = nn.ModuleList(heads)
+            # DINOv3 preprocessing is fixed ImageNet normalization, applied by
+            # _normalized_group_chunks before the backbone call.
+            self.image_mean = (0.485, 0.456, 0.406)
+            self.image_std = (0.229, 0.224, 0.225)
+            self.patch_size = backbone.patch_size
+            self.batch_size = config.backbone_batch_size
+            backbone_dtype = {
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+            }[config.backbone_dtype]
+            if backbone_dtype != torch.float32:
+                # bf16 compute halves backbone forward/backward time; the eager
+                # heads (spectral-norm power iteration included) run in bf16
+                # too so their inputs match the backbone's activations.
+                self.to(dtype=backbone_dtype)
+            self._compiled_backbone: (
+                Callable[[torch.Tensor], list[torch.Tensor]] | None
+            ) = None
+        else:
+            raise ValueError(
+                f"Unsupported discriminator backbone: {config.backbone_kind}"
+            )
+        self.set_head_requires_grad(True)
+
+    def train(self, mode: bool = True) -> "RAEFeatureDiscriminator":
+        super().train(mode)
+        if self._is_hf_model:
+            # Keep the frozen DINOv3 backbone in evaluation mode.
+            self.backbone.eval()
+        return self
+
+    def compile_forward(self, *, backend: str) -> None:
+        if not self._is_hf_model:
+            return
+        # dynamic=True: resolutions vary between microbatches, so the compiled
+        # forward keeps batch/height/width symbolic instead of re-specializing
+        # (and recompiling) on every new image shape. Buffer donation is
+        # disabled globally: an AOT backward compiled with donated buffers
+        # rejects the trainer's retain_graph=True adaptive-weight probes.
+        torch._functorch.config.donated_buffer = False
+        self._compiled_backbone = torch.compile(
+            self._backbone_features, backend=backend, dynamic=True
+        )
+
+    def set_head_requires_grad(self, enabled: bool) -> None:
+        self.backbone.requires_grad_(False)
+        self.heads.requires_grad_(enabled)
+
+    def _backbone_features(self, images_BCHW: torch.Tensor) -> list[torch.Tensor]:
+        """Frozen-backbone activations (B, C, L) at the probed depths."""
+        return self.backbone(images_BCHW, key_depths=self.key_depths)
+
+    def _forward_group(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+        """Per-patch logits (B, H, L) for one same-resolution batch.
+
+        The heads stay eager even when the backbone is compiled: their
+        spectral-norm power iteration mutates the u/v buffers in place on
+        every training-mode forward, and an AOTAutograd backward captured
+        against those buffers fails its version check once a later chunk's
+        forward bumps them.
+        """
+        if self._compiled_backbone is None:
+            activations_BCL = self._backbone_features(images_BCHW)
+        else:
+            activations_BCL = self._compiled_backbone(images_BCHW)
+        logits_BHL = [
+            head(activation_BCL)
+            for head, activation_BCL in zip(self.heads, activations_BCL, strict=True)
+        ]
+        return torch.cat(logits_BHL, dim=1)
+
+    def _group_by_shape(
+        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
+    ) -> tuple[list[torch.Tensor], dict[tuple[int, int], list[int]], bool]:
+        if isinstance(images_BCHW, torch.Tensor):
+            if images_BCHW.ndim != 4:
+                raise ValueError("HF vision discriminator expects BCHW images")
+            images = list(images_BCHW.unbind(0))
+            return_stacked = True
+        else:
+            images = list(images_BCHW)
+            return_stacked = False
+        if not images:
+            raise ValueError("HF vision discriminator requires at least one image")
+        groups: dict[tuple[int, int], list[int]] = {}
+        for index, image_CHW in enumerate(images):
+            if image_CHW.ndim != 3 or image_CHW.shape[0] != 3:
+                raise ValueError(
+                    "HF vision discriminator expects three-channel CHW images"
+                )
+            height, width = image_CHW.shape[-2:]
+            if height % self.patch_size != 0 or width % self.patch_size != 0:
+                raise ValueError(
+                    "HF vision discriminator image sides must be divisible by the "
+                    f"backbone patch size {self.patch_size}, got {(height, width)}"
+                )
+            groups.setdefault((height, width), []).append(index)
+        return images, groups, return_stacked
+
+    def _normalized_group_chunks(
+        self,
+        images: list[torch.Tensor],
+        groups: dict[tuple[int, int], list[int]],
+    ) -> Generator[tuple[list[int], torch.Tensor]]:
+        for indices in groups.values():
+            for start in range(0, len(indices), self.batch_size):
+                chunk = indices[start : start + self.batch_size]
+                group_BCHW = torch.stack([images[index] for index in chunk])
+                mean_1C11 = group_BCHW.new_tensor(self.image_mean).view(1, -1, 1, 1)
+                std_1C11 = group_BCHW.new_tensor(self.image_std).view(1, 3, 1, 1)
+                yield chunk, (group_BCHW - mean_1C11) / std_1C11
+
+    def _forward_hf(
+        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
+    ) -> torch.Tensor | list[torch.Tensor]:
+        images, groups, return_stacked = self._group_by_shape(images_BCHW)
+        outputs: list[torch.Tensor | None] = [None] * len(images)
+        for chunk, group_BCHW in self._normalized_group_chunks(images, groups):
+            logits_BHL = self._forward_group(group_BCHW)
+            for chunk_index, image_index in enumerate(chunk):
+                outputs[image_index] = logits_BHL[chunk_index]
+        if any(output is None for output in outputs):
+            raise RuntimeError("HF vision discriminator did not produce every output")
+        if return_stacked:
+            return torch.stack(outputs)  # type: ignore[arg-type]
+        return outputs  # type: ignore[return-value]
+
+    def features(
+        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
+    ) -> list[list[torch.Tensor]]:
+        """Per-image frozen-backbone activations (C, L_i) at each probed depth.
+
+        Eager by design: this path exists for no-gradient metric logging on
+        small subsamples, and bypasses the compiled backbone so no extra
+        autograd variant gets compiled mid-run.
+        """
+        images, groups, _ = self._group_by_shape(images_BCHW)
+        outputs: list[list[torch.Tensor] | None] = [None] * len(images)
+        for chunk, group_BCHW in self._normalized_group_chunks(images, groups):
+            group_activations = self._backbone_features(group_BCHW)
+            for chunk_index, image_index in enumerate(chunk):
+                outputs[image_index] = [
+                    activation_BCL[chunk_index] for activation_BCL in group_activations
+                ]
+        if any(output is None for output in outputs):
+            raise RuntimeError("HF vision discriminator did not produce every output")
+        return outputs  # type: ignore[return-value]
+
+    def feature_distance(
+        self,
+        real_items: Sequence[torch.Tensor],
+        fake_items: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        """Mean multi-depth backbone feature distance, uncalibrated.
+
+        Logging-only LPIPS-style perceptual metric over paired [-1, 1] CHW
+        lists: per image, the mean absolute activation difference at each
+        probed depth, averaged over depths, then averaged over images.
+        """
+        if len(real_items) != len(fake_items) or not real_items:
+            raise ValueError("feature_distance expects paired non-empty lists")
+        if self._is_hf_model:
+            real = [(image + 1.0) * 0.5 for image in real_items]
+            fake = [(image + 1.0) * 0.5 for image in fake_items]
+            real_features = self.features(real)
+            fake_features = self.features(fake)
+            # The diff accumulates in fp32 so the logged metric keeps the
+            # same precision whether the backbone computes in fp32 or bf16.
+            per_image = [
+                torch.stack(
+                    [
+                        (fake_depth.float() - real_depth.float()).abs().mean()
+                        for fake_depth, real_depth in zip(
+                            fake_depths, real_depths, strict=True
+                        )
+                    ]
+                ).mean()
+                for fake_depths, real_depths in zip(
+                    fake_features, real_features, strict=True
+                )
+            ]
+            return torch.stack(per_image).mean()
+        return grouped_per_image_loss(
+            self.backbone.features,
+            self.backbone.distance,
+            list(real_items),
+            list(fake_items),
+        ).mean()
+
+    def _forward_fixed_batch(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+        """Per-patch logits (B, H, L) for the fixed feature pyramid."""
+        features = self.backbone(images_BCHW)
+        # Pyramid levels shrink by stride 2; pool each head's per-patch logits
+        # to the coarsest grid so the heads stack into one (B, H, L) tensor.
+        min_tokens = min(feature.shape[-1] for feature in features)
+        return torch.cat(
+            [
+                F.adaptive_avg_pool1d(head(feature), min_tokens)
+                for head, feature in zip(self.heads, features, strict=True)
+            ],
+            dim=1,
+        )
+
+    def forward(
+        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
+    ) -> torch.Tensor | list[torch.Tensor]:
+        if self._is_hf_model:
+            if isinstance(images_BCHW, torch.Tensor):
+                images = (images_BCHW + 1.0) * 0.5
+            else:
+                images = [(image + 1.0) * 0.5 for image in images_BCHW]
+            return self._forward_hf(images)
+        if isinstance(images_BCHW, torch.Tensor):
+            if images_BCHW.ndim != 4:
+                raise ValueError("Fixed RAE discriminator expects BCHW images")
+            return self._forward_fixed_batch(images_BCHW)
+        image_items = list(images_BCHW)
+        if not image_items:
+            raise ValueError("RAE discriminator requires at least one image")
+        for image_CHW in image_items:
+            if image_CHW.ndim != 3 or image_CHW.shape[0] != 3:
+                raise ValueError("RAE discriminator expects three-channel CHW images")
+        outputs: list[torch.Tensor | None] = [None] * len(image_items)
+        groups: dict[tuple[int, int], list[int]] = {}
+        for index, image_CHW in enumerate(image_items):
+            groups.setdefault(tuple(image_CHW.shape[-2:]), []).append(index)
+        for indices in groups.values():
+            logits_BHL = self._forward_fixed_batch(
+                torch.stack([image_items[index] for index in indices])
+            )
+            for group_index, image_index in enumerate(indices):
+                outputs[image_index] = logits_BHL[group_index]
+        if any(output is None for output in outputs):
+            raise RuntimeError("RAE discriminator did not produce every output")
+        return outputs  # type: ignore[return-value]
+
+
+__all__ = ["DINOv3ViTBackbone", "RAEFeatureDiscriminator"]

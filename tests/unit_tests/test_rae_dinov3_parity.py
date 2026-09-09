@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from torchtitan.models.rae.discriminator.dinov3_vit import DINOv3ViTBackbone
+from torchtitan.models.rae.discriminator.dinov3 import DINOv3ViTBackbone
 
 CHECKPOINT_DIR = Path("~/models/dinov3-vitb16-pretrain-lvd1689m").expanduser()
 KEY_DEPTHS = (2, 5, 8, 11)
@@ -143,19 +143,17 @@ def test_compile_matches_eager(
 def test_integrated_discriminator_matches_hf(
     hf_features: dict[tuple[int, int], list[torch.Tensor]],
 ) -> None:
-    from torchtitan.models.rae.discriminator.discriminator import (
-        RAEFeatureDiscriminator,
-    )
+    from torchtitan.models.rae.discriminator.dinov3 import RAEFeatureDiscriminator
 
     config = RAEFeatureDiscriminator.Config(
         backbone_kind="hf",
         hf_model_path=str(CHECKPOINT_DIR),
     )
     discriminator = RAEFeatureDiscriminator(config, device=torch.device("cuda")).cuda()
-    assert isinstance(discriminator.backbone.model, DINOv3ViTBackbone)
+    assert isinstance(discriminator.backbone, DINOv3ViTBackbone)
     with torch.no_grad():
         for height, width in SHAPES[:2]:
-            actual = discriminator.backbone._backbone_features(_inputs(height, width))
+            actual = discriminator._backbone_features(_inputs(height, width))
             _assert_close(
                 actual,
                 hf_features[(height, width)],
@@ -166,9 +164,7 @@ def test_integrated_discriminator_matches_hf(
         assert logits_BHL.shape == (2, len(KEY_DEPTHS) + 1, 14 * 14)
         assert torch.isfinite(logits_BHL).all()
         # Eager features() logging path used by feature_distance.
-        features = discriminator.backbone.features(
-            [torch.rand(3, 224, 224, device="cuda")]
-        )
+        features = discriminator.features([torch.rand(3, 224, 224, device="cuda")])
         assert len(features) == 1 and len(features[0]) == len(KEY_DEPTHS) + 1
 
 
@@ -267,9 +263,7 @@ def test_bf16_compiled_backward_into_input(
 
 
 def test_integrated_bf16_discriminator() -> None:
-    from torchtitan.models.rae.discriminator.discriminator import (
-        RAEFeatureDiscriminator,
-    )
+    from torchtitan.models.rae.discriminator.dinov3 import RAEFeatureDiscriminator
 
     config = RAEFeatureDiscriminator.Config(
         backbone_kind="hf",
@@ -278,8 +272,8 @@ def test_integrated_bf16_discriminator() -> None:
     )
     discriminator = RAEFeatureDiscriminator(config, device=torch.device("cuda")).cuda()
     backbone = discriminator.backbone
-    assert backbone.model.embeddings.patch_embeddings.weight.dtype == torch.bfloat16
-    assert next(backbone.heads.parameters()).dtype == torch.bfloat16
+    assert backbone.embeddings.patch_embeddings.weight.dtype == torch.bfloat16
+    assert next(discriminator.heads.parameters()).dtype == torch.bfloat16
     with torch.no_grad():
         # fp32 input images get normalized in their own dtype and cast to
         # bf16 at the backbone boundary.

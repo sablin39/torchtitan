@@ -6,21 +6,20 @@
 
 """Frozen visual backbones and trainable RAE discriminator heads."""
 
-from .dino import HFModelFeatureDiscriminator
+from .dinov3 import DINOv3ViTBackbone, RAEFeatureDiscriminator
 from .discriminator import (
     FrozenImageFeatures,
     gan_discriminator_loss,
     gan_generator_loss,
     gan_logits_mean,
     gan_logits_per_image,
-    RAEFeatureDiscriminator,
     RAEPerceptualLoss,
 )
 from .perceptual import LPIPSPerceptualLoss
 
 __all__ = [
+    "DINOv3ViTBackbone",
     "FrozenImageFeatures",
-    "HFModelFeatureDiscriminator",
     "LPIPSPerceptualLoss",
     "RAEFeatureDiscriminator",
     "RAEPerceptualLoss",

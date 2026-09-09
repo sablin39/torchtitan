@@ -4,9 +4,34 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Frozen RAE Stage 1 encoder: Qwen3.5 vision tower plus the RAE adapter.
+
+``QwenVisionEncoder`` is a drop-in replacement for the HF
+``Qwen3_5VisionModel`` used as the frozen RAE encoder. It loads the same
+safetensors weights (keys without the ``model.visual.`` prefix) and consumes
+the same packed patch layout: ``pixels_TD`` of shape
+``(T, in_channels * temporal_patch_size * patch_size**2)`` plus a ``grid_thw``
+metadata tensor, with tokens packed in spatial-merge block-major order per
+image: (block_row, block_col, in_row, in_col).
+
+The tower forward takes only static-shaped tensors (all data-dependent
+indexing is precomputed by :meth:`QwenVisionEncoder.build_aux` outside the
+compiled graph), so it runs under ``torch.compile(fullgraph=True,
+dynamic=False)`` for a fixed token budget.
+
+``FrozenRAEEncoder`` wraps the tower with weight loading, the RAEv2
+multi-layer merge, and static token padding (``pad_tokens_to``).
+``kind='fixed'`` is a deterministic dependency-free conv projection for smoke
+tests.
+
+Tensor shape-suffix legend (letters are scoped to this file):
+    T: total packed patch tokens, D: hidden_size, N: num attention heads,
+    H: head dim, I: patch pixel dim (in_channels * temporal * patch**2),
+    P: num position-embedding taps per token (4 for bilinear).
+"""
+
 from __future__ import annotations
 
-import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -16,19 +41,411 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_varlen_func
 
-logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True, slots=True)
+class QwenVisionConfig:
+    """Vision tower settings; defaults match the Qwen3.5-0.8B vision config."""
+
+    depth: int = 12
+    hidden_size: int = 768
+    num_heads: int = 12
+    intermediate_size: int = 3072
+    patch_size: int = 16
+    temporal_patch_size: int = 2
+    spatial_merge_size: int = 2
+    in_channels: int = 3
+    out_hidden_size: int = 1024
+    num_position_embeddings: int = 2304
+    layer_norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
 
 
-_DINO_HUB_MODELS = {
-    "dinov2-vit-s": ("facebookresearch/dinov2", "dinov2_vits14_reg"),
-    "dinov2-vit-b": ("facebookresearch/dinov2", "dinov2_vitb14_reg"),
-    "dinov2-vit-l": ("facebookresearch/dinov2", "dinov2_vitl14_reg"),
-    "dinov2-vit-g": ("facebookresearch/dinov2", "dinov2_vitg14_reg"),
-    "dinov3-vit-s16": ("facebookresearch/dinov3", "dinov3_vits16"),
-    "dinov3-vit-b16": ("facebookresearch/dinov3", "dinov3_vitb16"),
-    "dinov3-vit-l16": ("facebookresearch/dinov3", "dinov3_vitl16"),
-}
+@dataclass(slots=True)
+class QwenVisionAux:
+    """Static-shaped per-batch indexing metadata from ``build_aux``."""
+
+    cu_seqlens: torch.Tensor  # (num_docs + 1,) int32
+    max_seqlen: int
+    interp_indices: torch.Tensor  # (T, P) long
+    interp_weights: torch.Tensor  # (T, P) float32
+    position_ids: torch.Tensor  # (T, 2) long, (row, col) patch indices
+
+    def to(self, device: torch.device) -> QwenVisionAux:
+        return QwenVisionAux(
+            cu_seqlens=self.cu_seqlens.to(device),
+            max_seqlen=self.max_seqlen,
+            interp_indices=self.interp_indices.to(device),
+            interp_weights=self.interp_weights.to(device),
+            position_ids=self.position_ids.to(device),
+        )
+
+
+class QwenVisionPatchEmbed(nn.Module):
+    def __init__(self, config: QwenVisionConfig) -> None:
+        super().__init__()
+        self.patch_size = config.patch_size
+        self.temporal_patch_size = config.temporal_patch_size
+        self.in_channels = config.in_channels
+        self.embed_dim = config.hidden_size
+        patch_dim = (
+            config.in_channels
+            * config.temporal_patch_size
+            * config.patch_size
+            * config.patch_size
+        )
+        # Named ``proj`` so the HF conv3d checkpoint keys load unchanged; the
+        # kernel == stride, so the conv is exactly this linear.
+        self.proj = nn.Linear(patch_dim, self.embed_dim, bias=True)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        key = prefix + "proj.weight"
+        weight = state_dict.get(key)
+        if weight is not None and weight.ndim == 5:
+            state_dict[key] = weight.reshape(weight.shape[0], -1)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def forward(self, pixels_TD: torch.Tensor) -> torch.Tensor:
+        # Compute through conv3d (kernel == stride) rather than the linear:
+        # both are the same math, but this matches the HF model's kernel
+        # accumulation order bit-for-bit, and the difference amplifies
+        # through the blocks' large activation outliers.
+        patch_shape = (
+            self.in_channels,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        x_TCTHW = pixels_TD.view(-1, *patch_shape)
+        conv_weight = self.proj.weight.view(self.embed_dim, *patch_shape)
+        return F.conv3d(
+            x_TCTHW, conv_weight, self.proj.bias, stride=patch_shape[1:]
+        ).view(-1, self.embed_dim)
+
+
+class QwenVisionMLP(nn.Module):
+    def __init__(self, config: QwenVisionConfig) -> None:
+        super().__init__()
+        self.linear_fc1 = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=True
+        )
+        self.linear_fc2 = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=True
+        )
+
+    def forward(self, x_TD: torch.Tensor) -> torch.Tensor:
+        return self.linear_fc2(F.gelu(self.linear_fc1(x_TD), approximate="tanh"))
+
+
+class QwenVisionPatchMerger(nn.Module):
+    """Pre-shuffle spatial merger; attribute names match the RAE merge helper."""
+
+    def __init__(self, config: QwenVisionConfig) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.use_postshuffle_norm = False
+        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.act_fn = nn.GELU()
+        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
+
+    def forward(self, x_TD: torch.Tensor) -> torch.Tensor:
+        x_TD = self.norm(x_TD).view(-1, self.hidden_size)
+        return self.linear_fc2(self.act_fn(self.linear_fc1(x_TD)))
+
+
+def _rotate_half(x_TNH: torch.Tensor) -> torch.Tensor:
+    half = x_TNH.shape[-1] // 2
+    return torch.cat((-x_TNH[..., half:], x_TNH[..., :half]), dim=-1)
+
+
+def _axis_taps_weights(
+    src: torch.Tensor, side: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bilinear taps into a ``side``-length table and their hat weights."""
+    floor = torch.floor(src)
+    frac = src - floor
+    low = floor.long().clamp(0, side - 1)
+    high = (floor.long() + 1).clamp(0, side - 1)
+    weight_low = (1 - frac).clamp(min=0)
+    weight_high = frac.clamp(min=0)
+    return low, weight_low, high, weight_high
+
+
+class QwenVisionAttention(nn.Module):
+    def __init__(self, config: QwenVisionConfig) -> None:
+        super().__init__()
+        self.dim = config.hidden_size
+        self.num_heads = config.num_heads
+        self.head_dim = self.dim // self.num_heads
+        self.scaling = self.head_dim**-0.5
+        self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
+        self.proj = nn.Linear(self.dim, self.dim, bias=True)
+
+    def forward(
+        self,
+        x_TD: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cos_TH: torch.Tensor,
+        sin_TH: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = x_TD.shape[0]
+        qkv_T3NH = self.qkv(x_TD).view(num_tokens, 3, self.num_heads, self.head_dim)
+        q_TNH, k_TNH, v_TNH = qkv_T3NH.unbind(dim=1)
+        # RoPE in fp32, cast back to the input dtype, broadcast over heads.
+        cos_T1H = cos_TH.unsqueeze(1)
+        sin_T1H = sin_TH.unsqueeze(1)
+        orig_dtype = q_TNH.dtype
+        q_TNH = (q_TNH.float() * cos_T1H + _rotate_half(q_TNH.float()) * sin_T1H).to(
+            orig_dtype
+        )
+        k_TNH = (k_TNH.float() * cos_T1H + _rotate_half(k_TNH.float()) * sin_T1H).to(
+            orig_dtype
+        )
+
+        if orig_dtype in (torch.float16, torch.bfloat16):
+            out_TNH = flash_attn_varlen_func(
+                q_TNH,
+                k_TNH,
+                v_TNH,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=self.scaling,
+                causal=False,
+            )
+        else:
+            # flash-attn only supports fp16/bf16; the fp32 path is eager-only
+            # (it syncs on cu_seqlens) and exists for high-precision parity
+            # checks against the HF sdpa implementation.
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            outputs = []
+            start = 0
+            for length in lengths:
+                q_1NTH = q_TNH[start : start + length].transpose(0, 1).unsqueeze(0)
+                k_1NTH = k_TNH[start : start + length].transpose(0, 1).unsqueeze(0)
+                v_1NTH = v_TNH[start : start + length].transpose(0, 1).unsqueeze(0)
+                out_1NTH = F.scaled_dot_product_attention(
+                    q_1NTH, k_1NTH, v_1NTH, scale=self.scaling
+                )
+                outputs.append(out_1NTH.squeeze(0).transpose(0, 1))
+                start += length
+            out_TNH = torch.cat(outputs, dim=0)
+        return self.proj(out_TNH.reshape(num_tokens, -1))
+
+
+class QwenVisionBlock(nn.Module):
+    def __init__(self, config: QwenVisionConfig) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.attn = QwenVisionAttention(config)
+        self.mlp = QwenVisionMLP(config)
+
+    def forward(
+        self,
+        x_TD: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cos_TH: torch.Tensor,
+        sin_TH: torch.Tensor,
+    ) -> torch.Tensor:
+        x_TD = x_TD + self.attn(
+            self.norm1(x_TD), cu_seqlens, max_seqlen, cos_TH, sin_TH
+        )
+        return x_TD + self.mlp(self.norm2(x_TD))
+
+
+class QwenVisionEncoder(nn.Module):
+    """Packed varlen Qwen3.5 vision tower with a static-shape forward."""
+
+    def __init__(
+        self,
+        config: QwenVisionConfig,
+        layer_indices: tuple[int, ...] = (),
+    ) -> None:
+        super().__init__()
+        self.config = config
+        invalid = [i for i in layer_indices if i < 0 or i >= config.depth]
+        if invalid:
+            raise ValueError(f"layer_indices out of range: {invalid}")
+        self.layer_indices = tuple(sorted(set(layer_indices)))
+        self.spatial_merge_size = config.spatial_merge_size
+        self.num_grid_per_side = int(math.isqrt(config.num_position_embeddings))
+        if self.num_grid_per_side**2 != config.num_position_embeddings:
+            raise ValueError("num_position_embeddings must be a perfect square")
+        self.patch_embed = QwenVisionPatchEmbed(config)
+        self.pos_embed = nn.Embedding(
+            config.num_position_embeddings, config.hidden_size
+        )
+        self.blocks = nn.ModuleList(
+            QwenVisionBlock(config) for _ in range(config.depth)
+        )
+        self.merger = QwenVisionPatchMerger(config)
+
+    def build_aux(
+        self,
+        grid_thw: torch.Tensor,
+        max_seqlen: int | None = None,
+        max_docs: int | None = None,
+    ) -> QwenVisionAux:
+        """Precompute indexing metadata from ``grid_thw`` (CPU or GPU tensor).
+
+        ``max_seqlen`` may be pinned to a fixed upper bound (e.g. the token
+        budget) so a compiled forward does not re-specialize when the true
+        maximum document length changes; flash-attn only uses it for kernel
+        scheduling. ``max_docs`` likewise pads cu_seqlens with zero-length
+        trailing entries to a static 1 + max_docs length: token packing fills
+        the budget with a variable document count, and an unpadded cu_seqlens
+        would re-specialize the compiled graph on every batch.
+        """
+        grid_thw = torch.as_tensor(grid_thw, dtype=torch.long).reshape(-1, 3)
+        merge = self.spatial_merge_size
+        side = self.num_grid_per_side
+        t_N, h_N, w_N = grid_thw.unbind(dim=1)
+        bad = ((h_N % merge) != 0) | ((w_N % merge) != 0)
+        if bool(bad.any()):
+            index = int(bad.nonzero()[0])
+            raise ValueError(
+                f"grid ({int(h_N[index])}, {int(w_N[index])}) is not "
+                f"divisible by spatial_merge_size {merge}"
+            )
+        # One entry per temporal frame: docs with t > 1 contribute t frames.
+        frame_tokens_F = torch.repeat_interleave(h_N * w_N, t_N)
+        h_F = torch.repeat_interleave(h_N, t_N)
+        w_F = torch.repeat_interleave(w_N, t_N)
+        cu_frames = torch.cat(
+            [frame_tokens_F.new_zeros(1), frame_tokens_F.cumsum(dim=0)]
+        )
+        num_frames = frame_tokens_F.shape[0]
+        device = grid_thw.device
+        frame_id_T = torch.repeat_interleave(
+            torch.arange(num_frames, device=device), frame_tokens_F
+        )
+        # The arithmetic below replays the exact float32 op sequence of the
+        # original per-document loop; elementwise ops are deterministic per
+        # element, so the vectorized result is bit-identical.
+        within_T = (
+            torch.arange(int(cu_frames[-1]), device=device) - cu_frames[:-1][frame_id_T]
+        ).to(torch.float32)
+        blocks_w_T = (w_F[frame_id_T] // merge).to(torch.float32)
+        # Decode the block-major packed index within one frame:
+        # (block_row, block_col, in_row, in_col).
+        in_col = within_T % merge
+        in_row = (within_T // merge) % merge
+        block_col = (within_T // (merge * merge)) % blocks_w_T
+        block_row = within_T // (merge * merge * blocks_w_T)
+        row = block_row * merge + in_row
+        col = block_col * merge + in_col
+        # Bilinear (align_corners=True) resample of the side x side
+        # position table: 2 taps per axis, outer product -> 4 taps.
+        h_T = h_F[frame_id_T].to(torch.float32)
+        w_T = w_F[frame_id_T].to(torch.float32)
+        src_h = row * (side - 1) / (h_T - 1).clamp(min=1)
+        src_w = col * (side - 1) / (w_T - 1).clamp(min=1)
+        h_low, h_wlow, h_high, h_whigh = _axis_taps_weights(src_h, side)
+        w_low, w_wlow, w_high, w_whigh = _axis_taps_weights(src_w, side)
+        indices_T4 = torch.stack(
+            (
+                h_low * side + w_low,
+                h_low * side + w_high,
+                h_high * side + w_low,
+                h_high * side + w_high,
+            ),
+            dim=-1,
+        )
+        weights_T4 = torch.stack(
+            (
+                h_wlow * w_wlow,
+                h_wlow * w_whigh,
+                h_whigh * w_wlow,
+                h_whigh * w_whigh,
+            ),
+            dim=-1,
+        )
+        positions_T2 = torch.stack((row.long(), col.long()), dim=-1)
+        true_max_seqlen = int((t_N * h_N * w_N).max())
+        if max_seqlen is None:
+            max_seqlen = true_max_seqlen
+        elif max_seqlen < true_max_seqlen:
+            raise ValueError(
+                f"max_seqlen {max_seqlen} is below the true maximum {true_max_seqlen}"
+            )
+        if max_docs is not None:
+            if num_frames > max_docs:
+                raise ValueError(
+                    f"batch has {num_frames} documents, above max_docs={max_docs}"
+                )
+            pad = max_docs - num_frames
+            cu_frames = torch.cat([cu_frames, cu_frames[-1:].expand(pad)])
+        return QwenVisionAux(
+            cu_seqlens=cu_frames.to(torch.int32),
+            max_seqlen=max_seqlen,
+            interp_indices=indices_T4,
+            interp_weights=weights_T4,
+            position_ids=positions_T2,
+        )
+
+    def _rope_cos_sin(
+        self, position_ids_T2: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # inv_freq is computed fresh from arange instead of stored as a
+        # buffer (a buffer would be silently truncated by nn.Module.to).
+        # HF stores it as a buffer, so the deployed HF model multiplies
+        # position ids by inv_freq in the *module* dtype and takes cos/sin
+        # there too; reproduce that quantization here so a bf16 deployment
+        # matches HF bit-for-bit (fp32 inv_freq deviates by ~5e-2 norm-rel
+        # on the late blocks' large activation outliers).
+        compute_dtype = self.pos_embed.weight.dtype
+        rope_dim = self.config.hidden_size // self.config.num_heads // 2
+        inv_freq = (
+            1.0
+            / (
+                self.config.rope_theta
+                ** (
+                    torch.arange(
+                        0,
+                        rope_dim,
+                        2,
+                        dtype=torch.float32,
+                        device=position_ids_T2.device,
+                    )
+                    / rope_dim
+                )
+            )
+        ).to(compute_dtype)
+        rot_T2F = position_ids_T2.unsqueeze(-1) * inv_freq
+        rot_TF = rot_T2F.flatten(1)
+        emb_TH = torch.cat((rot_TF, rot_TF), dim=-1)
+        return emb_TH.cos().float(), emb_TH.sin().float()
+
+    def forward(
+        self, pixels_TD: torch.Tensor, aux: QwenVisionAux
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Return the final hidden states (T, D) and tapped block outputs."""
+        if pixels_TD.shape[0] != aux.interp_indices.shape[0]:
+            raise ValueError(
+                "pixels_TD token count does not match aux: "
+                f"{pixels_TD.shape[0]} != {aux.interp_indices.shape[0]}"
+            )
+        x_TD = self.patch_embed(pixels_TD)
+        # fp32 weighted sum of the 4 interpolation taps, cast to input dtype.
+        pos_TD = (
+            self.pos_embed(aux.interp_indices).float()
+            * aux.interp_weights.unsqueeze(-1)
+        ).sum(dim=1)
+        x_TD = x_TD + pos_TD.to(x_TD.dtype)
+        cos_TH, sin_TH = self._rope_cos_sin(aux.position_ids)
+        taps: list[torch.Tensor] = []
+        tap_set = set(self.layer_indices)
+        for index, block in enumerate(self.blocks):
+            x_TD = block(x_TD, aux.cu_seqlens, aux.max_seqlen, cos_TH, sin_TH)
+            if index in tap_set:
+                taps.append(x_TD)
+        return x_TD, taps
 
 
 def _merge_qwen_hidden_states(
@@ -47,7 +464,7 @@ def _merge_qwen_hidden_states(
     token mean of the final selected layer is added back as a global signal.
     The merger MLP runs once on the combined tokens. ``tokens_per_item``
     holds the pre-merger token counts of each packed media item so the
-    global mean stays within its own image or video.
+    global mean stays within its own image.
     """
     if not layer_indices:
         return merger(final_hidden)
@@ -111,12 +528,9 @@ class RAEEncoderConfig:
     image_size: int = 256
     noise_tau: float = 0.8
     normalization_stat_path: str | None = None
-    checkpoint_path: str | None = None
-    repository_path: str | None = None
     layer_indices: tuple[int, ...] = ()
     merge_size: int = 1
     dtype: str = "float32"
-    attn_implementation: str = "flash_attention_2"
     compile: bool = False
     # Static token budget for kind='qwen': every microbatch is padded with one
     # trailing padding document up to this many patch tokens, so the native
@@ -165,9 +579,8 @@ class RAEEncoderConfig:
 class FrozenRAEEncoder(nn.Module):
     """Frozen image-to-latent adapter for Stage 1.
 
-    ``kind='dino_hub'`` loads a DINO encoder with PyTorch Hub. ``kind='qwen'``
-    loads only the local Qwen vision tower and merger. ``kind='fixed'`` is
-    deterministic and dependency-free for smoke tests.
+    ``kind='qwen'`` loads the local Qwen vision tower and merger.
+    ``kind='fixed'`` is deterministic and dependency-free for smoke tests.
     """
 
     def __init__(self, config: RAEEncoderConfig, device: torch.device) -> None:
@@ -200,88 +613,6 @@ class FrozenRAEEncoder(nn.Module):
         self.last_temporal_start: torch.Tensor | None = None
         if config.kind == "qwen":
             self._init_qwen(config, device)
-        elif config.kind in {"dino_hub", "hf"}:
-            if not config.name:
-                raise ValueError("DINO encoder name is required")
-            if config.kind == "hf":
-                try:
-                    from transformers import AutoModel
-                except ImportError as error:
-                    raise RuntimeError(
-                        "encoder.kind='hf' requires the optional transformers package"
-                    ) from error
-                model_path = str(Path(config.name).expanduser())
-                self.external = AutoModel.from_pretrained(
-                    model_path,
-                    local_files_only=True,
-                )
-                self.external.to(device=device).eval()
-                external_dim = getattr(
-                    self.external.config,
-                    "hidden_size",
-                    getattr(self.external.config, "embed_dim", None),
-                )
-                if external_dim != config.latent_dim:
-                    raise ValueError(
-                        "DINO encoder hidden size does not match decoder latent_dim: "
-                        f"{external_dim} != {config.latent_dim}"
-                    )
-                self._hf_num_register_tokens = int(
-                    getattr(self.external.config, "num_register_tokens", 0)
-                )
-                self._hf_processor_size = self.image_size
-                self._hf_patch_size = int(
-                    getattr(self.external.config, "patch_size", 16)
-                )
-            elif config.name not in _DINO_HUB_MODELS:
-                raise ValueError(f"Unsupported DINO encoder name: {config.name}")
-            else:
-                default_repository, model_name = _DINO_HUB_MODELS[config.name]
-                hub_repository = config.repository_path or default_repository
-                load_kwargs = {
-                    "source": "local" if config.repository_path else "github",
-                    "trust_repo": True,
-                    "pretrained": config.checkpoint_path is None,
-                }
-                self.external = torch.hub.load(
-                    hub_repository,
-                    model_name,
-                    **load_kwargs,
-                )
-                if config.checkpoint_path is not None:
-                    state = torch.load(
-                        config.checkpoint_path,
-                        map_location="cpu",
-                        weights_only=True,
-                    )
-                    if isinstance(state, dict) and "state_dict" in state:
-                        state = state["state_dict"]
-                    if not isinstance(state, dict):
-                        raise ValueError(
-                            "DINO encoder checkpoint must contain a state dict"
-                        )
-                    missing, unexpected = self.external.load_state_dict(
-                        state, strict=False
-                    )
-                    if missing:
-                        raise RuntimeError(
-                            f"DINO encoder checkpoint missing keys: {missing}"
-                        )
-                    if unexpected:
-                        raise RuntimeError(
-                            "DINO encoder checkpoint has unexpected keys: "
-                            f"{unexpected}"
-                        )
-                external_dim = getattr(
-                    self.external,
-                    "embed_dim",
-                    getattr(self.external, "hidden_size", None),
-                )
-            if external_dim != config.latent_dim:
-                raise ValueError(
-                    "DINO encoder hidden size does not match decoder latent_dim: "
-                    f"{external_dim} != {config.latent_dim}"
-                )
         elif config.kind == "fixed":
             self.projection = nn.Conv2d(3, config.latent_dim, kernel_size=1)
             with torch.no_grad():
@@ -313,20 +644,13 @@ class FrozenRAEEncoder(nn.Module):
     def _init_qwen(self, config: RAEEncoderConfig, device: torch.device) -> None:
         if not config.name:
             raise ValueError("Qwen encoder name is required")
-        if config.checkpoint_path is not None:
-            raise ValueError("Qwen encoder does not accept checkpoint_path")
         try:
             from safetensors import safe_open
             from transformers import AutoConfig, AutoImageProcessor, AutoProcessor
-
-            from torchtitan.models.rae.encoder.qwen_vit import (
-                QwenVisionConfig,
-                QwenVisionEncoder,
-            )
         except ImportError as error:
             raise RuntimeError(
-                "encoder.kind='qwen' requires transformers, safetensors, and "
-                "flash-attn"
+                "encoder.kind='qwen' requires the transformers and safetensors "
+                "packages"
             ) from error
         model_directory = Path(config.name).expanduser()
         if not model_directory.is_dir():
@@ -347,15 +671,6 @@ class FrozenRAEEncoder(nn.Module):
         ):
             raise ValueError(
                 "Qwen encoder image_size must be divisible by patch_size * merge_size"
-            )
-        # The torchtitan-native vision tower always uses flash-attn varlen in
-        # half precision and per-document SDPA in fp32; attn_implementation no
-        # longer applies.
-        if config.attn_implementation != "flash_attention_2":
-            logger.warning(
-                "encoder.attn_implementation=%s is ignored by the native Qwen "
-                "vision encoder",
-                config.attn_implementation,
             )
         visual = QwenVisionEncoder(
             QwenVisionConfig(
@@ -450,6 +765,7 @@ class FrozenRAEEncoder(nn.Module):
 
     @staticmethod
     def _as_btchw(media: Any) -> torch.Tensor:
+        """Normalize one image to a single-frame (1, C, H, W) float tensor."""
         if not isinstance(media, torch.Tensor):
             import io
 
@@ -460,38 +776,24 @@ class FrozenRAEEncoder(nn.Module):
                 media = Image.open(io.BytesIO(media)).convert("RGB")
             if hasattr(media, "convert"):
                 media = np.array(media.convert("RGB"), copy=True)
-            if isinstance(media, (list, tuple)):
-                frames = [FrozenRAEEncoder._as_btchw(frame)[0] for frame in media]
-                return torch.stack(frames, dim=0)
             media = torch.from_numpy(np.asarray(media))
         media = media.float()
         if media.numel() and media.max() > 1:
             media = media / 255.0
-        if media.ndim == 3:
-            if media.shape[-1] in (1, 3, 4):
-                media = media[..., :3].permute(2, 0, 1)
-            elif media.shape[0] not in (1, 3, 4):
-                raise ValueError("RAE media must be HWC or CHW with three channels")
-            else:
-                media = media[:3]
-            return media.unsqueeze(0)
-        if media.ndim == 4:
-            if media.shape[1] in (1, 3, 4):
-                return media[:, :3]
-            if media.shape[-1] in (1, 3, 4):
-                return media[..., :3].permute(0, 3, 1, 2)
-            raise ValueError("RAE videos must use TCHW or THWC layout")
-        if media.ndim == 5:
-            if media.shape[0] != 1 or media.shape[2] not in (1, 3, 4):
-                raise ValueError("RAE media batches must use one BTCHW item")
-            return media[0, :, :3]
-        raise ValueError("RAE media must have CHW, TCHW, or BTCHW dimensions")
+        if media.ndim != 3:
+            raise ValueError("RAE encoder images must have CHW or HWC dimensions")
+        if media.shape[-1] in (1, 3, 4):
+            media = media[..., :3].permute(2, 0, 1)
+        elif media.shape[0] not in (1, 3, 4):
+            raise ValueError("RAE encoder images must be HWC or CHW with 3 channels")
+        else:
+            media = media[:3]
+        return media.unsqueeze(0)
 
     def forward(
         self,
         images_BTCHW: torch.Tensor | Sequence[torch.Tensor] | Mapping[str, Any],
         *,
-        add_noise: bool = False,
         return_grid_thw: bool = False,
         fps: torch.Tensor | float | None = None,
         temporal_start: torch.Tensor | float = 0.0,
@@ -520,7 +822,6 @@ class FrozenRAEEncoder(nn.Module):
         processor_output: Mapping[str, Any] | None = None
         images_BCHW: torch.Tensor | None = None
         batch_size: int
-        media_kind = "image"
         if isinstance(images_BTCHW, Mapping):
             if self.kind != "qwen":
                 raise ValueError(
@@ -530,7 +831,7 @@ class FrozenRAEEncoder(nn.Module):
             pixel_key = next(
                 (
                     key
-                    for key in ("pixel_values", "pixel_values_videos", "input")
+                    for key in ("pixel_values", "input")
                     if processor_output.get(key) is not None
                 ),
                 None,
@@ -538,12 +839,7 @@ class FrozenRAEEncoder(nn.Module):
             grid_key = next(
                 (
                     key
-                    for key in (
-                        "image_grid_thw",
-                        "video_grid_thw",
-                        "grid_thw",
-                        "grid_thw_videos",
-                    )
+                    for key in ("image_grid_thw", "grid_thw")
                     if processor_output.get(key) is not None
                 ),
                 None,
@@ -552,102 +848,39 @@ class FrozenRAEEncoder(nn.Module):
                 raise ValueError(
                     "Qwen encoder mappings require pixel_values and grid_thw metadata"
                 )
-            media_kind = str(
-                processor_output.get(
-                    "media_kind", "video" if "video" in pixel_key else "image"
-                )
-            )
             grid_thw = torch.as_tensor(processor_output[grid_key])
             batch_size = int(grid_thw.reshape(-1, 3).shape[0])
         elif isinstance(images_BTCHW, torch.Tensor):
             raw_media = images_BTCHW.float()
             if raw_media.numel() and raw_media.max() > 1:
                 raw_media = raw_media / 255.0
+            if raw_media.ndim != 4:
+                raise ValueError("RAE encoder tensor inputs must be BCHW images")
+            images_BCHW = raw_media
+            batch_size = raw_media.shape[0]
             if self.kind == "qwen":
-                if raw_media.ndim == 4:
-                    images_BCHW = raw_media
-                    batch_size = raw_media.shape[0]
-                    processor_output = self.processor(
-                        images=raw_media.detach(),
-                        do_rescale=False,
-                        return_tensors="pt",
-                    )
-                elif raw_media.ndim == 5:
-                    media_kind = "video"
-                    videos_TCHW = [
-                        raw_media[index].detach() for index in range(raw_media.shape[0])
-                    ]
-                    batch_size = len(videos_TCHW)
-                    if not hasattr(self.processor, "video_processor"):
-                        raise RuntimeError(
-                            "Qwen processor does not provide a video processor"
-                        )
-                    processor_output = self.processor(
-                        videos=videos_TCHW,
-                        do_rescale=False,
-                        do_sample_frames=False,
-                        return_metadata=True,
-                        return_tensors="pt",
-                    )
-                else:
-                    raise ValueError("Qwen encoder expects BCHW images or BTCHW videos")
-            else:
-                if raw_media.ndim == 5:
-                    if raw_media.shape[1] != 1:
-                        raise ValueError(
-                            "Non-Qwen RAE encoders only accept one-frame BTCHW images"
-                        )
-                    raw_media = raw_media[:, 0]
-                if raw_media.ndim != 4:
-                    raise ValueError("Non-Qwen RAE encoders expect BCHW images")
-                images_BCHW = raw_media
-                batch_size = raw_media.shape[0]
+                processor_output = self.processor(
+                    images=raw_media.detach(),
+                    do_rescale=False,
+                    return_tensors="pt",
+                )
         else:
             media_items = list(images_BTCHW)
             if not media_items:
-                raise ValueError("RAE encoder requires at least one image or video")
-            if self.kind != "qwen":
-                if any(item.ndim not in (3, 4) for item in media_items):
-                    raise ValueError(
-                        "Non-Qwen RAE encoders expect CHW or one-frame TCHW images"
-                    )
-                if any(item.ndim == 4 and item.shape[0] != 1 for item in media_items):
-                    raise ValueError(
-                        "Non-Qwen RAE encoders only accept one-frame TCHW images"
-                    )
-                images_BCHW = torch.stack(
-                    [
-                        item.float() if item.ndim == 3 else item[0].float()
-                        for item in media_items
-                    ]
-                )
-                batch_size = images_BCHW.shape[0]
-            else:
+                raise ValueError("RAE encoder requires at least one image")
+            if self.kind == "qwen":
                 media_items = [self._as_btchw(item) for item in media_items]
-                media_kind = (
-                    "video"
-                    if any(item.shape[0] > 1 for item in media_items)
-                    else "image"
-                )
                 batch_size = len(media_items)
-                if media_kind == "video":
-                    if not hasattr(self.processor, "video_processor"):
-                        raise RuntimeError(
-                            "Qwen processor does not provide a video processor"
-                        )
-                    processor_output = self.processor(
-                        videos=[item.detach() for item in media_items],
-                        do_rescale=False,
-                        do_sample_frames=False,
-                        return_metadata=True,
-                        return_tensors="pt",
-                    )
-                else:
-                    processor_output = self.processor(
-                        images=[item[0].detach() for item in media_items],
-                        do_rescale=False,
-                        return_tensors="pt",
-                    )
+                processor_output = self.processor(
+                    images=[item[0].detach() for item in media_items],
+                    do_rescale=False,
+                    return_tensors="pt",
+                )
+            else:
+                if any(item.ndim != 3 for item in media_items):
+                    raise ValueError("RAE encoder image lists must contain CHW tensors")
+                images_BCHW = torch.stack([item.float() for item in media_items])
+                batch_size = images_BCHW.shape[0]
 
         if self.kind != "qwen" and images_BCHW is not None:
             if images_BCHW.shape[1] != 3:
@@ -666,17 +899,12 @@ class FrozenRAEEncoder(nn.Module):
             assert processor_output is not None
             pixel_key = next(
                 key
-                for key in ("pixel_values", "pixel_values_videos", "input")
+                for key in ("pixel_values", "input")
                 if processor_output.get(key) is not None
             )
             grid_key = next(
                 key
-                for key in (
-                    "image_grid_thw",
-                    "video_grid_thw",
-                    "grid_thw",
-                    "grid_thw_videos",
-                )
+                for key in ("image_grid_thw", "grid_thw")
                 if processor_output.get(key) is not None
             )
             grid_thw = torch.as_tensor(processor_output[grid_key])
@@ -776,79 +1004,12 @@ class FrozenRAEEncoder(nn.Module):
             else:
                 tokens_BLC = merged_hidden_states
             fps_source = processor_output.get("fps") if fps is None else fps
-            if fps_source is None and media_kind == "video":
-                metadata = processor_output.get("video_metadata")
-                metadata_fps = (
-                    [getattr(item, "fps", None) for item in metadata]
-                    if metadata
-                    else []
-                )
-                if len(metadata_fps) != batch_size or any(
-                    item_fps is None or item_fps <= 0 for item_fps in metadata_fps
-                ):
-                    raise ValueError(
-                        "Video FPS must be provided with the input or processor metadata"
-                    )
-                fps_values = [float(item_fps) for item_fps in metadata_fps]
-            else:
-                fps_values = scalar_values(fps_source, batch_size, 0.0)
-            if media_kind == "video" and any(value <= 0 for value in fps_values):
-                raise ValueError("Video FPS must be positive")
+            fps_values = scalar_values(fps_source, batch_size, 0.0)
             self.last_fps = torch.tensor(fps_values, device=merged_hidden_states.device)
             start_values = scalar_values(temporal_start, batch_size, 0.0)
             self.last_temporal_start = torch.tensor(
                 start_values, device=merged_hidden_states.device
             )
-        elif self.external is not None and self.kind == "dino_hub":
-            assert images_BCHW is not None
-            images_BCHW = F.interpolate(
-                images_BCHW, size=(self.image_size, self.image_size), mode="bicubic"
-            )
-            mean_1C11 = images_BCHW.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
-            std_1C11 = images_BCHW.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
-            images_BCHW = (images_BCHW - mean_1C11) / std_1C11
-            if hasattr(self.external, "forward_features"):
-                features = self.external.forward_features(images_BCHW)
-                tokens_BLC = features["x_norm_patchtokens"]
-            else:
-                tokens_BLC = self.external(images_BCHW)
-        elif self.kind == "hf":
-            assert images_BCHW is not None
-            images_BCHW = F.interpolate(
-                images_BCHW,
-                size=(self._hf_processor_size, self._hf_processor_size),
-                mode="bicubic",
-                align_corners=False,
-            )
-            mean_1C11 = images_BCHW.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
-            std_1C11 = images_BCHW.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
-            layer_indices = self.layer_indices
-            outputs = self.external(
-                pixel_values=(images_BCHW - mean_1C11) / std_1C11,
-                output_hidden_states=bool(layer_indices),
-            )
-            prefix_length = 1 + self._hf_num_register_tokens
-            if layer_indices:
-                hidden_states = outputs.hidden_states
-                if hidden_states is None:
-                    raise RuntimeError("DINO encoder did not return hidden states")
-                num_layers = int(self.external.config.num_hidden_layers)
-                invalid_indices = [
-                    index for index in layer_indices if index < 0 or index >= num_layers
-                ]
-                if invalid_indices:
-                    raise ValueError(
-                        "DINO encoder layer indices are out of range: "
-                        f"{invalid_indices}"
-                    )
-                selected = [
-                    self.external.norm(hidden_states[index + 1])[:, prefix_length:]
-                    for index in layer_indices
-                ]
-                tokens_BLC = torch.stack(selected).mean(dim=0)
-                tokens_BLC = tokens_BLC + selected[-1].mean(dim=1, keepdim=True)
-            else:
-                tokens_BLC = outputs.last_hidden_state[:, prefix_length:]
         elif self.kind == "fixed":
             assert images_BCHW is not None
             latent_side = self.image_size // 16
@@ -921,46 +1082,6 @@ class FrozenRAEEncoder(nn.Module):
             else:
                 latent_var = 1
             latents = (latents - latent_mean) / torch.sqrt(latent_var + 1e-5)
-        if add_noise and self.noise_tau > 0:
-            if latents.ndim == 4:
-                noise_scale = self.noise_tau * torch.rand(
-                    (latents.shape[0], 1, 1, 1),
-                    device=latents.device,
-                    dtype=latents.dtype,
-                )
-            elif latents.ndim == 3:
-                noise_scale = self.noise_tau * torch.rand(
-                    (latents.shape[0], 1, 1),
-                    device=latents.device,
-                    dtype=latents.dtype,
-                )
-            elif self.last_grid_thw is not None:
-                # Packed (T, C) latents: one noise scale per packed media item.
-                tokens_per_item = (
-                    self.last_grid_thw.reshape(-1, 3)
-                    .prod(dim=-1)
-                    .to(device=latents.device)
-                )
-                if int(tokens_per_item.sum().item()) != latents.shape[0]:
-                    raise ValueError(
-                        "Qwen grid metadata does not match the packed latent count"
-                    )
-                noise_scale = torch.repeat_interleave(
-                    self.noise_tau
-                    * torch.rand(
-                        tokens_per_item.numel(),
-                        device=latents.device,
-                        dtype=latents.dtype,
-                    ),
-                    tokens_per_item,
-                ).unsqueeze(-1)
-            else:
-                noise_scale = self.noise_tau * torch.rand(
-                    (1, 1),
-                    device=latents.device,
-                    dtype=latents.dtype,
-                )
-            latents = latents + noise_scale * torch.randn_like(latents)
         if return_grid_thw:
             if self.last_grid_thw is None:
                 if latents.ndim == 4:
@@ -976,4 +1097,10 @@ class FrozenRAEEncoder(nn.Module):
         return latents
 
 
-__all__ = ["RAEEncoderConfig", "FrozenRAEEncoder"]
+__all__ = [
+    "FrozenRAEEncoder",
+    "QwenVisionAux",
+    "QwenVisionConfig",
+    "QwenVisionEncoder",
+    "RAEEncoderConfig",
+]
