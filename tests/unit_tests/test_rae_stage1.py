@@ -41,10 +41,6 @@ from torchtitan.models.rae.encoder import FrozenRAEEncoder, RAEEncoderConfig
 from torchtitan.models.rae.encoder.encoder import _merge_qwen_hidden_states
 from torchtitan.models.rae.training import RAEGANConfig, RAEStage1Trainer
 from torchtitan.models.rae.training.augmentation import DiscriminatorAugmentation
-from torchtitan.models.rae.training.graphs import (
-    RAEDiscriminatorGraph,
-    RAEGeneratorLossGraph,
-)
 from torchtitan.models.rae.training.metrics import log_stage1_metrics
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -435,8 +431,9 @@ def test_fixed_discriminator_accepts_variable_resolution_images() -> None:
         torch.randn(3, 24, 32, requires_grad=True),
     ]
     logits = discriminator(images)
-    assert logits.shape == (2, 3)
-    logits.mean().backward()
+    assert isinstance(logits, list) and len(logits) == 2
+    assert all(image_logits.shape[0] == 3 for image_logits in logits)
+    torch.stack([image_logits.mean() for image_logits in logits]).sum().backward()
     assert all(image.grad is not None for image in images)
 
 
@@ -464,14 +461,18 @@ def test_qwen_mls_averages_normed_blocks_with_global_mean() -> None:
             self.act_fn = torch.nn.GELU()
             self.linear_fc2 = torch.nn.Linear(6, 3)
 
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.norm(x).view(-1, self.hidden_size)
+            return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
+
     hidden_states = tuple(torch.randn(4, 3) for _ in range(5))
-    outputs = SimpleNamespace(
-        hidden_states=hidden_states,
-        pooler_output=torch.full((1, 3), -1.0),
-    )
     merger = _Merger()
     merged = _merge_qwen_hidden_states(
-        outputs, merger, (0, 2), tokens_per_item=torch.tensor([1, 3])
+        [hidden_states[1], hidden_states[3]],
+        hidden_states[-1],
+        merger,
+        (0, 2),
+        tokens_per_item=torch.tensor([1, 3]),
     )
     normed = [merger.norm(hidden_states[1]), merger.norm(hidden_states[3])]
     averaged = torch.stack(normed).mean(dim=0)
@@ -481,17 +482,15 @@ def test_qwen_mls_averages_normed_blocks_with_global_mean() -> None:
     )
     expected = merger.linear_fc2(merger.act_fn(merger.linear_fc1(expected.view(-1, 6))))
     torch.testing.assert_close(merged, expected)
-    assert torch.equal(
-        _merge_qwen_hidden_states(outputs, merger, ()), outputs.pooler_output
+    final_hidden = torch.randn(4, 3)
+    torch.testing.assert_close(
+        _merge_qwen_hidden_states([], final_hidden, merger, ()),
+        merger(final_hidden),
     )
 
 
 def test_qwen_mls_rejects_mismatched_token_counts() -> None:
     hidden_states = tuple(torch.randn(4, 3) for _ in range(5))
-    outputs = SimpleNamespace(
-        hidden_states=hidden_states,
-        pooler_output=torch.full((1, 3), -1.0),
-    )
 
     class _Merger(torch.nn.Module):
         def __init__(self) -> None:
@@ -505,7 +504,11 @@ def test_qwen_mls_rejects_mismatched_token_counts() -> None:
 
     with pytest.raises(ValueError, match="tokens_per_item"):
         _merge_qwen_hidden_states(
-            outputs, _Merger(), (0, 2), tokens_per_item=torch.tensor([2, 2, 2])
+            [hidden_states[1], hidden_states[3]],
+            hidden_states[-1],
+            _Merger(),
+            (0, 2),
+            tokens_per_item=torch.tensor([2, 2, 2]),
         )
 
 
@@ -610,30 +613,43 @@ def test_token_budget_batching_packs_by_cost_and_restores_state() -> None:
         next(iterator)
 
 
-def test_canvas_stacking_letterboxes_mixed_resolutions() -> None:
-    trainer = object.__new__(RAEStage1Trainer)
-    trainer.discriminator = SimpleNamespace(input_canvas_size=32, canvas_patch_size=16)
-    images = [torch.randn(3, 32, 32), torch.randn(3, 48, 24)]
-    stacked = trainer._stack_canvas_images(images)
-    assert stacked.shape == (2, 3, 32, 32)
-    # The 48x24 image scales to 32x16 and centers on a zero canvas.
-    torch.testing.assert_close(stacked[1, :, :, :8], torch.zeros(3, 32, 8))
-    torch.testing.assert_close(stacked[1, :, :, 24:], torch.zeros(3, 32, 8))
-    torch.testing.assert_close(stacked[0], images[0])
-    # No fixed canvas -> no stacking.
-    trainer.discriminator = SimpleNamespace(input_canvas_size=None, canvas_patch_size=1)
-    assert trainer._stack_canvas_images(images) is None
+def test_discriminator_list_path_groups_shapes_and_matches_loop() -> None:
+    torch.manual_seed(0)
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    images = [torch.randn(3, 32, 32), torch.randn(3, 24, 40), torch.randn(3, 32, 32)]
+    logits_list = discriminator(images)
+    assert isinstance(logits_list, list) and len(logits_list) == 3
+    # Per-patch logits: one logit per head per feature position.
+    assert all(logits.shape[0] == 3 for logits in logits_list)
+    assert logits_list[0].shape != logits_list[1].shape
+    looped = [discriminator(image.unsqueeze(0))[0] for image in images]
+    for got, expected in zip(logits_list, looped, strict=True):
+        torch.testing.assert_close(got, expected)
+    # Tensor input returns a stacked (B, heads, L) tensor.
+    logits_stacked = discriminator(torch.stack([images[0], images[2]]))
+    assert isinstance(logits_stacked, torch.Tensor)
+    assert logits_stacked.shape[0] == 2
+    torch.testing.assert_close(logits_stacked[0], logits_list[0])
+    # List and tensor forms of the same batch give identical GAN losses.
+    for loss_type in ("hinge", "vanilla"):
+        tensor_loss = gan_discriminator_loss(logits_stacked, logits_stacked, loss_type)
+        list_loss = gan_discriminator_loss(
+            [logits_list[0], logits_list[2]],
+            [logits_list[0], logits_list[2]],
+            loss_type,
+        )
+        torch.testing.assert_close(list_loss, tensor_loss)
 
 
-def test_pad_to_bucket_pads_with_zero_mask() -> None:
-    images = torch.randn(5, 3, 8, 8)
-    padded, mask = RAEStage1Trainer._pad_to_bucket(images, 4)
-    assert padded.shape == (8, 3, 8, 8)
-    assert mask.tolist() == [1.0] * 5 + [0.0] * 3
-    assert torch.equal(padded[5:], torch.zeros(3, 3, 8, 8))
-    same, same_mask = RAEStage1Trainer._pad_to_bucket(images[:4], 4)
-    assert same.shape == (4, 3, 8, 8)
-    assert same_mask.sum().item() == 4.0
+def test_gan_losses_weight_images_not_patch_tokens() -> None:
+    # Constant per-image logits make the expected reduction exact: the
+    # image-weighted mean is 1.5, while a token-weighted mean would be 5/3.
+    logits_fake = [torch.full((1, 4), 1.0), torch.full((1, 8), 2.0)]
+    assert gan_generator_loss(logits_fake, "hinge").item() == pytest.approx(-1.5)
+    expected = torch.nn.functional.softplus(torch.tensor([-1.0, -2.0])).mean()
+    torch.testing.assert_close(gan_generator_loss(logits_fake, "vanilla"), expected)
 
 
 def test_chunked_discriminator_update_matches_full_batch() -> None:
@@ -642,19 +658,20 @@ def test_chunked_discriminator_update_matches_full_batch() -> None:
         RAEFeatureDiscriminator.Config(feature_channels=8)
     )
     augmentation = DiscriminatorAugmentation(probability=0.0)
-    fake = torch.randn(11, 3, 16, 16)
-    real = torch.randn(11, 3, 16, 16)
+    fake = [torch.randn(3, 16, 16) for _ in range(11)]
+    real = [torch.randn(3, 16, 16) for _ in range(11)]
 
-    def run(chunk_size: int):
+    def run(batch_size: int):
         trainer = object.__new__(RAEStage1Trainer)
         trainer.config = SimpleNamespace(
-            gan=RAEGANConfig(discriminator_chunk_size=chunk_size)
+            gan=RAEGANConfig(discriminator_update_batch_size=batch_size)
         )
+        trainer.device = torch.device("cpu")
         trainer.discriminator_train = discriminator
         trainer.discriminator_augmentation = augmentation
         for parameter in discriminator.parameters():
             parameter.grad = None
-        output = trainer._update_discriminator_fixed_eager(fake, real)
+        output = trainer._update_discriminator(fake, real)
         grads = [
             parameter.grad.clone()
             for parameter in discriminator.parameters()
@@ -662,13 +679,26 @@ def test_chunked_discriminator_update_matches_full_batch() -> None:
         ]
         return output, grads
 
-    # A chunk size larger than the batch degenerates to the full-batch update.
+    # A batch size larger than the list degenerates to the full-batch update.
     reference, reference_grads = run(16)
     chunked, chunked_grads = run(4)
     for got, expected in zip(chunked, reference, strict=True):
         torch.testing.assert_close(got, expected)
     for got, expected in zip(chunked_grads, reference_grads, strict=True):
         torch.testing.assert_close(got, expected)
+
+
+def test_feature_distance_is_zero_for_identical_pairs() -> None:
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    real = [torch.randn(3, 32, 32), torch.randn(3, 24, 40)]
+    same = discriminator.feature_distance(real, real)
+    assert same.item() == pytest.approx(0.0, abs=1e-7)
+    different = discriminator.feature_distance(
+        real, [torch.randn_like(image) for image in real]
+    )
+    assert different.item() > 0.0
 
 
 def test_perceptual_list_path_groups_shapes_and_matches_loop() -> None:
@@ -752,7 +782,7 @@ def test_stage1_metrics_include_packing_stats() -> None:
 
     log_stage1_metrics(
         1,
-        [torch.zeros(()) for _ in range(11)],
+        [torch.zeros(()) for _ in range(12)],
         metrics_processor=Metrics(),
         non_padding_ratio=0.75,
         num_images_per_step=16.0,
@@ -804,7 +834,7 @@ def test_static_recipe_packs_multiple_images_into_fixed_token_budget() -> None:
     assert collator.token_budget == 64512
     assert collator.max_tokens_per_item == 1024
     assert config.training.num_tokens_per_microbatch_per_dp_rank == 64512
-    assert config.training.num_tokens_per_train_step == 258048
+    assert config.training.num_tokens_per_train_step == 2064384
     assert decoder.static_sequence_length == 65536
     assert decoder.attention_backend == "varlen"
     assert not config.training.disable_cuda_graphs
@@ -819,13 +849,15 @@ def test_openimages_static_recipe_keeps_token_budget_and_tar_train_shards() -> N
     assert train_source.load_dataset_kwargs == {
         "data_files": {"train": "train_*.tar.gz"}
     }
-    assert validation_source.path == "/home/rwkv/molin/openimages_local/data"
+    assert validation_source.path == "/mnt/sda1/OpenImages/validation_subset"
     assert validation_source.load_dataset_kwargs == {
         "data_files": {"train": "validation/*.jpg"}
     }
     assert config.training.num_tokens_per_microbatch_per_dp_rank == 64512
-    assert config.training.num_tokens_per_train_step == 258048
+    assert config.training.num_tokens_per_train_step == 2064384
     assert config.validator.enable
+    assert config.validator.steps == 16
+    assert config.validator.freq == 500
 
 
 def test_static_recipe_uses_replicated_data_parallelism() -> None:
@@ -938,7 +970,11 @@ def test_gan_losses_match_stage1_conventions() -> None:
     assert torch.equal(
         gan_discriminator_loss(logits_real, logits_fake, "hinge"), expected_hinge
     )
-    assert torch.equal(gan_generator_loss(logits_fake, "vanilla"), -logits_fake.mean())
+    assert torch.equal(gan_generator_loss(logits_fake, "hinge"), -logits_fake.mean())
+    assert torch.equal(
+        gan_generator_loss(logits_fake, "vanilla"),
+        torch.nn.functional.softplus(-logits_fake).mean(),
+    )
 
 
 def test_vendored_dmuon_is_loadable() -> None:
@@ -959,72 +995,6 @@ def test_discriminator_augmentation_can_be_disabled() -> None:
     augmentation = DiscriminatorAugmentation(probability=0.0)
     images = torch.randn(2, 3, 16, 16)
     assert torch.equal(augmentation(images), images)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs require CUDA")
-def test_rae_cuda_loss_graph_replays_forward_and_gradients() -> None:
-    device = torch.device("cuda")
-    discriminator = RAEFeatureDiscriminator(
-        RAEFeatureDiscriminator.Config(feature_channels=8), device=device
-    ).to(device)
-    discriminator.eval()
-    discriminator.set_head_requires_grad(False)
-    perceptual = RAEPerceptualLoss(channels=8).to(device)
-    augmentation = DiscriminatorAugmentation(probability=0.0)
-    generator_graph = RAEGeneratorLossGraph(
-        discriminator,
-        perceptual,
-        augmentation,
-        use_gan=True,
-        use_perceptual=True,
-        perceptual_weight=1.0,
-        discriminator_weight=0.75,
-        generator_loss="vanilla",
-        loss_scale=1.0,
-        autocast_dtype=None,
-    )
-    fake = torch.rand(2, 3, 32, 32, device=device, requires_grad=True)
-    target = torch.rand_like(fake)
-    output = generator_graph(fake, target, torch.ones(2, device=device))
-    torch.autograd.backward(fake, output.fake_gradient)
-    assert fake.grad is not None
-
-    discriminator.set_head_requires_grad(True)
-    discriminator.train()
-    discriminator_graph = RAEDiscriminatorGraph(
-        discriminator,
-        augmentation,
-        discriminator_loss="hinge",
-        autocast_dtype=None,
-    )
-    output = discriminator_graph(
-        torch.randn_like(fake), torch.randn_like(fake), torch.ones(2, device=device)
-    )
-    assert output.loss_sum.is_cuda
-    assert output.valid_count.item() == 2.0
-    assert any(parameter.grad is not None for parameter in discriminator.parameters())
-
-    # Replays accumulate unnormalized gradient sums (chunked updates divide by
-    # the total valid count once, at the update boundary).
-    fake_in = torch.randn_like(fake)
-    real_in = torch.randn_like(fake)
-    mask = torch.ones(2, device=device)
-    for parameter in discriminator.parameters():
-        parameter.grad = None
-    discriminator_graph(fake_in, real_in, mask)
-    first = [
-        parameter.grad.clone()
-        for parameter in discriminator.parameters()
-        if parameter.grad is not None
-    ]
-    discriminator_graph(fake_in, real_in, mask)
-    second = [
-        parameter.grad
-        for parameter in discriminator.parameters()
-        if parameter.grad is not None
-    ]
-    for doubled, single in zip(second, first, strict=True):
-        torch.testing.assert_close(doubled, single * 2)
 
 
 def test_streaming_source_tracks_epoch_completion(tmp_path) -> None:

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Literal
 
 from torchtitan.components.checkpointer import CheckpointManager
@@ -28,7 +29,7 @@ from torchtitan.config import (
     ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.protocols.model_spec import ModelSpec
 from .data import RAEQwenCollator, RAEQwenProcessor
 from .decoder import RAEDecoder
@@ -41,14 +42,14 @@ from .training import RAEGANAugmentConfig, RAEGANConfig, RAEStage1Trainer
 _OPENIMAGES_ROOT = "/mnt/nas/OpenImages/media"
 _OPENIMAGES_TRAIN_FILES = "train_*/*.jpg"
 _OPENIMAGES_VALIDATION_FILES = "validation*/*.jpg"
-_OPENIMAGES_LOCAL_ROOT = "/home/rwkv/molin/openimages_local/data"
-_OPENIMAGES_LOCAL_VALIDATION_FILES = "validation/*.jpg"
 # Full OpenImages train set as gzipped webdataset tars (16 shards, members
 # named <folder>/<hash>.jpg, row key "jpg"). The single validation.tar.gz has
-# one shard, too few to split across DP ranks, so validation stays on the
-# staged media folder.
+# one shard, too few to split across DP ranks, so validation reads a 25k-image
+# subset extracted from its head into a plain folder instead.
 _OPENIMAGES_TAR_ROOT = "/mnt/sda1/OpenImages/tar"
 _OPENIMAGES_TAR_TRAIN_FILES = "train_*.tar.gz"
+_OPENIMAGES_VALIDATION_SUBSET_ROOT = "/mnt/sda1/OpenImages/validation_subset"
+_OPENIMAGES_VALIDATION_SUBSET_FILES = "validation/*.jpg"
 _STATIC_QWEN_MIN_PIXELS = 256 * 256
 _STATIC_QWEN_MAX_PIXELS = 1024 * 1024
 _STATIC_QWEN_MAX_TOKENS_PER_ITEM = 1024
@@ -69,17 +70,22 @@ def model_registry(
     if flavor not in {"base", "debug"}:
         raise ValueError(f"Unknown RAE flavor: {flavor}")
     debug = flavor == "debug"
+    sizes = {
+        "latent_dim": 32 if debug else 1024,
+        "image_size": 32 if debug else -1,
+        "patch_size": 8 if debug else 16,
+        "hidden_size": 64 if debug else 1024,
+        "num_layers": 2 if debug else 8,
+        "num_heads": 4 if debug else 16,
+        "num_kv_heads": 2 if debug else 4,
+        "intermediate_size": 128 if debug else 3072,
+    }
+    if latent_dim is not None:
+        sizes["latent_dim"] = latent_dim
+    if decoder_image_size is not None:
+        sizes["image_size"] = decoder_image_size
     model = RAEDecoder.Config(
-        latent_dim=(32 if debug else 1024) if latent_dim is None else latent_dim,
-        image_size=(32 if debug else -1)
-        if decoder_image_size is None
-        else decoder_image_size,
-        patch_size=8 if debug else 16,
-        hidden_size=64 if debug else 1024,
-        num_layers=2 if debug else 8,
-        num_heads=4 if debug else 16,
-        num_kv_heads=2 if debug else 4,
-        intermediate_size=128 if debug else 3072,
+        **sizes,
         attention_backend=attention_backend,
         spatial_merge_size=2,
         temporal_patch_size=2,
@@ -113,6 +119,7 @@ def _image_dataloader(
     image_key: str = "jpg",
     num_prefetch_batches: int = 2,
     num_processor_workers: int = 0,
+    readahead_mb: int = 0,
 ) -> GrainDataLoader.Config:
     dataset = SingleDatasetConfig(
         source=HuggingFaceStreamingSource.Config(
@@ -123,6 +130,7 @@ def _image_dataloader(
             # > 0; keep the image as encoded bytes so JPEG decode happens in
             # the workers instead of at submit-pickle time.
             decode_images=False,
+            readahead_mb=readahead_mb,
         ),
         processor=RAEQwenProcessor.Config(
             model_name="~/models/Qwen3.5-0.8B",
@@ -280,7 +288,14 @@ def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
         lpips_calibration_checkpoint_path="pretrained_models/lpips/vgg_lpips.pth",
         lpips_vgg_checkpoint_path="pretrained_models/lpips/vgg16-397923af.pth",
         augment=RAEGANAugmentConfig(probability=1.0, cutout=0.0),
+        # Half the decoder's dmuon LR: the DINOv3 backbone is frozen, so only
+        # the small spectral-norm heads train and 2e-4 over-rotates them.
+        discriminator_lr=1e-4,
         discriminator_warmup_steps=625,
+        # The discriminator has fully separated real/fake by the time the
+        # adversarial term starts, so ramp its weight in instead of taking
+        # the full gradient spike on the first GAN step.
+        discriminator_weight_ramp_steps=625,
     )
     config.discriminator = RAEFeatureDiscriminator.Config(
         feature_channels=768,
@@ -288,6 +303,9 @@ def rae_stage1_dmuon() -> RAEStage1Trainer.Config:
         hf_model_path="~/models/dinov3-vitb16-pretrain-lvd1689m",
         hf_key_depths=(2, 5, 8, 11),
         backbone_batch_size=64,
+        # bf16 backbone+heads: disc phase 20.0 -> 12.8 s/step and 84 -> 68 GiB
+        # (bench 2026-09-09); feature-space parity vs fp32 is ~1e-2 rel.
+        backbone_dtype="bfloat16",
     )
     config.parallelism = ParallelismConfig(
         data_parallel_replicate_degree=4,
@@ -342,11 +360,15 @@ def _openimages_static(
         max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
         num_prefetch_batches=4,
         num_processor_workers=num_processor_workers,
+        # /mnt/sda1 is a USB-attached NVMe: a single buffered stream tops out
+        # far below the device's aggregate bandwidth (the kernel readahead
+        # window is latency-bound), so keep the page cache warm with preads.
+        readahead_mb=2048,
     )
     config.validator.dataloader = _image_dataloader(
         batch_size=None,
-        dataset_path=_OPENIMAGES_LOCAL_ROOT,
-        data_files=_OPENIMAGES_LOCAL_VALIDATION_FILES,
+        dataset_path=_OPENIMAGES_VALIDATION_SUBSET_ROOT,
+        data_files=_OPENIMAGES_VALIDATION_SUBSET_FILES,
         image_key="image",
         min_pixels=_STATIC_QWEN_MIN_PIXELS,
         max_pixels=_STATIC_QWEN_MAX_PIXELS,
@@ -356,8 +378,10 @@ def _openimages_static(
         num_processor_workers=num_processor_workers,
     )
     config.validator.enable = True
-    config.validator.steps = -1
-    config.validator.freq = 1000
+    # 16 packed validation microbatches per round, every 500 steps: enough
+    # images to judge generation quality without stalling training for long.
+    config.validator.steps = 16
+    config.validator.freq = 500
     return config
 
 
@@ -407,9 +431,23 @@ def _dmuon_static(
         use_dmuon=True,
     )
     config.model_spec.model.flops_attention_context = _STATIC_QWEN_MAX_TOKENS_PER_ITEM
+    # Pad the packed encoder input with one isolated document so the native
+    # Qwen ViT (encoder/qwen_vit.py, bitwise-parity with the HF tower)
+    # compiles with fully static shapes. The budget is in post-merge tokens;
+    # the encoder consumes pre-merge patches (merge_size**2 x).
+    config.encoder = dataclasses.replace(
+        config.encoder,
+        pad_tokens_to=token_budget * config.encoder.merge_size**2,
+        # The longest varlen segment (padding doc included) stays below one
+        # max-size row: packing slack is always < max_tokens_per_item.
+        max_tokens_per_doc=_STATIC_QWEN_MAX_TOKENS_PER_ITEM
+        * config.encoder.merge_size**2,
+        compile=True,
+    )
     config.training = TrainingConfig(
         num_tokens_per_microbatch_per_dp_rank=token_budget,
-        num_tokens_per_train_step=token_budget * 4,
+        # token_budget x 8 accumulation microbatches x 4 DP ranks.
+        num_tokens_per_train_step=token_budget * 32,
         max_context_length=1,
         max_norm=1.0,
         steps=10000,
@@ -433,7 +471,10 @@ def _dmuon_static(
         max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
         num_prefetch_batches=4,
     )
-    config.activation_checkpoint = FullAC.Config()
+    # Selective AC measured fastest at the 96k budget (benches 2026-09-09,
+    # GAN active from step 0): 55.4 s/step vs 57.4 full; none OOMs at 96k and
+    # none at 64k nets lower tokens/s despite fitting.
+    config.activation_checkpoint = SelectiveAC.Config()
     config.compile = CompileConfig(enable=True, components=["model", "discriminator"])
     # Four ranks compile the encoder/decoder/discriminator concurrently on the
     # first step, and mid-run CUDA-graph captures pause collectives; loosen the

@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,11 @@ import torch.nn.functional as F
 
 from .dino import HFModelFeatureDiscriminator
 from .perceptual import grouped_per_image_loss, LPIPSPerceptualLoss
+
+# Discriminator logits are per patch token: a (B, H, L) tensor for a stacked
+# batch, or a list of (H, L_i) tensors for variable-resolution images
+# (B=batch, H=discriminator heads, L=patch tokens).
+Logits = torch.Tensor | Sequence[torch.Tensor]
 
 
 class FrozenImageFeatures(nn.Module):
@@ -87,7 +93,7 @@ class RAEFeatureDiscriminator(nn.Module):
         hf_using_spec_norm: bool = True
         hf_norm_eps: float = 1e-6
         backbone_batch_size: int = 8
-        hf_input_size: int | None = None
+        backbone_dtype: Literal["float32", "bfloat16"] = "float32"
 
         def __post_init__(self) -> None:
             if self.feature_channels <= 0:
@@ -106,8 +112,11 @@ class RAEFeatureDiscriminator(nn.Module):
                 raise ValueError("discriminator.hf_norm_eps must be positive")
             if self.backbone_batch_size <= 0:
                 raise ValueError("discriminator.backbone_batch_size must be positive")
-            if self.hf_input_size is not None and self.hf_input_size <= 0:
-                raise ValueError("discriminator.hf_input_size must be positive")
+            if self.backbone_dtype not in ("float32", "bfloat16"):
+                raise ValueError(
+                    "discriminator.backbone_dtype must be 'float32' or 'bfloat16', "
+                    f"got {self.backbone_dtype!r}"
+                )
 
     def __init__(
         self,
@@ -118,7 +127,6 @@ class RAEFeatureDiscriminator(nn.Module):
         super().__init__()
         config = config or self.Config()
         device = device or torch.device("cpu")
-        self.backbone_batch_size = config.backbone_batch_size
         self._is_hf_model = False
         if config.backbone_kind == "fixed":
             self.backbone = FrozenImageFeatures(config.feature_channels)
@@ -131,7 +139,11 @@ class RAEFeatureDiscriminator(nn.Module):
                 norm_type=config.hf_norm_type,
                 using_spec_norm=config.hf_using_spec_norm,
                 norm_eps=config.hf_norm_eps,
-                input_size=config.hf_input_size,
+                batch_size=config.backbone_batch_size,
+                backbone_dtype={
+                    "float32": torch.float32,
+                    "bfloat16": torch.bfloat16,
+                }[config.backbone_dtype],
             )
             self._is_hf_model = True
         else:
@@ -160,18 +172,6 @@ class RAEFeatureDiscriminator(nn.Module):
         assert self._heads is not None
         return self._heads
 
-    @property
-    def input_canvas_size(self) -> int | None:
-        """Fixed square canvas of the HF backbone; None for free-form backbones."""
-        return self.backbone.input_size if self._is_hf_model else None
-
-    @property
-    def canvas_patch_size(self) -> int:
-        """Patch grid unit used when letterboxing onto the canvas."""
-        if self._is_hf_model:
-            return self.backbone.patch_size
-        return 1
-
     def set_head_requires_grad(self, enabled: bool) -> None:
         if self._is_hf_model:
             self.backbone.set_head_requires_grad(enabled)
@@ -189,53 +189,91 @@ class RAEFeatureDiscriminator(nn.Module):
         if self._is_hf_model:
             self.backbone.compile_forward(backend=backend)
 
-    def forward(
-        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
+    def feature_distance(
+        self,
+        real_items: Sequence[torch.Tensor],
+        fake_items: Sequence[torch.Tensor],
     ) -> torch.Tensor:
+        """Mean multi-depth backbone feature distance, uncalibrated.
+
+        Logging-only LPIPS-style perceptual metric over paired [-1, 1] CHW
+        lists: per image, the mean absolute activation difference at each
+        probed depth, averaged over depths, then averaged over images.
+        """
+        if len(real_items) != len(fake_items) or not real_items:
+            raise ValueError("feature_distance expects paired non-empty lists")
+        if self._is_hf_model:
+            real = [(image + 1.0) * 0.5 for image in real_items]
+            fake = [(image + 1.0) * 0.5 for image in fake_items]
+            real_features = self.backbone.features(real)
+            fake_features = self.backbone.features(fake)
+            # The diff accumulates in fp32 so the logged metric keeps the
+            # same precision whether the backbone computes in fp32 or bf16.
+            per_image = [
+                torch.stack(
+                    [
+                        (fake_depth.float() - real_depth.float()).abs().mean()
+                        for fake_depth, real_depth in zip(
+                            fake_depths, real_depths, strict=True
+                        )
+                    ]
+                ).mean()
+                for fake_depths, real_depths in zip(
+                    fake_features, real_features, strict=True
+                )
+            ]
+            return torch.stack(per_image).mean()
+        return grouped_per_image_loss(
+            self.backbone.features,
+            self.backbone.distance,
+            list(real_items),
+            list(fake_items),
+        ).mean()
+
+    def _forward_fixed_batch(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+        """Per-patch logits (B, H, L) for the fixed feature pyramid."""
+        features = self.backbone(images_BCHW)
+        # Pyramid levels shrink by stride 2; pool each head's per-patch logits
+        # to the coarsest grid so the heads stack into one (B, H, L) tensor.
+        min_tokens = min(feature.shape[-1] for feature in features)
+        return torch.cat(
+            [
+                F.adaptive_avg_pool1d(head(feature), min_tokens)
+                for head, feature in zip(self.heads, features, strict=True)
+            ],
+            dim=1,
+        )
+
+    def forward(self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]) -> Logits:
         if self._is_hf_model:
             if isinstance(images_BCHW, torch.Tensor):
                 images = (images_BCHW + 1.0) * 0.5
             else:
                 images = [(image + 1.0) * 0.5 for image in images_BCHW]
-            return torch.cat(
-                [
-                    self.backbone(images[start : start + self.backbone_batch_size])
-                    for start in range(0, len(images), self.backbone_batch_size)
-                ],
-                dim=0,
-            )
+            return self.backbone(images)
         if isinstance(images_BCHW, torch.Tensor):
             if images_BCHW.ndim != 4:
                 raise ValueError("Fixed RAE discriminator expects BCHW images")
-            image_items = list(images_BCHW.unbind(0))
-        else:
-            image_items = list(images_BCHW)
+            return self._forward_fixed_batch(images_BCHW)
+        image_items = list(images_BCHW)
         if not image_items:
             raise ValueError("RAE discriminator requires at least one image")
-        outputs = []
         for image_CHW in image_items:
             if image_CHW.ndim != 3 or image_CHW.shape[0] != 3:
                 raise ValueError("RAE discriminator expects three-channel CHW images")
-            features = self.backbone(image_CHW.unsqueeze(0))
-            logits = [
-                head(feature).mean(dim=-1).squeeze(0)
-                for head, feature in zip(self.heads, features, strict=True)
-            ]
-            outputs.append(torch.cat(logits, dim=0))
-        return torch.stack(outputs)
-
-    def forward_fixed(self, images_BCHW: torch.Tensor) -> torch.Tensor:
-        """Evaluate a fixed BCHW batch without list or shape-grouping logic."""
-        if images_BCHW.ndim != 4 or images_BCHW.shape[1] != 3:
-            raise ValueError("RAE discriminator fixed path expects BCHW RGB images")
-        if self._is_hf_model:
-            return self.backbone.forward_fixed((images_BCHW + 1.0) * 0.5)
-        features = self.backbone(images_BCHW)
-        logits = [
-            head(feature).mean(dim=-1)
-            for head, feature in zip(self.heads, features, strict=True)
-        ]
-        return torch.cat(logits, dim=1)
+        outputs: list[torch.Tensor | None] = [None] * len(image_items)
+        groups: dict[tuple[int, int], list[int]] = {}
+        for index, image_CHW in enumerate(image_items):
+            groups.setdefault(tuple(image_CHW.shape[-2:]), []).append(index)
+        for indices in groups.values():
+            logits_BHL = self._forward_fixed_batch(
+                torch.stack([image_items[index] for index in indices])
+            )
+            for group_index, image_index in enumerate(indices):
+                outputs[image_index] = logits_BHL[group_index]
+        if any(output is None for output in outputs):
+            raise RuntimeError("RAE discriminator did not produce every output")
+        return outputs  # type: ignore[return-value]
 
 
 class RAEPerceptualLoss(nn.Module):
@@ -316,29 +354,64 @@ class RAEPerceptualLoss(nn.Module):
         )
 
 
-def gan_generator_loss(logits_fake: torch.Tensor, loss_type: str) -> torch.Tensor:
+def _image_weighted_mean(
+    logits: Logits, per_patch_fn: Callable[[torch.Tensor], torch.Tensor]
+) -> torch.Tensor:
+    """Mean of per-patch penalties, weighted per image rather than per token.
+
+    Averaging within each image first keeps the loss scale independent of the
+    (variable) patch-token count of every image.
+    """
+    if isinstance(logits, torch.Tensor):
+        return per_patch_fn(logits).flatten(1).mean(dim=1).mean()
+    return torch.stack(
+        [per_patch_fn(image_logits).mean() for image_logits in logits]
+    ).mean()
+
+
+def gan_generator_loss(logits_fake: Logits, loss_type: str) -> torch.Tensor:
     if loss_type == "hinge":
-        return -logits_fake.mean()
+        return _image_weighted_mean(logits_fake, lambda logits: -logits)
     if loss_type == "vanilla":
-        return -logits_fake.mean()
+        # Non-saturating BCE generator loss: -log D(fake). Unlike the hinge
+        # form, its per-patch logit gradient (sigmoid(logit) - 1) vanishes
+        # once the generator is winning, instead of pushing without bound.
+        return _image_weighted_mean(logits_fake, lambda logits: F.softplus(-logits))
     raise ValueError(f"Unsupported generator GAN loss: {loss_type}")
 
 
 def gan_discriminator_loss(
-    logits_real: torch.Tensor, logits_fake: torch.Tensor, loss_type: str
+    logits_real: Logits, logits_fake: Logits, loss_type: str
 ) -> torch.Tensor:
     if loss_type == "hinge":
         return 0.5 * (
-            F.relu(1.0 - logits_real).mean() + F.relu(1.0 + logits_fake).mean()
+            _image_weighted_mean(logits_real, lambda logits: F.relu(1.0 - logits))
+            + _image_weighted_mean(logits_fake, lambda logits: F.relu(1.0 + logits))
         )
     if loss_type == "vanilla":
-        return 0.5 * (F.softplus(-logits_real).mean() + F.softplus(logits_fake).mean())
+        return 0.5 * (
+            _image_weighted_mean(logits_real, lambda logits: F.softplus(-logits))
+            + _image_weighted_mean(logits_fake, F.softplus)
+        )
     raise ValueError(f"Unsupported discriminator GAN loss: {loss_type}")
+
+
+def gan_logits_per_image(logits: Logits) -> torch.Tensor:
+    """Per-image mean logit (over heads and patch tokens), shape (B,)."""
+    if isinstance(logits, torch.Tensor):
+        return logits.flatten(1).mean(dim=1)
+    return torch.stack([image_logits.mean() for image_logits in logits])
+
+
+def gan_logits_mean(logits: Logits) -> torch.Tensor:
+    return gan_logits_per_image(logits).mean()
 
 
 __all__ = [
     "RAEFeatureDiscriminator",
     "RAEPerceptualLoss",
-    "gan_generator_loss",
     "gan_discriminator_loss",
+    "gan_generator_loss",
+    "gan_logits_mean",
+    "gan_logits_per_image",
 ]

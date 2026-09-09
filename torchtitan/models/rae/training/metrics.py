@@ -27,8 +27,8 @@ def log_stage1_metrics(
 ) -> None:
     """Log the scalar metrics emitted by one RAE Stage 1 update."""
     values = [float(loss.detach().item()) for loss in losses]
-    if len(values) != 11:
-        raise ValueError(f"RAE Stage 1 metrics require 11 values, got {len(values)}")
+    if len(values) != 12:
+        raise ValueError(f"RAE Stage 1 metrics require 12 values, got {len(values)}")
     if metrics_processor is not None:
         extra_metrics: dict[str, float] = {
             "rae/reconstruction_loss": values[0],
@@ -42,6 +42,7 @@ def log_stage1_metrics(
             "rae/discriminator_real_logit": values[8],
             "rae/discriminator_fake_logit": values[9],
             "rae/discriminator_accuracy": values[10],
+            "rae/dino_feature_distance": values[11],
             "rae/non_padding_ratio": non_padding_ratio,
             "rae/num_images_per_step": num_images_per_step,
         }
@@ -62,7 +63,7 @@ def log_stage1_metrics(
             "[RAE Stage 1 | step %d] recon=%.5f perceptual=%.5f "
             "gan=%.5f disc=%.5f adaptive=%.5f decoder_grad=%.5f "
             "disc_grad=%.5f gen_logit=%.5f real_logit=%.5f fake_logit=%.5f "
-            "disc_acc=%.5f non_padding=%.5f images_per_step=%.2f%s",
+            "disc_acc=%.5f dino_dist=%.5f non_padding=%.5f images_per_step=%.2f%s",
             step,
             *values,
             non_padding_ratio,

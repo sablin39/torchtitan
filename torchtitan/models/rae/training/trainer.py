@@ -34,13 +34,14 @@ from ..decoder import create_rae_static_varlen_metadata
 from ..discriminator import (
     gan_discriminator_loss,
     gan_generator_loss,
+    gan_logits_mean,
+    gan_logits_per_image,
     RAEFeatureDiscriminator,
     RAEPerceptualLoss,
 )
 from ..encoder import FrozenRAEEncoder, RAEEncoderConfig
 
 from .augmentation import DiscriminatorAugmentation
-from .graphs import RAEDiscriminatorGraph
 from .metrics import log_stage1_metrics
 from .validation import RAEValidator
 
@@ -143,12 +144,18 @@ class RAEGANConfig:
     discriminator_update_start_fraction: float = 0.375
     perceptual_start_step: int = 0
     discriminator_weight: float = 0.75
+    discriminator_weight_ramp_steps: int = 0
+    """Steps over which the generator-side GAN weight ramps linearly from 0
+    to ``discriminator_weight`` after the adversarial phase starts. The
+    discriminator has already converged by then, so a full-weight first step
+    spikes the generator gradient; 0 keeps RAEv2's step-function onset."""
     perceptual_weight: float = 1.0
     discriminator_updates: int = 1
-    discriminator_chunk_size: int = 128
-    """Fixed image count per discriminator update chunk. The CUDA graph is
-    captured once at this shape, so the update's private memory pool is bounded
-    independently of how many images a packed step contains."""
+    discriminator_update_batch_size: int = 256
+    """Images per backward in one discriminator update. A packed step holds
+    ~1000 native-resolution images; backward over all of them at once retains
+    the whole backbone/head activation graph and OOMs, so the update chunks
+    the image list and weights each chunk's mean loss by its image count."""
     generator_loss: str = "vanilla"
     discriminator_loss: str = "hinge"
     max_adaptive_weight: float = 10000.0
@@ -171,8 +178,10 @@ class RAEGANConfig:
     def __post_init__(self) -> None:
         if self.discriminator_updates <= 0:
             raise ValueError("gan.discriminator_updates must be positive")
-        if self.discriminator_chunk_size <= 0:
-            raise ValueError("gan.discriminator_chunk_size must be positive")
+        if self.discriminator_weight_ramp_steps < 0:
+            raise ValueError("gan.discriminator_weight_ramp_steps must be non-negative")
+        if self.discriminator_update_batch_size <= 0:
+            raise ValueError("gan.discriminator_update_batch_size must be positive")
         if self.discriminator_weight < 0 or self.perceptual_weight < 0:
             raise ValueError("GAN and perceptual weights must be non-negative")
         if not 0.0 <= self.ema_decay < 1.0:
@@ -358,9 +367,6 @@ class RAEStage1Trainer(Trainer):
                 "decoder static_sequence_length"
             )
         self._static_sequence_length = static_sequence_length
-        self._adaptive_weight_enabled = not any(
-            hasattr(optimizer, "_dedicated_params") for optimizer in self.optimizers
-        )
         self.encoder = FrozenRAEEncoder(config.encoder, self.device)
         if (
             decoder.image_size != -1
@@ -375,16 +381,12 @@ class RAEStage1Trainer(Trainer):
             config.discriminator,
             device=self.device,
         ).to(self.device)
-        self._cuda_graphs_enabled = (
-            not config.training.disable_cuda_graphs and self.device.type == "cuda"
-        )
         if config.compile.enable and "discriminator" in config.compile.components:
             self.discriminator.compile_forward(backend=config.compile.backend)
         if (
             dist.is_available()
             and dist.is_initialized()
             and self.parallel_dims.dp_enabled
-            and not self._cuda_graphs_enabled
         ):
             ddp_kwargs = {}
             if self.device.type == "cuda":
@@ -413,39 +415,59 @@ class RAEStage1Trainer(Trainer):
             config.compile.enable
             and "discriminator" in config.compile.components
             and config.gan.discriminator_weight > 0
+            and config.discriminator.backbone_kind == "hf"
         ):
-            canvas = self.discriminator.input_canvas_size
-            if canvas is not None:
-                # Warm the generator-side compiled path during initialization
-                # (covered by the init timeout): the first GAN step would
-                # otherwise compile mid-run, and slow per-rank compilation can
-                # stall the DP collectives. The warmup must replicate the
-                # runtime guards (eval mode, frozen head, bf16 autocast,
-                # grad-enabled chunk of gan.discriminator_chunk_size rows) or
-                # dynamo compiles a separate variant and the warmup is wasted.
-                autocast_bf16 = (
-                    self.device.type == "cuda" and config.training.dtype == "bfloat16"
-                )
-                dummy_BCHW = torch.zeros(
-                    config.gan.discriminator_chunk_size,
+            # Warm both autograd variants of the compiled discriminator during
+            # initialization (covered by the init timeout): the first GAN step
+            # would otherwise compile mid-run, and slow per-rank compilation
+            # can stall the DP collectives. The warmups must replicate the
+            # runtime guards (frozen vs trainable heads, bf16 autocast,
+            # grad-enabled generator-side inputs, CHW list input) or dynamo
+            # compiles separate variants and the warmup is wasted. The forward
+            # is compiled with dynamic shapes, so one warmup per variant
+            # covers the native resolutions seen at runtime.
+            autocast_bf16 = (
+                self.device.type == "cuda" and config.training.dtype == "bfloat16"
+            )
+            dummy_items = [
+                torch.zeros(
                     3,
-                    canvas,
-                    canvas,
+                    256,
+                    256,
                     device=self.device,
                     dtype=torch.bfloat16 if autocast_bf16 else torch.float32,
-                    requires_grad=True,
                 )
-                self.discriminator.eval()
-                self.discriminator.set_head_requires_grad(False)
-                with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=torch.bfloat16,
-                    enabled=autocast_bf16,
-                ):
-                    self.discriminator(self.discriminator_augmentation(dummy_BCHW))
-                self.discriminator.set_head_requires_grad(True)
-        self._discriminator_graphs: dict[tuple[int, ...], RAEDiscriminatorGraph] = {}
-        self._graph_failures: set[tuple[str, tuple[Any, ...]]] = set()
+                for _ in range(config.discriminator.backbone_batch_size)
+            ]
+            # Generator-side variant: frozen heads, grad-enabled inputs,
+            # forward+backward (the backward compiles the backbone's gradient
+            # graph, which the first GAN step would otherwise build mid-run).
+            self.discriminator.eval()
+            self.discriminator.set_head_requires_grad(False)
+            generator_dummies = [item.requires_grad_(True) for item in dummy_items]
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.bfloat16,
+                enabled=autocast_bf16,
+            ):
+                generator_logits = self.discriminator(
+                    self._augment_images(generator_dummies)
+                )
+            torch.stack([logits.sum() for logits in generator_logits]).sum().backward()
+            # Discriminator-side variant: trainable heads, forward+backward.
+            self.discriminator.set_head_requires_grad(True)
+            self.discriminator.train()
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.bfloat16,
+                enabled=autocast_bf16,
+            ):
+                warmup_logits = self.discriminator(self._augment_images(dummy_items))
+            torch.stack([logits.sum() for logits in warmup_logits]).sum().backward()
+            self.discriminator.zero_grad(set_to_none=True)
+            self.discriminator.eval()
+            self.discriminator.set_head_requires_grad(False)
+
         if config.epochs is not None and config.epochs <= 0:
             raise ValueError(f"epochs must be positive, got {config.epochs}")
         self._phase_profiler = _PhaseProfiler(
@@ -473,10 +495,7 @@ class RAEStage1Trainer(Trainer):
         self._last_seen_epoch = 0
         self._tokens_last_epoch: int | None = None
         self._warned_epoch_tracking_missing = False
-        if self._cuda_graphs_enabled:
-            canvas = self.discriminator.input_canvas_size
-            if canvas is not None:
-                self._precapture_discriminator_graph(canvas)
+        self._warned_adaptive_weight_unavailable = False
         self.disc_optimizer = torch.optim.AdamW(
             self.discriminator.parameters(),
             lr=config.gan.discriminator_lr,
@@ -923,259 +942,6 @@ class RAEStage1Trainer(Trainer):
             real_items, fake_items
         ).mean()
 
-    def _stack_canvas_images(self, images: list[torch.Tensor]) -> torch.Tensor | None:
-        """Letterbox [-1, 1] CHW images onto the discriminator's square canvas.
-
-        A fixed (B, 3, canvas, canvas) stack lets the compiled backbone and the
-        CUDA-graph discriminator path run every microbatch regardless of the
-        native resolutions in the batch. Returns None for backbones without a
-        fixed canvas.
-        """
-        canvas = self.discriminator.input_canvas_size
-        if canvas is None or not images:
-            return None
-        if any(image.ndim != 3 or image.shape[0] != 3 for image in images):
-            return None
-        patch = self.discriminator.canvas_patch_size
-        letterboxed = []
-        for image in images:
-            height, width = image.shape[-2:]
-            if (height, width) == (canvas, canvas):
-                letterboxed.append(image)
-                continue
-            scale = min(canvas / height, canvas / width)
-            target_height = max(
-                patch, min(canvas, int(height * scale) // patch * patch)
-            )
-            target_width = max(patch, min(canvas, int(width * scale) // patch * patch))
-            resized = F.interpolate(
-                image.unsqueeze(0),
-                size=(target_height, target_width),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0)
-            canvas_image = image.new_zeros(3, canvas, canvas)
-            top = (canvas - target_height) // 2
-            left = (canvas - target_width) // 2
-            canvas_image[
-                :, top : top + target_height, left : left + target_width
-            ] = resized
-            letterboxed.append(canvas_image)
-        return torch.stack(letterboxed)
-
-    def _discriminator_generator_logits(
-        self, images_BCHW: torch.Tensor
-    ) -> torch.Tensor:
-        """Generator-side discriminator logits over fixed-shape chunks.
-
-        The compiled backbone re-specializes on batch size, and a mid-training
-        recompile stalls one rank for tens of seconds while its DP peers wait
-        in the gradient collective. Chunking to gan.discriminator_chunk_size
-        keeps a single compiled shape, matching the discriminator-update path.
-        Padded rows are sliced off the concatenated logits.
-        """
-        chunk_size = self.config.gan.discriminator_chunk_size
-        num_images = images_BCHW.shape[0]
-        logit_chunks = []
-        for start in range(0, num_images, chunk_size):
-            valid = min(chunk_size, num_images - start)
-            chunk, _ = self._pad_to_bucket(
-                images_BCHW[start : start + chunk_size], chunk_size
-            )
-            logits = self.discriminator_train(self.discriminator_augmentation(chunk))
-            logit_chunks.append(logits[:valid])
-        return torch.cat(logit_chunks)
-
-    @staticmethod
-    def _pad_to_bucket(
-        images_BCHW: torch.Tensor, bucket: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pad a stacked batch up to a bucket multiple with zero images."""
-        batch = images_BCHW.shape[0]
-        target = ((batch + bucket - 1) // bucket) * bucket
-        mask = images_BCHW.new_zeros(target, dtype=torch.float32)
-        mask[:batch] = 1.0
-        if target == batch:
-            return images_BCHW, mask
-        padding = images_BCHW.new_zeros(target - batch, *images_BCHW.shape[1:])
-        return torch.cat([images_BCHW, padding], dim=0), mask
-
-    def _get_discriminator_graph(
-        self, shape: tuple[int, ...]
-    ) -> RAEDiscriminatorGraph | None:
-        if not self._cuda_graphs_enabled:
-            return None
-        if ("discriminator", shape) in self._graph_failures:
-            return None
-        graph = self._discriminator_graphs.get(shape)
-        if graph is None:
-            if len(self._discriminator_graphs) >= 32:
-                # Bound graph capture cost when bucket shapes proliferate.
-                return None
-            graph = RAEDiscriminatorGraph(
-                self.discriminator,
-                self.discriminator_augmentation,
-                discriminator_loss=self.config.gan.discriminator_loss,
-                autocast_dtype=(
-                    torch.bfloat16 if self.config.training.dtype == "bfloat16" else None
-                ),
-            )
-            self._discriminator_graphs[shape] = graph
-        return graph
-
-    def _precapture_discriminator_graph(self, canvas: int) -> None:
-        """Capture the discriminator CUDA graph at init with dummy inputs.
-
-        Allocates the GAN-phase graph pool up front: a capture-time OOM fails
-        at startup instead of mid-run at the GAN phase boundary, and the phase
-        transition does not stall collectives on capture. Dummy dtypes mirror
-        the runtime pipeline (bf16 canvas stacks under bf16 training).
-        """
-        chunk_size = self.config.gan.discriminator_chunk_size
-        dtype = (
-            torch.bfloat16
-            if self.config.training.dtype == "bfloat16"
-            else torch.float32
-        )
-        dummy_BCHW = torch.zeros(
-            chunk_size, 3, canvas, canvas, device=self.device, dtype=dtype
-        )
-        result = self._run_discriminator_graph(dummy_BCHW, dummy_BCHW)
-        self._zero_discriminator_gradients()
-        if result is None:
-            logger.warning(
-                "RAE discriminator graph pre-capture failed; the GAN phase "
-                "will fall back to the eager discriminator update"
-            )
-
-    def _run_discriminator_graph(
-        self,
-        fake_BCHW: torch.Tensor,
-        real_BCHW: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Chunked discriminator update through one fixed-shape CUDA graph.
-
-        Every chunk is padded to ``gan.discriminator_chunk_size`` and replayed
-        through the same graph, so a step with ~1000 images holds a single
-        private memory pool instead of one giant (or many per-batch) captures.
-        Gradients accumulate as masked sums across chunks and are divided by
-        the total valid count once, matching the eager path's mean reduction.
-        Returns normalized (loss, real_logits, fake_logits, accuracy), or None
-        when capture/replay fails (the caller then falls back to eager).
-        """
-        chunk_size = self.config.gan.discriminator_chunk_size
-        chunk_shape = (chunk_size, *fake_BCHW.shape[1:])
-        if ("discriminator", chunk_shape) in self._graph_failures:
-            return None
-        graph = self._get_discriminator_graph(chunk_shape)
-        if graph is None:
-            return None
-        sums = [
-            torch.zeros((), device=fake_BCHW.device, dtype=torch.float32)
-            for _ in range(4)
-        ]
-        count = torch.zeros((), device=fake_BCHW.device, dtype=torch.float32)
-        try:
-            for start in range(0, fake_BCHW.shape[0], chunk_size):
-                fake_chunk, valid_mask_B = self._pad_to_bucket(
-                    fake_BCHW[start : start + chunk_size], chunk_size
-                )
-                real_chunk, _ = self._pad_to_bucket(
-                    real_BCHW[start : start + chunk_size], chunk_size
-                )
-                output = graph(fake_chunk, real_chunk, valid_mask_B)
-                sums[0] += output.loss_sum
-                sums[1] += output.real_logits_sum
-                sums[2] += output.fake_logits_sum
-                sums[3] += output.accuracy_sum
-                count += output.valid_count
-        except Exception as error:
-            # A failed chunk may have left partially accumulated gradients;
-            # drop them so the eager fallback starts from a clean state.
-            self._graph_failures.add(("discriminator", chunk_shape))
-            self._zero_discriminator_gradients()
-            logger.warning(
-                "RAE discriminator CUDA graph unavailable for shape %s; "
-                "falling back to eager loss (%s)",
-                chunk_shape,
-                error,
-            )
-            return None
-        normalizer = count.clamp_min(1.0)
-        for parameter in self.discriminator.parameters():
-            if parameter.grad is not None:
-                parameter.grad.div_(normalizer)
-        return tuple(total / normalizer for total in sums)  # type: ignore[return-value]
-
-    def _update_discriminator_fixed_eager(
-        self,
-        fake_BCHW: torch.Tensor,
-        real_BCHW: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Eager chunked discriminator update over fixed-canvas images.
-
-        Each chunk's mean loss is weighted by its image count, so accumulated
-        gradients match a single full-batch masked mean while peak memory stays
-        bounded by the chunk size.
-        """
-        chunk_size = self.config.gan.discriminator_chunk_size
-        num_images = fake_BCHW.shape[0]
-        loss_sum = torch.zeros((), device=fake_BCHW.device, dtype=torch.float32)
-        real_sum = torch.zeros((), device=fake_BCHW.device, dtype=torch.float32)
-        fake_sum = torch.zeros((), device=fake_BCHW.device, dtype=torch.float32)
-        accuracy_sum = torch.zeros((), device=fake_BCHW.device, dtype=torch.float32)
-        for start in range(0, num_images, chunk_size):
-            fake_chunk = fake_BCHW[start : start + chunk_size]
-            real_chunk = real_BCHW[start : start + chunk_size]
-            num_chunk = fake_chunk.shape[0]
-            logits_fake = self.discriminator_train(
-                self.discriminator_augmentation(fake_chunk)
-            )
-            logits_real = self.discriminator_train(
-                self.discriminator_augmentation(real_chunk)
-            )
-            chunk_loss = gan_discriminator_loss(
-                logits_real, logits_fake, self.config.gan.discriminator_loss
-            )
-            (chunk_loss * (num_chunk / num_images)).backward()
-            loss_sum += chunk_loss.detach() * num_chunk
-            real_sum += logits_real.mean(dim=-1).detach().sum()
-            fake_sum += logits_fake.mean(dim=-1).detach().sum()
-            accuracy_sum += (
-                (logits_real.mean(dim=-1) > logits_fake.mean(dim=-1))
-                .float()
-                .detach()
-                .sum()
-            )
-        return (
-            loss_sum / num_images,
-            real_sum / num_images,
-            fake_sum / num_images,
-            accuracy_sum / num_images,
-        )
-
-    def _zero_discriminator_gradients(self) -> None:
-        if self._discriminator_graphs:
-            for parameter in self.discriminator.parameters():
-                if parameter.grad is not None:
-                    parameter.grad.zero_()
-        else:
-            self.disc_optimizer.zero_grad(set_to_none=True)
-
-    def _sync_discriminator_gradients(self) -> None:
-        if not dist.is_available() or not dist.is_initialized():
-            return
-        if not self.parallel_dims.dp_enabled:
-            return
-        batch_mesh = self.parallel_dims.get_mesh("batch")
-        if batch_mesh.size() == 1:
-            return
-        group = batch_mesh.get_group()
-        for parameter in self.discriminator.parameters():
-            if parameter.grad is not None:
-                dist.all_reduce(parameter.grad, group=group)
-                parameter.grad.div_(batch_mesh.size())
-
     def _augment_images(self, images: list[torch.Tensor]) -> list[torch.Tensor]:
         grouped: dict[tuple[int, int], list[int]] = {}
         for index, image in enumerate(images):
@@ -1187,6 +953,40 @@ class RAEStage1Trainer(Trainer):
             for group_index, image_index in enumerate(indices):
                 augmented[image_index] = group[group_index]
         return augmented
+
+    def _update_discriminator(
+        self,
+        fake_normed_items: list[torch.Tensor],
+        real_normed_items: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Chunked discriminator update over native-resolution image lists.
+
+        Each chunk's mean loss is weighted by its image count, so accumulated
+        gradients match a single full-batch mean while peak activation memory
+        stays bounded by gan.discriminator_update_batch_size. Returns
+        (loss, real_logits, fake_logits, accuracy) batch means.
+        """
+        num_images = len(fake_normed_items)
+        batch_size = self.config.gan.discriminator_update_batch_size
+        sums = [
+            torch.zeros((), device=self.device, dtype=torch.float32) for _ in range(4)
+        ]
+        for start in range(0, num_images, batch_size):
+            fake_chunk = fake_normed_items[start : start + batch_size]
+            real_chunk = real_normed_items[start : start + batch_size]
+            logits_fake = self.discriminator_train(self._augment_images(fake_chunk))
+            logits_real = self.discriminator_train(self._augment_images(real_chunk))
+            real_per_image = gan_logits_per_image(logits_real).detach()
+            fake_per_image = gan_logits_per_image(logits_fake).detach()
+            chunk_loss = gan_discriminator_loss(
+                logits_real, logits_fake, self.config.gan.discriminator_loss
+            )
+            (chunk_loss * (len(fake_chunk) / num_images)).backward()
+            sums[0] += chunk_loss.detach().float() * len(fake_chunk)
+            sums[1] += real_per_image.float().sum()
+            sums[2] += fake_per_image.float().sum()
+            sums[3] += (real_per_image > fake_per_image).float().sum()
+        return tuple(total / num_images for total in sums)  # type: ignore[return-value]
 
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -1221,6 +1021,15 @@ class RAEStage1Trainer(Trainer):
             step >= gan.discriminator_update_start(total_steps)
             and gan.discriminator_weight > 0
         )
+        gan_weight = gan.discriminator_weight
+        if use_gan and gan.discriminator_weight_ramp_steps > 0:
+            # Soften the GAN onset: the discriminator has already converged
+            # when the adversarial term starts, so a full-weight step-one
+            # gradient spike can knock the decoder out of its basin.
+            ramp_progress = (step - gan.discriminator_start(total_steps) + 1) / (
+                gan.discriminator_weight_ramp_steps
+            )
+            gan_weight *= min(ramp_progress, 1.0)
         use_perceptual = step >= gan.perceptual_start_step and gan.perceptual_weight > 0
         num_microbatches = self.gradient_accumulation_steps
         images_batches: list[ImageBatch] = []
@@ -1229,7 +1038,7 @@ class RAEStage1Trainer(Trainer):
         ] = []
 
         self.optimizers.zero_grad(set_to_none=True)
-        self._zero_discriminator_gradients()
+        self.disc_optimizer.zero_grad(set_to_none=True)
         self.discriminator.eval()
         self.discriminator.set_head_requires_grad(False)
         reconstruction_metric = perceptual_metric = adversarial_metric = None
@@ -1302,43 +1111,38 @@ class RAEStage1Trainer(Trainer):
                 )
                 if use_gan:
                     with self._phase_profiler.phase("gan"):
-                        fake_canvas_BCHW = self._stack_canvas_images(
+                        fake_augmented = self._augment_images(
                             [
                                 reconstruction * 2.0 - 1.0
                                 for reconstruction in recon_items
                             ]
                         )
-                        if fake_canvas_BCHW is not None:
-                            logits_fake = self._discriminator_generator_logits(
-                                fake_canvas_BCHW
-                            )
-                        else:
-                            fake_augmented = self._augment_images(
-                                [
-                                    reconstruction * 2.0 - 1.0
-                                    for reconstruction in recon_items
-                                ]
-                            )
-                            logits_fake = self.discriminator_train(fake_augmented)
-                        generator_logits_metric = logits_fake.detach().mean()
+                        logits_fake = self.discriminator_train(fake_augmented)
+                        generator_logits_metric = gan_logits_mean(logits_fake).detach()
                         adversarial_loss = gan_generator_loss(
                             logits_fake, gan.generator_loss
                         )
-                        adaptive_weight = (
-                            self._adaptive_weight(
+                        with self._dmuon_reduce_suppressed():
+                            adaptive_weight = self._adaptive_weight(
                                 reconstruction_total,
                                 adversarial_loss,
                                 decoder.decoder_pred.weight,
                                 gan.max_adaptive_weight,
                             )
-                            if self._adaptive_weight_enabled
-                            else reconstruction_loss.new_ones(())
-                        )
+                        if adaptive_weight is None:
+                            # A None gradient probe would silently disable the
+                            # GAN term; fall back to zero and surface it once.
+                            adaptive_weight = reconstruction_loss.new_zeros(())
+                            if not self._warned_adaptive_weight_unavailable:
+                                logger.warning(
+                                    "RAE adaptive weight probe returned no "
+                                    "gradient for decoder_pred.weight; the GAN "
+                                    "term is scaled by 0 until this resolves"
+                                )
+                                self._warned_adaptive_weight_unavailable = True
                         total_loss = (
                             reconstruction_total
-                            + gan.discriminator_weight
-                            * adaptive_weight
-                            * adversarial_loss
+                            + gan_weight * adaptive_weight * adversarial_loss
                         )
                 else:
                     adversarial_loss = reconstruction_loss.new_zeros(())
@@ -1381,6 +1185,7 @@ class RAEStage1Trainer(Trainer):
             ()
         )
         discriminator_accuracy_metric = metric_source.new_zeros(())
+        dino_distance_metric = metric_source.new_zeros(())
         if train_discriminator:
             self._phase_profiler.start("disc")
             self.discriminator.set_head_requires_grad(True)
@@ -1390,8 +1195,8 @@ class RAEStage1Trainer(Trainer):
             # discriminator sees deterministic decodes.
             decoder_was_training = decoder.training
             decoder.eval()
-            for _ in range(gan.discriminator_updates):
-                self._zero_discriminator_gradients()
+            for update_index in range(gan.discriminator_updates):
+                self.disc_optimizer.zero_grad(set_to_none=True)
                 with torch.no_grad(), torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.bfloat16,
@@ -1421,45 +1226,25 @@ class RAEStage1Trainer(Trainer):
                     for fake in fake_normed_items
                 ]
                 real_normed_items = [real * 2.0 - 1.0 for real in real_items]
-                fake_BCHW = self._stack_canvas_images(fake_normed_items)
-                real_BCHW = self._stack_canvas_images(real_normed_items)
-                if fake_BCHW is not None and real_BCHW is not None:
-                    fixed_output = None
-                    if self._cuda_graphs_enabled:
-                        fixed_output = self._run_discriminator_graph(
-                            fake_BCHW, real_BCHW
+                (
+                    disc_loss,
+                    discriminator_real_metric,
+                    discriminator_fake_metric,
+                    discriminator_accuracy_metric,
+                ) = self._update_discriminator(fake_normed_items, real_normed_items)
+                if update_index == 0:
+                    # Logging-only DINO feature distance (uncalibrated
+                    # LPIPS-style metric) on a 16-pair subsample. Eager and
+                    # no-gradient; costs one small backbone forward per step.
+                    with torch.no_grad(), torch.autocast(
+                        device_type=self.device.type,
+                        dtype=torch.bfloat16,
+                        enabled=self.device.type == "cuda"
+                        and self.config.training.dtype == "bfloat16",
+                    ):
+                        dino_distance_metric = self.discriminator.feature_distance(
+                            real_normed_items[:16], fake_normed_items[:16]
                         )
-                    if fixed_output is None:
-                        fixed_output = self._update_discriminator_fixed_eager(
-                            fake_BCHW, real_BCHW
-                        )
-                    (
-                        disc_loss,
-                        discriminator_real_metric,
-                        discriminator_fake_metric,
-                        discriminator_accuracy_metric,
-                    ) = fixed_output
-                else:
-                    logits_fake = self.discriminator_train(
-                        self._augment_images(fake_normed_items)
-                    )
-                    logits_real = self.discriminator_train(
-                        self._augment_images(real_normed_items)
-                    )
-                    discriminator_fake_metric = logits_fake.detach().mean()
-                    discriminator_real_metric = logits_real.detach().mean()
-                    discriminator_accuracy_metric = (
-                        (logits_real.mean(dim=-1) > logits_fake.mean(dim=-1))
-                        .float()
-                        .mean()
-                        .detach()
-                    )
-                    disc_loss = gan_discriminator_loss(
-                        logits_real, logits_fake, gan.discriminator_loss
-                    )
-                    disc_loss.backward()
-                if self._cuda_graphs_enabled:
-                    self._sync_discriminator_gradients()
                 disc_grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.discriminator.parameters(), self.config.training.max_norm
                 )
@@ -1506,6 +1291,7 @@ class RAEStage1Trainer(Trainer):
                     discriminator_real_metric,
                     discriminator_fake_metric,
                     discriminator_accuracy_metric,
+                    dino_distance_metric,
                 ),
                 metrics_processor=self.metrics_processor,
                 non_padding_ratio=non_padding_tokens / padding_capacity_tokens,
@@ -1576,13 +1362,30 @@ class RAEStage1Trainer(Trainer):
         self._last_seen_epoch = state_dict.get("rae_last_seen_epoch", 0)
         self._tokens_last_epoch = state_dict.get("rae_tokens_last_epoch")
 
+    @contextmanager
+    def _dmuon_reduce_suppressed(self) -> Generator[None]:
+        """Inert dmuon backward reduce hooks while autograd.grad probes run.
+
+        The adaptive-weight probe executes partial backward passes outside
+        the once-per-forward protocol dmuon's post-backward hooks assume.
+        """
+        decoder = self.model_parts[0]
+        if getattr(decoder, "_dmuon_enabled", False) and hasattr(
+            decoder, "_dedicated_comm_ctx"
+        ):
+            dmuon = load_dmuon()
+            with dmuon.suppress_grad_reduce(decoder):
+                yield
+        else:
+            yield
+
     @staticmethod
     def _adaptive_weight(
         reconstruction_loss: torch.Tensor,
         adversarial_loss: torch.Tensor,
         layer: torch.Tensor,
         max_weight: float,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         recon_grad = torch.autograd.grad(
             reconstruction_loss, layer, retain_graph=True, allow_unused=True
         )[0]
@@ -1590,7 +1393,7 @@ class RAEStage1Trainer(Trainer):
             adversarial_loss, layer, retain_graph=True, allow_unused=True
         )[0]
         if recon_grad is None or gan_grad is None:
-            return reconstruction_loss.new_zeros(())
+            return None
         return (
             (
                 torch.linalg.vector_norm(recon_grad)

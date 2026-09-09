@@ -6,8 +6,12 @@
 
 """Storage adapters for Grain datasets."""
 
+import fnmatch
 import glob
 import json
+import os
+import threading
+import time
 from array import array
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +23,7 @@ from datasets.distributed import split_dataset_by_node
 
 from torchtitan.components.data.types import DatasetIterationPolicy
 from torchtitan.config import Configurable
+from torchtitan.tools.logging import logger
 
 
 @runtime_checkable
@@ -152,6 +157,17 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
         instead of decoded PIL images (HF ``Image(decode=False)``). The row
         processor then owns decoding; this keeps multi-MB pixel payloads out of
         the trainer process when rows cross a process-pool boundary."""
+        readahead_mb: int = 0
+        """When > 0, spawn a daemon that preads this many MiB ahead of the
+        read position of every open local data file, keeping the page cache
+        warm for the streaming consumer. Helps local datasets on latency-bound
+        storage (e.g. USB-attached drives), where the kernel's small readahead
+        window caps per-stream throughput far below the device's aggregate
+        bandwidth."""
+        num_readahead_threads: int = 2
+        """Threads issuing readahead preads per open data file. Each thread
+        reads on its own fd because the kernel tracks readahead per open file
+        description, so threads sharing one fd serialize on a single window."""
 
         def __post_init__(self) -> None:
             duplicated = {"split", "name", "revision", "streaming"} & (
@@ -161,6 +177,13 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
                 raise ValueError(
                     "first-class Hugging Face fields repeated in kwargs: "
                     f"{sorted(duplicated)}"
+                )
+            if self.readahead_mb < 0:
+                raise ValueError(f"readahead_mb must be >= 0, got {self.readahead_mb}")
+            if self.readahead_mb > 0 and self.num_readahead_threads < 1:
+                raise ValueError(
+                    "num_readahead_threads must be >= 1 when readahead_mb > 0, "
+                    f"got {self.num_readahead_threads}"
                 )
 
     def __init__(
@@ -208,6 +231,26 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
         self._repeat = dataset_iteration_policy.repeat
         self._shuffle = dataset_iteration_policy.shuffle
         self._current_epoch = 0
+        self._readahead_warmer: _LocalFileReadaheadWarmer | None = None
+        if config.readahead_mb > 0:
+            patterns = _data_files_name_patterns(
+                config.load_dataset_kwargs.get("data_files")
+            )
+            local_match = any(
+                glob.glob(os.path.join(config.path, pattern)) for pattern in patterns
+            )
+            if not patterns or not local_match:
+                logger.warning(
+                    f"readahead_mb={config.readahead_mb} is set but the "
+                    f"data_files patterns match no local files under "
+                    f"{config.path!r}; readahead warming is disabled"
+                )
+            else:
+                self._readahead_warmer = _LocalFileReadaheadWarmer(
+                    file_name_patterns=patterns,
+                    window_bytes=config.readahead_mb * 2**20,
+                    num_threads=config.num_readahead_threads,
+                )
 
     @property
     def current_epoch(self) -> int:
@@ -226,6 +269,137 @@ class HuggingFaceStreamingSource(Configurable, grain.IterDataset):
             shuffle=self._shuffle,
             source=self,
         )
+
+
+_READAHEAD_IO_BYTES = 8 * 2**20
+# A tar stream is consumed strictly forward, so pages this far behind the read
+# position are never re-read; evicting them bounds the cache footprint.
+_READAHEAD_KEEP_BEHIND_BYTES = 512 * 2**20
+_READAHEAD_POLL_INTERVAL_S = 1.0
+
+
+def _data_files_name_patterns(data_files: Any) -> tuple[str, ...]:
+    """Flatten an HF ``data_files`` value into a tuple of glob patterns."""
+    if isinstance(data_files, str):
+        values: list[Any] = [data_files]
+    elif isinstance(data_files, dict):
+        values = [
+            value
+            for split_values in data_files.values()
+            for value in (
+                split_values if isinstance(split_values, list) else [split_values]
+            )
+        ]
+    elif isinstance(data_files, list):
+        values = data_files
+    else:
+        return ()
+    return tuple(value for value in values if isinstance(value, str))
+
+
+class _LocalFileReadaheadWarmer:
+    """Keeps the page cache warm ahead of open local data files.
+
+    On latency-bound storage the kernel caps buffered readahead at one small
+    window per stream, so a sequential consumer gets a fraction of the device
+    bandwidth. Worker threads pread large chunks ahead of each matched file's
+    read position -- each on its own fd, because the kernel tracks readahead
+    per open file description and threads sharing one fd serialize on a
+    single window -- and the consumer then reads at page-cache speed.
+    posix_fadvise(DONTNEED) well behind the read position bounds the cache
+    footprint so a full cache never throttles readahead.
+    """
+
+    def __init__(
+        self,
+        *,
+        file_name_patterns: tuple[str, ...],
+        window_bytes: int,
+        num_threads: int,
+    ) -> None:
+        self._file_name_patterns = tuple(
+            os.path.basename(pattern) for pattern in file_name_patterns
+        )
+        self._window_bytes = window_bytes
+        self._num_threads = num_threads
+        self._positions: dict[str, int] = {}
+        self._warmed_through: dict[str, int] = {}
+        threading.Thread(target=self._run, name="tar-readahead", daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            try:
+                self._warm_once()
+            except OSError:
+                pass  # files open and close between the scan and the preads
+            time.sleep(_READAHEAD_POLL_INTERVAL_S)
+
+    def _warm_once(self) -> None:
+        for path, position in self._scan_read_positions().items():
+            warmed_through = self._warmed_through.get(path, 0)
+            if position < self._positions.get(path, 0):
+                # The stream rewound (epoch restart): re-warm from the new
+                # position, since trailing DONTNEED evicted those pages.
+                warmed_through = position
+            self._positions[path] = position
+            warm_end = position + self._window_bytes
+            if warm_end <= warmed_through:
+                continue
+            self._pread_range(path, warmed_through, warm_end)
+            self._warmed_through[path] = warm_end
+            evict_through = position - _READAHEAD_KEEP_BEHIND_BYTES
+            if evict_through > 0:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, evict_through, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+
+    def _scan_read_positions(self) -> dict[str, int]:
+        positions: dict[str, int] = {}
+        for fd_name in os.listdir("/proc/self/fd"):
+            try:
+                path = os.readlink(f"/proc/self/fd/{fd_name}")
+                if not any(
+                    fnmatch.fnmatch(os.path.basename(path), pattern)
+                    for pattern in self._file_name_patterns
+                ):
+                    continue
+                with open(f"/proc/self/fdinfo/{fd_name}") as fdinfo:
+                    pos_line = fdinfo.readline()
+                position = int(pos_line.split()[1])
+            except (OSError, IndexError, ValueError):
+                continue  # not a regular file, or closed mid-scan
+            positions[path] = max(positions.get(path, 0), position)
+        return positions
+
+    def _pread_range(self, path: str, start: int, end: int) -> None:
+        bounds = [
+            start + (end - start) * i // self._num_threads
+            for i in range(self._num_threads + 1)
+        ]
+        threads = [
+            threading.Thread(
+                target=self._pread_subrange,
+                args=(path, bounds[i], bounds[i + 1]),
+                daemon=True,
+            )
+            for i in range(self._num_threads)
+            if bounds[i + 1] > bounds[i]
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    @staticmethod
+    def _pread_subrange(path: str, start: int, end: int) -> None:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            for offset in range(start, end, _READAHEAD_IO_BYTES):
+                os.pread(fd, min(_READAHEAD_IO_BYTES, end - offset), offset)
+        finally:
+            os.close(fd)
 
 
 def _file_patterns_to_paths(patterns: tuple[str, ...]) -> tuple[str, ...]:

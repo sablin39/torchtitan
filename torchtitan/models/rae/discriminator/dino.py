@@ -6,13 +6,16 @@
 
 from __future__ import annotations
 
-# Tensor dimensions: B=batch, L=patch tokens, C=channel.
+# Tensor dimensions: B=batch, L=patch tokens, C=channel, H=discriminator heads.
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file
+
+from .dinov3_vit import DINOv3ViTBackbone
 
 
 class _ResidualBlock(nn.Module):
@@ -33,6 +36,7 @@ class _BatchNormLocal(nn.Module):
         self.bias = nn.Parameter(torch.zeros(num_features))
 
     def forward(self, x_BCL: torch.Tensor) -> torch.Tensor:
+        input_dtype = x_BCL.dtype
         shape = x_BCL.shape
         x_BCL = x_BCL.float()
         grouped_B1CL = x_BCL.view(shape[0], 1, shape[1], shape[2])
@@ -42,7 +46,9 @@ class _BatchNormLocal(nn.Module):
         grouped_B1CL = (
             grouped_B1CL * self.weight[None, :, None] + self.bias[None, :, None]
         )
-        return grouped_B1CL.view(shape)
+        # The statistics accumulate in fp32; cast back so the surrounding
+        # conv stack keeps the module's compute dtype.
+        return grouped_B1CL.view(shape).to(input_dtype)
 
 
 def _make_head_block(
@@ -76,7 +82,15 @@ def _make_head_block(
 
 
 class HFModelFeatureDiscriminator(nn.Module):
-    """HF vision feature discriminator with variable-resolution image support."""
+    """DINOv3 vision feature discriminator evaluated at native image resolution.
+
+    Images pass through the frozen backbone unresized (sides must be
+    divisible by the backbone patch size; the backbone's RoPE generalizes to
+    any resolution), so the discriminator scores the reconstruction at the
+    decoder's output resolution. Each head emits one logit per patch token:
+    forward returns a (B, H, L) tensor for a stacked BCHW batch and a list of
+    (H, L_i) tensors for a variable-resolution CHW sequence.
+    """
 
     def __init__(
         self,
@@ -88,34 +102,25 @@ class HFModelFeatureDiscriminator(nn.Module):
         norm_type: str,
         using_spec_norm: bool,
         norm_eps: float,
-        input_size: int | None,
+        batch_size: int = 64,
+        backbone_dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
-        try:
-            from transformers import AutoModel
-        except ImportError as error:
-            raise RuntimeError(
-                "HFModelFeatureDiscriminator requires the transformers package"
-            ) from error
         model_directory = Path(model_path).expanduser()
         if not model_directory.is_dir():
             raise ValueError(f"HF model directory does not exist: {model_directory}")
-        model = AutoModel.from_pretrained(
-            str(model_directory),
-            local_files_only=True,
-        )
+        checkpoint_path = model_directory / "model.safetensors"
+        if not checkpoint_path.is_file():
+            raise ValueError(f"DINOv3 checkpoint does not exist: {checkpoint_path}")
+        model = DINOv3ViTBackbone()
+        # Weights load in fp32 (the checkpoint dtype); the bf16 cast happens
+        # below together with the heads.
+        model.load_state_dict(load_file(str(checkpoint_path)), strict=True)
         model.to(device=device).eval().requires_grad_(False)
         self.model = model
-        model_config = model.config
-        self.num_prefix_tokens = int(
-            getattr(
-                model_config,
-                "num_prefix_tokens",
-                1 + int(getattr(model_config, "num_register_tokens", 0)),
-            )
-        )
-        hidden_size = int(model_config.hidden_size)
-        num_layers = int(getattr(model_config, "num_hidden_layers", 0))
+        self.num_prefix_tokens = model.num_prefix_tokens
+        hidden_size = model.hidden_size
+        num_layers = len(model.layer)
         self.key_depths = tuple(
             index for index in key_depths if 0 <= index < num_layers
         )
@@ -146,220 +151,143 @@ class HFModelFeatureDiscriminator(nn.Module):
                 )
             )
         self.heads = nn.ModuleList(heads)
-        try:
-            from transformers import AutoImageProcessor
-
-            processor = AutoImageProcessor.from_pretrained(
-                str(model_directory), local_files_only=True
-            )
-        except (ImportError, OSError, ValueError):
-            processor = None
-        self.image_mean = tuple(
-            float(value)
-            for value in getattr(processor, "image_mean", (0.485, 0.456, 0.406))
-        )
-        self.image_std = tuple(
-            float(value)
-            for value in getattr(processor, "image_std", (0.229, 0.224, 0.225))
-        )
-        if len(self.image_mean) != 3 or len(self.image_std) != 3:
-            raise ValueError("HF vision processor statistics must have three values")
-        self.register_buffer(
-            "image_mean_1C11",
-            torch.tensor(self.image_mean, dtype=torch.float32).view(1, 3, 1, 1),
-            persistent=False,
-        )
-        self.register_buffer(
-            "image_std_1C11",
-            torch.tensor(self.image_std, dtype=torch.float32).view(1, 3, 1, 1),
-            persistent=False,
-        )
-        self.model_norm = getattr(self.model, "norm", nn.Identity())
-        self.patch_size = int(getattr(model_config, "patch_size", 16))
-        if self.patch_size <= 0:
-            raise ValueError("HF vision model patch_size must be positive")
-        if input_size is None:
-            input_size = int(getattr(model_config, "image_size", 224))
-        if input_size <= 0 or input_size % self.patch_size != 0:
-            raise ValueError(
-                "HF vision discriminator input_size must be positive and divisible "
-                "by the backbone patch size"
-            )
-        self.input_size = input_size
-        self._compiled_forward_group: (
-            Callable[[torch.Tensor], torch.Tensor] | None
+        # DINOv3 preprocessing is fixed ImageNet normalization, applied by
+        # _normalized_group_chunks before the backbone call.
+        self.image_mean = (0.485, 0.456, 0.406)
+        self.image_std = (0.229, 0.224, 0.225)
+        self.patch_size = model.patch_size
+        if batch_size <= 0:
+            raise ValueError("HF vision discriminator batch_size must be positive")
+        self.batch_size = batch_size
+        if backbone_dtype != torch.float32:
+            # bf16 compute halves backbone forward/backward time; the eager
+            # heads (spectral-norm power iteration included) run in bf16 too
+            # so their inputs match the backbone's activations.
+            self.to(dtype=backbone_dtype)
+        self._compiled_backbone: (
+            Callable[[torch.Tensor], list[torch.Tensor]] | None
         ) = None
-        self._compile_backend: str | None = None
-        self._compile_warmup_pending = False
 
     def train(self, mode: bool = True) -> "HFModelFeatureDiscriminator":
-        """Keep the frozen Hugging Face backbone in evaluation mode."""
+        """Keep the frozen DINOv3 backbone in evaluation mode."""
         super().train(mode)
         self.model.eval()
         return self
 
     def compile_forward(self, *, backend: str) -> None:
-        self._compile_backend = backend
-        self._compile_warmup_pending = True
-
-    def _get_forward_group(self, sample_BCHW: torch.Tensor) -> Callable:
-        """Initialize compiled execution after Transformers installs its hooks."""
-        if self.training:
-            return self._forward_group
-        if self._compile_warmup_pending:
-            with torch.no_grad():
-                self._forward_group(sample_BCHW.detach())
-            assert self._compile_backend is not None
-            self._compiled_forward_group = torch.compile(
-                self._forward_group,
-                backend=self._compile_backend,
-                fullgraph=True,
-            )
-            self._compile_warmup_pending = False
-        return self._compiled_forward_group or self._forward_group
+        # dynamic=True: resolutions vary between microbatches, so the compiled
+        # forward keeps batch/height/width symbolic instead of re-specializing
+        # (and recompiling) on every new image shape. Buffer donation is
+        # disabled globally: an AOT backward compiled with donated buffers
+        # rejects the trainer's retain_graph=True adaptive-weight probes.
+        torch._functorch.config.donated_buffer = False
+        self._compiled_backbone = torch.compile(
+            self._backbone_features, backend=backend, dynamic=True
+        )
 
     def set_head_requires_grad(self, enabled: bool) -> None:
         self.model.requires_grad_(False)
         self.heads.requires_grad_(enabled)
 
+    def _backbone_features(self, images_BCHW: torch.Tensor) -> list[torch.Tensor]:
+        """Frozen-backbone activations (B, C, L) at the probed depths."""
+        return self.model(images_BCHW, key_depths=self.key_depths)
+
     def _forward_group(self, images_BCHW: torch.Tensor) -> torch.Tensor:
-        outputs = self.model(
-            pixel_values=images_BCHW,
-            output_hidden_states=True,
-        )
-        hidden_states = outputs.hidden_states
-        if hidden_states is None:
-            raise RuntimeError("HF vision model did not return hidden states")
-        activations_BCL = [
-            outputs.last_hidden_state,
-            *[self.model_norm(hidden_states[index + 1]) for index in self.key_depths],
-        ]
-        activations_BCL = [
-            activation_BLC[:, self.num_prefix_tokens :].transpose(1, 2)
-            for activation_BLC in activations_BCL
-        ]
-        logits_B1 = [
-            head(activation_BCL).mean(dim=-1)
-            for head, activation_BCL in zip(self.heads, activations_BCL)
-        ]
-        return torch.cat(logits_B1, dim=1)
+        """Per-patch logits (B, H, L) for one same-resolution batch.
 
-    def forward_fixed(self, images_BCHW: torch.Tensor) -> torch.Tensor:
-        """Evaluate a fixed BCHW batch with deterministic letterboxing."""
-        if images_BCHW.ndim != 4 or images_BCHW.shape[1] != 3:
-            raise ValueError(
-                "HF vision discriminator fixed path expects BCHW RGB images"
-            )
-        height, width = images_BCHW.shape[-2:]
-        if (height, width) != (self.input_size, self.input_size):
-            scale = min(self.input_size / height, self.input_size / width)
-            target_height = max(
-                self.patch_size,
-                min(
-                    self.input_size,
-                    int(height * scale) // self.patch_size * self.patch_size,
-                ),
-            )
-            target_width = max(
-                self.patch_size,
-                min(
-                    self.input_size,
-                    int(width * scale) // self.patch_size * self.patch_size,
-                ),
-            )
-            resized_BCHW = torch.nn.functional.interpolate(
-                images_BCHW,
-                size=(target_height, target_width),
-                mode="bilinear",
-                align_corners=False,
-                antialias=True,
-            )
-            canvas_BCHW = images_BCHW.new_full(
-                (images_BCHW.shape[0], 3, self.input_size, self.input_size),
-                0.5,
-            )
-            top = (self.input_size - target_height) // 2
-            left = (self.input_size - target_width) // 2
-            canvas_BCHW[
-                :, :, top : top + target_height, left : left + target_width
-            ] = resized_BCHW
-            images_BCHW = canvas_BCHW
-        mean_1C11 = self.image_mean_1C11.to(dtype=images_BCHW.dtype)
-        std_1C11 = self.image_std_1C11.to(dtype=images_BCHW.dtype)
-        return self._forward_group((images_BCHW - mean_1C11) / std_1C11)
+        The heads stay eager even when the backbone is compiled: their
+        spectral-norm power iteration mutates the u/v buffers in place on
+        every training-mode forward, and an AOTAutograd backward captured
+        against those buffers fails its version check once a later chunk's
+        forward bumps them.
+        """
+        if self._compiled_backbone is None:
+            activations_BCL = self._backbone_features(images_BCHW)
+        else:
+            activations_BCL = self._compiled_backbone(images_BCHW)
+        logits_BHL = [
+            head(activation_BCL)
+            for head, activation_BCL in zip(self.heads, activations_BCL, strict=True)
+        ]
+        return torch.cat(logits_BHL, dim=1)
 
-    def _resize_for_backbone(self, image_CHW: torch.Tensor) -> torch.Tensor:
-        height, width = image_CHW.shape[-2:]
-        if (height, width) == (self.input_size, self.input_size):
-            return image_CHW
-        scale = min(self.input_size / height, self.input_size / width)
-        target_height = max(
-            self.patch_size,
-            min(
-                self.input_size,
-                int(height * scale) // self.patch_size * self.patch_size,
-            ),
-        )
-        target_width = max(
-            self.patch_size,
-            min(
-                self.input_size,
-                int(width * scale) // self.patch_size * self.patch_size,
-            ),
-        )
-        resized = torch.nn.functional.interpolate(
-            image_CHW.unsqueeze(0),
-            size=(target_height, target_width),
-            mode="bilinear",
-            align_corners=False,
-            antialias=True,
-        ).squeeze(0)
-        canvas = image_CHW.new_full(
-            (image_CHW.shape[0], self.input_size, self.input_size), 0.5
-        )
-        top = (self.input_size - target_height) // 2
-        left = (self.input_size - target_width) // 2
-        canvas[:, top : top + target_height, left : left + target_width] = resized
-        return canvas
-
-    def forward(
+    def _group_by_shape(
         self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
-    ) -> torch.Tensor:
+    ) -> tuple[list[torch.Tensor], dict[tuple[int, int], list[int]], bool]:
         if isinstance(images_BCHW, torch.Tensor):
             if images_BCHW.ndim != 4:
                 raise ValueError("HF vision discriminator expects BCHW images")
-            images = [
-                images_BCHW[index : index + 1] for index in range(images_BCHW.shape[0])
-            ]
+            images = list(images_BCHW.unbind(0))
+            return_stacked = True
         else:
             images = list(images_BCHW)
+            return_stacked = False
         if not images:
             raise ValueError("HF vision discriminator requires at least one image")
-        outputs: list[torch.Tensor | None] = [None] * len(images)
         groups: dict[tuple[int, int], list[int]] = {}
         for index, image_CHW in enumerate(images):
-            if image_CHW.ndim == 4:
-                if image_CHW.shape[0] != 1:
-                    raise ValueError("HF image sequences must contain CHW tensors")
-                image_CHW = image_CHW[0]
             if image_CHW.ndim != 3 or image_CHW.shape[0] != 3:
                 raise ValueError(
                     "HF vision discriminator expects three-channel CHW images"
                 )
-            image_CHW = self._resize_for_backbone(image_CHW)
-            groups.setdefault(tuple(image_CHW.shape[-2:]), []).append(index)
-            images[index] = image_CHW
+            height, width = image_CHW.shape[-2:]
+            if height % self.patch_size != 0 or width % self.patch_size != 0:
+                raise ValueError(
+                    "HF vision discriminator image sides must be divisible by the "
+                    f"backbone patch size {self.patch_size}, got {(height, width)}"
+                )
+            groups.setdefault((height, width), []).append(index)
+        return images, groups, return_stacked
+
+    def _normalized_group_chunks(
+        self,
+        images: list[torch.Tensor],
+        groups: dict[tuple[int, int], list[int]],
+    ) -> Generator[tuple[list[int], torch.Tensor]]:
         for indices in groups.values():
-            group_BCHW = torch.stack([images[index] for index in indices])
-            mean_1C11 = group_BCHW.new_tensor(self.image_mean).view(1, -1, 1, 1)
-            std_1C11 = group_BCHW.new_tensor(self.image_std).view(1, 3, 1, 1)
-            forward_group = self._get_forward_group(group_BCHW)
-            group_logits_BH = forward_group((group_BCHW - mean_1C11) / std_1C11)
-            for group_index, image_index in enumerate(indices):
-                outputs[image_index] = group_logits_BH[group_index]
+            for start in range(0, len(indices), self.batch_size):
+                chunk = indices[start : start + self.batch_size]
+                group_BCHW = torch.stack([images[index] for index in chunk])
+                mean_1C11 = group_BCHW.new_tensor(self.image_mean).view(1, -1, 1, 1)
+                std_1C11 = group_BCHW.new_tensor(self.image_std).view(1, 3, 1, 1)
+                yield chunk, (group_BCHW - mean_1C11) / std_1C11
+
+    def forward(
+        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
+    ) -> torch.Tensor | list[torch.Tensor]:
+        images, groups, return_stacked = self._group_by_shape(images_BCHW)
+        outputs: list[torch.Tensor | None] = [None] * len(images)
+        for chunk, group_BCHW in self._normalized_group_chunks(images, groups):
+            logits_BHL = self._forward_group(group_BCHW)
+            for chunk_index, image_index in enumerate(chunk):
+                outputs[image_index] = logits_BHL[chunk_index]
         if any(output is None for output in outputs):
             raise RuntimeError("HF vision discriminator did not produce every output")
-        return torch.stack(outputs)
+        if return_stacked:
+            return torch.stack(outputs)  # type: ignore[arg-type]
+        return outputs  # type: ignore[return-value]
+
+    def features(
+        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
+    ) -> list[list[torch.Tensor]]:
+        """Per-image frozen-backbone activations (C, L_i) at each probed depth.
+
+        Eager by design: this path exists for no-gradient metric logging on
+        small subsamples, and bypasses the compiled backbone so no extra
+        autograd variant gets compiled mid-run.
+        """
+        images, groups, _ = self._group_by_shape(images_BCHW)
+        outputs: list[list[torch.Tensor] | None] = [None] * len(images)
+        for chunk, group_BCHW in self._normalized_group_chunks(images, groups):
+            group_activations = self._backbone_features(group_BCHW)
+            for chunk_index, image_index in enumerate(chunk):
+                outputs[image_index] = [
+                    activation_BCL[chunk_index] for activation_BCL in group_activations
+                ]
+        if any(output is None for output in outputs):
+            raise RuntimeError("HF vision discriminator did not produce every output")
+        return outputs  # type: ignore[return-value]
 
 
 __all__ = ["HFModelFeatureDiscriminator"]

@@ -11,6 +11,8 @@ from .discriminator import (
     FrozenImageFeatures,
     gan_discriminator_loss,
     gan_generator_loss,
+    gan_logits_mean,
+    gan_logits_per_image,
     RAEFeatureDiscriminator,
     RAEPerceptualLoss,
 )
@@ -24,4 +26,6 @@ __all__ = [
     "RAEPerceptualLoss",
     "gan_discriminator_loss",
     "gan_generator_loss",
+    "gan_logits_mean",
+    "gan_logits_per_image",
 ]

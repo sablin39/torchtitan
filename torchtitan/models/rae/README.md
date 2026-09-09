@@ -65,10 +65,9 @@ restore exactly. `rae_stage1_dmuon_static_128k` and
 `rae_stage1_openimages_static_128k` double the static capacity to 131072 tokens
 for higher device utilization. The conservative 65536-token setting leaves
 headroom on a 95 GiB RTX PRO 6000; lower the per-rank budget if the available
-device has less memory. The HF DINO adversarial input is independently
-letterboxed to its
-native 224x224 patch grid, so high-resolution decoder outputs do not consume
-the discriminator's full-resolution activation memory.
+device has less memory. The HF DINO discriminator scores images at the
+decoder's native output resolution, so high-resolution decoder outputs
+consume proportionally more discriminator activation memory.
 
 The full OpenImages recipe uses the same Hugging Face streaming source, but
 selects every `train_*/*.jpg` folder for training and every `validation*/*.jpg`
@@ -178,41 +177,30 @@ for packed unequal-length latents so the FA2 varlen kernel consumes cumulative
 sequence offsets without materializing an `T x T` mask.
 
 `--compile.enable --compile.components '["model", "discriminator"]'` compiles
-every decoder transformer block and the tensor-only frozen HF DINO forward with
-`fullgraph=True`. Variable-grid normalization, position construction,
-unpatchification, and image-shape grouping stay in eager wrappers and are
-implemented in `layout.py`, `position.py`, and `discriminator/dino.py`. DINO
-uses one native 224x224 letterboxed shape, so variable-resolution decoder
-outputs share one discriminator graph. The trainable spectral-normalized
-discriminator heads remain eager in the non-graph compile path because their
-power-iteration buffers are intentionally mutated in place; in CUDA-graph
-mode those fixed-shape buffer updates are captured along with head backward.
-The frozen backbone is always in evaluation mode.
-
-When CUDA graphs are enabled, `training/graphs.py` captures the discriminator
-forward/backward path. The trainer letterboxes every real and generated image
-onto the backbone's fixed 224x224 canvas, then processes the batch in chunks
-of `gan.discriminator_chunk_size` images (last chunk zero-padded with a
-validity mask). Every chunk replays a single fixed-shape graph, so the GAN
-phase holds exactly one private memory pool regardless of how many images a
-packed step contains; chunk gradients accumulate as masked sums and are
-divided by the total valid count once per update, matching the eager path's
-mean reduction. The graph is captured during trainer initialization with
-dummy inputs, so the GAN-phase memory footprint is allocated at startup and
-a capture failure surfaces before training begins rather than at the
-discriminator phase boundary. Graph mode bypasses DDP reducer hooks and
-explicitly averages discriminator gradients across the batch mesh; this keeps
-graph capture safe for replicated DP. DMuon and its optimizer step remain
-eager. The frozen backbone is compiled during trainer
-initialization (covered by `comm.init_timeout_seconds`) rather than lazily at
-the first GAN step, and the static recipes loosen the NCCL watchdog to
+every decoder transformer block and the frozen HF DINO backbone feature
+extraction (`discriminator/dino.py`). The discriminator is compiled with
+dynamic shapes: images are scored at their native decoder resolution, so
+batch, height, and width stay symbolic and variable-resolution microbatches
+share one compiled graph without recompilation. The trainable
+spectral-normalized heads stay eager by design: their power iteration mutates
+the u/v buffers in place on every training-mode forward, and an AOTAutograd
+backward captured against those buffers fails its version check once a later
+chunk's forward bumps them. Both autograd variants (frozen heads with
+grad-enabled generator-side inputs; trainable heads with backward) are warmed
+up during trainer initialization, which is covered by
+`comm.init_timeout_seconds`, rather than compiling lazily at the first GAN
+step. The static recipes loosen the NCCL watchdog to
 `init_timeout_seconds=3600` / `train_timeout_seconds=600` because four ranks
-compiling concurrently can drift apart by minutes. The generator loss (L1,
-LPIPS at native resolution, and the adversarial forward on the letterboxed
-canvas) stays eager; on the RTX PRO
-6000, a fixed `B=16, 256x256` loss path measured 1.69x faster generator and
-3.15x faster discriminator steady-state replay than eager execution (capture
-time excluded).
+compiling concurrently can drift apart by minutes. Variable-grid
+normalization, position construction, unpatchification, and image-shape
+grouping stay in eager wrappers (`layout.py`, `position.py`,
+`discriminator/dino.py`). The frozen backbone is always in evaluation mode.
+
+The decoder keeps its fixed-shape CUDA graphs (`training.disable_cuda_graphs`
+controls them). The discriminator does not use CUDA graphs: capture requires
+fixed shapes, which conflicts with scoring images at their native
+resolutions; the dynamic-shape compiled forward covers the frozen backbone
+cost instead. DMuon and its optimizer step remain eager.
 
 RAE Stage 1 currently uses fully replicated data parallelism. Set
 `data_parallel_shard_degree=1`; sharded data parallelism is rejected by the RAE
@@ -269,10 +257,16 @@ The default recipe uses the local Hugging Face DINOv3 ViT-B/16 at
 `~/models/dinov3-vitb16-pretrain-lvd1689m` as the frozen discriminator backbone,
 with intermediate layers 2, 5, 8, and 11 and RAEv2-style residual spectral
 heads. ViT-B/16 has a 768-wide hidden state, reducing discriminator feature
-memory versus ViT-L/16 while retaining four depth-spaced probes. The
-discriminator accepts any compatible local Hugging Face vision model through
-`backbone_kind="hf"` and `hf_model_path`; its processor statistics are read from
-the model directory. No Python module from the checked-out `RAEv2/` tree is
+memory versus ViT-L/16 while retaining four depth-spaced probes. Images pass
+through the backbone unresized at the decoder's output resolution (1/4 of the
+encoder input), and each head emits one logit per 16x16 patch token. GAN
+losses apply their nonlinearity per patch and reduce image-weighted (per-image
+mean first, then batch mean), so large images do not dominate the loss. The
+discriminator runs a torchtitan-native DINOv3 ViT-B/16 backbone
+(`torchtitan/models/rae/discriminator/dinov3_vit.py`) selected through
+`backbone_kind="hf"` and `hf_model_path`; the weights load strictly from the
+`model.safetensors` in that directory and inputs get fixed ImageNet
+normalization. No Python module from the checked-out `RAEv2/` tree is
 needed at runtime. DMuon dedicates and replicates its parameter groups through
 the regular DDP path. The recipes apply a decoupled `weight_decay=0.01` to the
 Muon-updated matrix parameters (Muon's updates are scale-invariant to the
@@ -285,10 +279,17 @@ The VGG16 backbone is loaded from torchvision unless
 `gan.lpips_vgg_checkpoint_path` points to a local VGG16 state dict. Set
 `gan.augment.probability` and `gan.augment.cutout` to the original DiffAug
 values; augmentation is applied to both generator and discriminator inputs.
-Because DMuon owns backward-time gradient reduction hooks, the optional RAEv2
-two-pass adaptive GAN-weight calculation is replaced by a unit multiplier when
-DMuon is enabled. This keeps backward and optimizer ordering valid; use AdamW
-if exact adaptive-weight parity is required.
+DMuon owns backward-time gradient reduction hooks, so the RAEv2 two-pass
+adaptive GAN-weight calculation wraps its `torch.autograd.grad` probes in
+`dmuon.suppress_grad_reduce`, which keeps the probes from dispatching reduces
+or consuming the once-per-forward post-backward protocol. The generator loss
+"vanilla" is the non-saturating BCE form `softplus(-logit)`; "hinge" is
+`-logit`. `gan.discriminator_weight_ramp_steps` ramps the generator-side GAN
+weight in linearly after the adversarial phase starts, softening the onset
+against an already-converged discriminator. Each discriminator update
+processes the step's images in chunks of `gan.discriminator_update_batch_size`
+with count-weighted gradients, bounding peak activation memory independently
+of how many images a packed step contains.
 
 DMuon EMA is maintained as a regular replicated decoder copy. Each generator
 update applies the EMA update to that local copy, so there is no FSDP state
@@ -375,7 +376,7 @@ boundaries. It does not, by itself, batch variable RAE latents: use
 to keep Qwen's flattened `pixel_values` and `grid_thw` together. The Stage 1
 trainer keeps each image as a list, unpatchifies packed decoder outputs, resizes
 each target to its corresponding output grid, and applies DiffAugment on the
-letterboxed 224x224 discriminator canvas. Multi-frame media remains rejected by
+native-resolution discriminator inputs. Multi-frame media remains rejected by
 the 2D GAN trainer until a video discriminator/loss path is enabled.
 
 `RAEQwenCollator` now also emits `rae_grid_thw` (the post-merger grid),

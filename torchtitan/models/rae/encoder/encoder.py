@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 _DINO_HUB_MODELS = {
@@ -29,25 +32,25 @@ _DINO_HUB_MODELS = {
 
 
 def _merge_qwen_hidden_states(
-    outputs,
+    taps: Sequence[torch.Tensor],
+    final_hidden: torch.Tensor,
     merger: nn.Module,
     layer_indices: tuple[int, ...],
     tokens_per_item: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Merge selected Qwen vision blocks with RAEv2 multi-layer-sum semantics.
 
-    Each selected block output is normalized by the merger's LayerNorm (the
-    Qwen vision tower has no separate final norm), the selected layers are
-    averaged, and the per-item token mean of the final selected layer is added
-    back as a global signal. The merger MLP runs once on the combined tokens.
-    ``tokens_per_item`` holds the pre-merger token counts of each packed media
-    item so the global mean stays within its own image or video.
+    ``taps`` holds the block outputs at ``layer_indices`` (in that order) and
+    ``final_hidden`` the last block output. Each selected block output is
+    normalized by the merger's LayerNorm (the Qwen vision tower has no
+    separate final norm), the selected layers are averaged, and the per-item
+    token mean of the final selected layer is added back as a global signal.
+    The merger MLP runs once on the combined tokens. ``tokens_per_item``
+    holds the pre-merger token counts of each packed media item so the
+    global mean stays within its own image or video.
     """
     if not layer_indices:
-        return outputs.pooler_output
-    hidden_states = outputs.hidden_states
-    if hidden_states is None:
-        raise RuntimeError("Qwen vision model did not return hidden states")
+        return merger(final_hidden)
     for attribute in ("norm", "linear_fc1", "act_fn", "linear_fc2", "hidden_size"):
         if not hasattr(merger, attribute):
             raise ValueError(
@@ -56,8 +59,12 @@ def _merge_qwen_hidden_states(
             )
     if getattr(merger, "use_postshuffle_norm", False):
         raise ValueError("Qwen multi-layer merging requires a pre-shuffle merger norm")
-    selected = [hidden_states[index + 1] for index in layer_indices]
-    normed = [merger.norm(hidden) for hidden in selected]
+    if len(taps) != len(layer_indices):
+        raise ValueError(
+            f"Qwen vision model returned {len(taps)} taps for "
+            f"{len(layer_indices)} requested layer indices"
+        )
+    normed = [merger.norm(hidden) for hidden in taps]
     merged = torch.stack(normed).mean(dim=0)
     global_signal = normed[-1]
     if tokens_per_item is not None:
@@ -111,6 +118,26 @@ class RAEEncoderConfig:
     dtype: str = "float32"
     attn_implementation: str = "flash_attention_2"
     compile: bool = False
+    # Static token budget for kind='qwen': every microbatch is padded with one
+    # trailing padding document up to this many patch tokens, so the native
+    # Qwen vision encoder runs at a fixed shape and torch.compile never
+    # recompiles. Aux tensor VALUES (cu_seqlens, interpolation indices,
+    # position ids) still vary per step; only shapes are static.
+    pad_tokens_to: int | None = None
+    # Static flash-attn max_seqlen pin under pad_tokens_to: must bound the
+    # longest varlen segment INCLUDING the padding document. Packing slack is
+    # always below one max-size row, so the max pre-merge document length
+    # (e.g. 4096) is a valid pin; pinning to the full pad_tokens_to budget
+    # instead would make flash-attn schedule splits for a budget-length
+    # segment and waste performance. build_aux rejects a pin below the true
+    # longest segment, so a wrong value fails loudly.
+    max_tokens_per_doc: int | None = None
+    # Static cu_seqlens length under pad_tokens_to: token packing fills the
+    # budget with a variable document count (~140 for OpenImages), so
+    # zero-length trailing entries pad the doc axis to this bound. Hard
+    # maximum is pad_tokens_to / min-doc-tokens (min_pixels 256x256 -> 256
+    # pre-merge tokens); 2048 covers the 389120/256 = 1520 worst case.
+    max_docs_per_microbatch: int = 2048
 
     def __post_init__(self) -> None:
         if self.image_size == 0 or (self.image_size < -1):
@@ -123,6 +150,16 @@ class RAEEncoderConfig:
             raise ValueError("encoder.image_size must be divisible by merge_size")
         if self.dtype not in {"float32", "bfloat16"}:
             raise ValueError(f"Unsupported encoder dtype: {self.dtype}")
+        if self.pad_tokens_to is not None:
+            if self.kind != "qwen":
+                raise ValueError("encoder.pad_tokens_to requires kind='qwen'")
+            if self.pad_tokens_to <= 0:
+                raise ValueError("encoder.pad_tokens_to must be positive")
+        if self.max_tokens_per_doc is not None:
+            if self.pad_tokens_to is None:
+                raise ValueError("encoder.max_tokens_per_doc requires pad_tokens_to")
+            if self.max_tokens_per_doc <= 0:
+                raise ValueError("encoder.max_tokens_per_doc must be positive")
 
 
 class FrozenRAEEncoder(nn.Module):
@@ -155,6 +192,9 @@ class FrozenRAEEncoder(nn.Module):
             self.latent_mean = self._format_stat(stats.get("mean"), "mean")
             self.latent_var = self._format_stat(stats.get("var"), "var")
         self.external = None
+        self.pad_tokens_to = config.pad_tokens_to
+        self.max_tokens_per_doc = config.max_tokens_per_doc
+        self.max_docs_per_microbatch = config.max_docs_per_microbatch
         self.last_grid_thw: torch.Tensor | None = None
         self.last_fps: torch.Tensor | None = None
         self.last_temporal_start: torch.Tensor | None = None
@@ -262,7 +302,13 @@ class FrozenRAEEncoder(nn.Module):
         if config.compile:
             if self.external is None:
                 raise ValueError("encoder.compile requires an external backbone")
-            self.external = torch.compile(self.external, dynamic=True)
+            if config.kind == "qwen" and config.pad_tokens_to is not None:
+                # Fully static shapes (see RAEEncoderConfig.pad_tokens_to).
+                self.external = torch.compile(
+                    self.external, dynamic=False, fullgraph=True
+                )
+            else:
+                self.external = torch.compile(self.external, dynamic=True)
 
     def _init_qwen(self, config: RAEEncoderConfig, device: torch.device) -> None:
         if not config.name:
@@ -272,10 +318,15 @@ class FrozenRAEEncoder(nn.Module):
         try:
             from safetensors import safe_open
             from transformers import AutoConfig, AutoImageProcessor, AutoProcessor
-            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+
+            from torchtitan.models.rae.encoder.qwen_vit import (
+                QwenVisionConfig,
+                QwenVisionEncoder,
+            )
         except ImportError as error:
             raise RuntimeError(
-                "encoder.kind='qwen' requires transformers and safetensors"
+                "encoder.kind='qwen' requires transformers, safetensors, and "
+                "flash-attn"
             ) from error
         model_directory = Path(config.name).expanduser()
         if not model_directory.is_dir():
@@ -286,10 +337,6 @@ class FrozenRAEEncoder(nn.Module):
         vision_config = getattr(full_config, "vision_config", None)
         if vision_config is None:
             raise ValueError("Qwen checkpoint does not contain a vision_config")
-        # The HF default (sdpa) splits the packed sequence per document and
-        # runs one attention call per image per block; flash attention consumes
-        # cu_seqlens in a single varlen kernel.
-        vision_config._attn_implementation = config.attn_implementation
         if vision_config.spatial_merge_size != config.merge_size:
             raise ValueError(
                 "encoder.merge_size does not match Qwen vision config: "
@@ -301,7 +348,30 @@ class FrozenRAEEncoder(nn.Module):
             raise ValueError(
                 "Qwen encoder image_size must be divisible by patch_size * merge_size"
             )
-        visual = Qwen3_5VisionModel(vision_config)
+        # The torchtitan-native vision tower always uses flash-attn varlen in
+        # half precision and per-document SDPA in fp32; attn_implementation no
+        # longer applies.
+        if config.attn_implementation != "flash_attention_2":
+            logger.warning(
+                "encoder.attn_implementation=%s is ignored by the native Qwen "
+                "vision encoder",
+                config.attn_implementation,
+            )
+        visual = QwenVisionEncoder(
+            QwenVisionConfig(
+                depth=int(vision_config.depth),
+                hidden_size=int(vision_config.hidden_size),
+                num_heads=int(vision_config.num_heads),
+                intermediate_size=int(vision_config.intermediate_size),
+                patch_size=int(vision_config.patch_size),
+                temporal_patch_size=int(vision_config.temporal_patch_size),
+                spatial_merge_size=int(vision_config.spatial_merge_size),
+                in_channels=int(vision_config.in_channels),
+                out_hidden_size=int(vision_config.out_hidden_size),
+                num_position_embeddings=int(vision_config.num_position_embeddings),
+            ),
+            layer_indices=config.layer_indices,
+        )
         index_path = model_directory / "model.safetensors.index.json"
         if index_path.is_file():
             import json
@@ -327,12 +397,7 @@ class FrozenRAEEncoder(nn.Module):
                         visual_state[key[len("model.visual.") :]] = shard.get_tensor(
                             key
                         )
-        missing, unexpected = visual.load_state_dict(visual_state, strict=False)
-        if missing or unexpected:
-            raise RuntimeError(
-                "Qwen vision checkpoint mismatch: "
-                f"missing={missing}, unexpected={unexpected}"
-            )
+        visual.load_state_dict(visual_state, strict=True)
         encoder_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
         self.external = visual.to(device=device, dtype=encoder_dtype).eval()
         try:
@@ -626,18 +691,76 @@ class FrozenRAEEncoder(nn.Module):
                 for name, value in processor_output.items()
                 if name == pixel_key or name == grid_key
             }
-            with torch.no_grad():
-                outputs = self.external(
-                    hidden_states=model_inputs[pixel_key],
-                    grid_thw=model_inputs[grid_key],
-                    output_hidden_states=bool(self.layer_indices),
+            pixels_TD = model_inputs[pixel_key]
+            grid_thw = grid_thw.reshape(-1, 3).to(dtype=torch.long)
+            real_grid_thw = grid_thw
+            num_real_tokens = int(grid_thw.prod(dim=-1).sum().item())
+            if num_real_tokens != pixels_TD.shape[0]:
+                raise ValueError(
+                    "Qwen grid_thw token count does not match pixel rows: "
+                    f"{num_real_tokens} != {pixels_TD.shape[0]}"
                 )
+            if self.pad_tokens_to is not None:
+                pad_len = self.pad_tokens_to - num_real_tokens
+                if pad_len < 0:
+                    raise ValueError(
+                        f"Qwen microbatch has {num_real_tokens} patch tokens, "
+                        f"above encoder.pad_tokens_to={self.pad_tokens_to}"
+                    )
+                if pad_len > 0:
+                    # One trailing padding document keeps the pack at the
+                    # static token budget. h=2 requires pad_len divisible by 4
+                    # (real documents have even h, w, so their token counts
+                    # are multiples of 4 already).
+                    if pad_len % 4:
+                        raise ValueError(
+                            f"Qwen padding of {pad_len} tokens is not "
+                            "expressible as an even (h, w) document"
+                        )
+                    pad_grid = grid_thw.new_tensor([[1, 2, pad_len // 2]])
+                    grid_thw = torch.cat([grid_thw, pad_grid], dim=0)
+                    pixels_TD = torch.cat(
+                        [
+                            pixels_TD,
+                            pixels_TD.new_zeros(pad_len, pixels_TD.shape[1]),
+                        ],
+                        dim=0,
+                    )
+            with torch.no_grad(), torch.autocast(
+                device_type=external_device.type, enabled=False
+            ):
+                # Pin max_seqlen under a static budget so the compiled graph
+                # never re-specializes on the python int; flash-attn only
+                # uses it for kernel scheduling. Prefer max_tokens_per_doc
+                # (a tight bound on the longest segment, padding document
+                # included) over the full budget. Aux values vary per step;
+                # shapes are static. Autocast is forced off so the compiled
+                # frame sees one global state from every caller: training
+                # encodes outside autocast while validation wraps the whole
+                # encode-decode in autocast, and fullgraph=True hard-fails
+                # on the recompile that an autocast-state guard flip causes.
+                aux = self.external.build_aux(
+                    grid_thw,
+                    max_seqlen=self.max_tokens_per_doc or self.pad_tokens_to,
+                    max_docs=(
+                        self.max_docs_per_microbatch
+                        if self.pad_tokens_to is not None
+                        else None
+                    ),
+                )
+                final_TD, taps = self.external(pixels_TD, aux.to(external_device))
             merged_hidden_states = _merge_qwen_hidden_states(
-                outputs,
+                taps,
+                final_TD,
                 self.external.merger,
                 self.layer_indices,
-                tokens_per_item=grid_thw.reshape(-1, 3).prod(dim=-1),
+                tokens_per_item=grid_thw.prod(dim=-1),
             )
+            grid_thw = real_grid_thw
+            if self.pad_tokens_to is not None:
+                # Drop the padding document's merged tokens and grid row.
+                num_real_merged = num_real_tokens // self.merge_size**2
+                merged_hidden_states = merged_hidden_states[:num_real_merged]
             grid_thw = grid_thw.to(
                 device=merged_hidden_states.device, dtype=torch.long
             ).reshape(-1, 3)

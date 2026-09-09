@@ -6,7 +6,10 @@
 
 """CPU tests for the composed Grain data pipeline."""
 
+import ctypes
 import json
+import mmap
+import os
 from dataclasses import dataclass, replace
 from typing import Any
 from unittest import mock
@@ -16,6 +19,7 @@ import grain.python as grain
 import numpy as np
 import pytest
 import torch
+from torchtitan.components.data import sources
 
 from torchtitan.components.data.collators import Collator, TextCollator, TrainerBatch
 from torchtitan.components.data.dataset import (
@@ -32,7 +36,9 @@ from torchtitan.components.data.packing import (
     FirstFitPackingConfig,
 )
 from torchtitan.components.data.sources import (
+    _data_files_name_patterns,
     _HuggingFaceCursorIterator,
+    _LocalFileReadaheadWarmer,
     HuggingFaceRandomAccessSource,
     HuggingFaceStreamingSource,
     IndexedJsonlSource,
@@ -202,6 +208,71 @@ def test_hugging_face_streaming_source_shards_and_restores(tmp_path):
     restored.set_state(state)
 
     assert next(restored) == expected
+
+
+def test_data_files_name_patterns_flattens_hf_shapes():
+    assert _data_files_name_patterns("train_*.tar.gz") == ("train_*.tar.gz",)
+    assert _data_files_name_patterns({"train": "a.tar.gz", "test": ["b.tar.gz"]}) == (
+        "a.tar.gz",
+        "b.tar.gz",
+    )
+    assert _data_files_name_patterns(["a.tar.gz", "b.tar.gz"]) == (
+        "a.tar.gz",
+        "b.tar.gz",
+    )
+    assert _data_files_name_patterns(None) == ()
+
+
+def test_local_file_readahead_warmer_warms_ahead_of_position(tmp_path, monkeypatch):
+    # Keep the background thread from racing the direct _warm_once calls.
+    monkeypatch.setattr(sources, "_READAHEAD_POLL_INTERVAL_S", 3600.0)
+
+    path = tmp_path / "train_0.tar.gz"
+    path.write_bytes(b"x" * (8 * 2**20))
+
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p)
+
+    def nonresident_pages(length: int) -> list[int]:
+        with open(path, "r+b") as file:
+            mapping = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_WRITE)
+            try:
+                holder = ctypes.c_char.from_buffer(mapping)
+                address = ctypes.addressof(holder)
+                vec = ctypes.create_string_buffer(length // page_size)
+                assert libc.mincore(address, length, vec) == 0
+            finally:
+                del holder
+                mapping.close()
+        return [index for index, byte in enumerate(vec.raw) if not byte & 1]
+
+    # Evict the just-written pages so residency below reflects the warmer.
+    with open(path, "rb") as file:
+        os.fsync(file.fileno())
+        os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    assert nonresident_pages(2 * 2**20)
+
+    # Unbuffered opens: the warmer tracks the kernel fd position, which a
+    # BufferedReader runs ahead of the logical position.
+    warmer = _LocalFileReadaheadWarmer(
+        file_name_patterns=("train_*.tar.gz",),
+        window_bytes=2 * 2**20,
+        num_threads=1,
+    )
+    with open(path, "rb", buffering=0) as consumer:
+        consumer.read(4096)
+        warmer._warm_once()
+    assert warmer._warmed_through[str(path)] == 4096 + 2 * 2**20
+    assert nonresident_pages(2 * 2**20) == []
+
+    # A rewind (epoch restart) re-warms from the new position instead of
+    # treating already-warmed pages as done. _positions still holds the
+    # pre-rewind 4096 from the first scan.
+    with open(path, "rb", buffering=0) as consumer:
+        consumer.read(1024)
+        warmer._warm_once()
+    assert warmer._warmed_through[str(path)] == 1024 + 2 * 2**20
 
 
 def _hf_sharded_rows():
