@@ -224,6 +224,8 @@ def rae_stage1_debug() -> RAEStage1Trainer.Config:
             discriminator_start_step=0,
             discriminator_update_start_step=0,
             perceptual_start_step=0,
+            # Keep the debug recipe on the pre-feature-matching loss.
+            feature_matching_weight=0.0,
         ),
     )
     return config
@@ -322,10 +324,10 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
         ),
         validator=Validator.Config(
             enable=True,
-            # 16 packed validation microbatches per round, every 500 steps:
+            # 64 packed validation microbatches per round, every 500 steps:
             # enough images to judge generation quality without stalling
             # training for long.
-            steps=16,
+            steps=64,
             freq=500,
             dataloader=_image_dataloader(
                 batch_size=None,
@@ -370,6 +372,9 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
             # adversarial term starts, so ramp its weight in instead of taking
             # the full gradient spike on the first GAN step.
             discriminator_weight_ramp_steps=625,
+            # Per-patch DINOv3 feature matching joins the adversarial term
+            # under the same adaptive weight.
+            feature_matching_weight=1.0,
         ),
         discriminator=RAEFeatureDiscriminator.Config(
             feature_channels=768,

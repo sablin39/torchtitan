@@ -49,6 +49,21 @@ from .discriminator import (
 from .encoder import FrozenRAEEncoder, RAEEncoderConfig
 
 
+@dataclass
+class AugmentationParams:
+    """Sampled DiscriminatorAugmentation draws for a set of images.
+
+    ``gates`` holds the three per-call on/off draws (translate, color,
+    cutout). ``uniforms`` holds the per-image uniforms from which pixel
+    offsets and color factors are derived at apply time, so one params set
+    can serve images of different resolutions and can be shared between a
+    real image and its paired reconstruction.
+    """
+
+    gates: torch.Tensor
+    uniforms: torch.Tensor
+
+
 class DiscriminatorAugmentation:
     """Differentiable translation, color, and cutout augmentation."""
 
@@ -80,17 +95,25 @@ class DiscriminatorAugmentation:
             )
         return self._grids[key]
 
-    def __call__(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+    def sample_params(
+        self, num_images: int, device: torch.device
+    ) -> AugmentationParams:
+        """Draw one set of augmentation parameters for ``num_images`` images."""
+        gates = torch.rand(3, device=device) <= self.probability
+        random_B = torch.rand(7, num_images, 1, 1, device=device)
+        return AugmentationParams(gates=gates, uniforms=random_B)
+
+    def apply(
+        self, images_BCHW: torch.Tensor, params: AugmentationParams
+    ) -> torch.Tensor:
         if images_BCHW.dtype != torch.float32:
             images_BCHW = images_BCHW.float()
         if self.probability < 1e-6:
             return images_BCHW
 
-        apply_translate, apply_color, apply_cutout = (
-            torch.rand(3, device=images_BCHW.device) <= self.probability
-        )
+        apply_translate, apply_color, apply_cutout = params.gates
         batch_size, _, height, width = images_BCHW.shape
-        random_B = torch.rand(7, batch_size, 1, 1, device=images_BCHW.device)
+        random_B = params.uniforms
 
         height_delta = round(height * 0.125)
         width_delta = round(width * 0.125)
@@ -166,6 +189,16 @@ class DiscriminatorAugmentation:
 
         return images_BCHW.contiguous()
 
+    def __call__(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+        if images_BCHW.dtype != torch.float32:
+            images_BCHW = images_BCHW.float()
+        if self.probability < 1e-6:
+            return images_BCHW
+        return self.apply(
+            images_BCHW,
+            self.sample_params(images_BCHW.shape[0], images_BCHW.device),
+        )
+
 
 def log_stage1_metrics(
     step: int,
@@ -179,8 +212,8 @@ def log_stage1_metrics(
 ) -> None:
     """Log the scalar metrics emitted by one RAE Stage 1 update."""
     values = [float(loss.detach().item()) for loss in losses]
-    if len(values) != 12:
-        raise ValueError(f"RAE Stage 1 metrics require 12 values, got {len(values)}")
+    if len(values) != 13:
+        raise ValueError(f"RAE Stage 1 metrics require 13 values, got {len(values)}")
     if metrics_processor is not None:
         extra_metrics: dict[str, float] = {
             "rae/reconstruction_loss": values[0],
@@ -195,6 +228,7 @@ def log_stage1_metrics(
             "rae/discriminator_fake_logit": values[9],
             "rae/discriminator_accuracy": values[10],
             "rae/dino_feature_distance": values[11],
+            "rae/feature_matching_loss": values[12],
             "rae/non_padding_ratio": non_padding_ratio,
             "rae/num_images_per_step": num_images_per_step,
         }
@@ -215,7 +249,8 @@ def log_stage1_metrics(
             "[RAE Stage 1 | step %d] recon=%.5f perceptual=%.5f "
             "gan=%.5f disc=%.5f adaptive=%.5f decoder_grad=%.5f "
             "disc_grad=%.5f gen_logit=%.5f real_logit=%.5f fake_logit=%.5f "
-            "disc_acc=%.5f dino_dist=%.5f non_padding=%.5f images_per_step=%.2f%s",
+            "disc_acc=%.5f dino_dist=%.5f fm=%.5f non_padding=%.5f "
+            "images_per_step=%.2f%s",
             step,
             *values,
             non_padding_ratio,
@@ -327,6 +362,9 @@ class RAEGANConfig:
     to ``discriminator_weight`` after the adversarial phase starts. The
     discriminator has already converged by then, so a full-weight first step
     spikes the generator gradient; 0 keeps RAEv2's step-function onset."""
+    feature_matching_weight: float = 1.0
+    """Weight of the per-patch DINOv3 feature-matching term folded into the
+    adaptive-weighted adversarial loss; 0 disables it."""
     perceptual_weight: float = 1.0
     discriminator_updates: int = 1
     discriminator_update_batch_size: int = 256
@@ -362,6 +400,8 @@ class RAEGANConfig:
             raise ValueError("gan.discriminator_update_batch_size must be positive")
         if self.discriminator_weight < 0 or self.perceptual_weight < 0:
             raise ValueError("GAN and perceptual weights must be non-negative")
+        if self.feature_matching_weight < 0:
+            raise ValueError("gan.feature_matching_weight must be non-negative")
         if not 0.0 <= self.ema_decay < 1.0:
             raise ValueError("gan.ema_decay must be in [0, 1)")
         for name in (
@@ -466,9 +506,7 @@ class _RAEModelState(Stateful):
                 )
         else:
             self.decoder.load_state_dict(decoder_state, strict=True)
-        self.discriminator.load_state_dict(
-            state_dict["discriminator"], strict=True
-        )
+        self.discriminator.load_state_dict(state_dict["discriminator"], strict=True)
         self.ema.load_state_dict(state_dict["ema"], strict=True)
 
 
@@ -636,6 +674,12 @@ class RAEStage1Trainer(Trainer):
                 warmup_logits = self.discriminator(self._augment_images(dummy_items))
             torch.stack([logits.sum() for logits in warmup_logits]).sum().backward()
             self.discriminator.zero_grad(set_to_none=True)
+            if config.gan.feature_matching_weight > 0:
+                # The step-start real-feature cache calls the compiled backbone
+                # in a no-grad variant; warm it here so the first
+                # feature-matching step does not compile mid-run.
+                with torch.no_grad():
+                    self.discriminator.cache_real_features(dummy_items)
             self.discriminator.eval()
             self.discriminator.set_head_requires_grad(False)
 
@@ -867,9 +911,9 @@ class RAEStage1Trainer(Trainer):
             if target_sizes is None:
                 target_size = self.encoder.supervision_image_size
                 target_sizes = (
-                    [(target_size,) * 2 for _ in image_items]
+                    [(target_size, target_size) for _ in image_items]
                     if target_size is not None
-                    else [tuple(image.shape[-2:]) for image in image_items]
+                    else [(image.shape[-2], image.shape[-1]) for image in image_items]
                 )
             if len(target_sizes) != len(image_items):
                 raise ValueError("Supervision target sizes must match image count")
@@ -1082,14 +1126,25 @@ class RAEStage1Trainer(Trainer):
             real_items, fake_items
         ).mean()
 
-    def _augment_images(self, images: list[torch.Tensor]) -> list[torch.Tensor]:
+    def _augment_images(
+        self,
+        images: list[torch.Tensor],
+        *,
+        params: AugmentationParams | None = None,
+    ) -> list[torch.Tensor]:
         grouped: dict[tuple[int, int], list[int]] = {}
         for index, image in enumerate(images):
-            grouped.setdefault(tuple(image.shape[-2:]), []).append(index)
+            grouped.setdefault((image.shape[-2], image.shape[-1]), []).append(index)
         augmented = list(images)
         for indices in grouped.values():
             group = torch.stack([images[index] for index in indices])
-            group = self.discriminator_augmentation(group)
+            if params is None:
+                group = self.discriminator_augmentation(group)
+            else:
+                group_params = AugmentationParams(
+                    gates=params.gates, uniforms=params.uniforms[:, indices]
+                )
+                group = self.discriminator_augmentation.apply(group, group_params)
             for group_index, image_index in enumerate(indices):
                 augmented[image_index] = group[group_index]
         return augmented
@@ -1098,6 +1153,8 @@ class RAEStage1Trainer(Trainer):
         self,
         fake_normed_items: list[torch.Tensor],
         real_normed_items: list[torch.Tensor],
+        *,
+        real_features: list[list[torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Chunked discriminator update over native-resolution image lists.
 
@@ -1105,6 +1162,12 @@ class RAEStage1Trainer(Trainer):
         gradients match a single full-batch mean while peak activation memory
         stays bounded by gan.discriminator_update_batch_size. Returns
         (loss, real_logits, fake_logits, accuracy) batch means.
+
+        When ``real_features`` carries the step-start cached backbone
+        activations of the same reals (augmented with the step's shared
+        augmentation draws, so the real pass keeps its usual augmented
+        distribution), the eager heads run on the cache and the real backbone
+        forward is not repeated.
         """
         num_images = len(fake_normed_items)
         batch_size = self.config.gan.discriminator_update_batch_size
@@ -1115,7 +1178,12 @@ class RAEStage1Trainer(Trainer):
             fake_chunk = fake_normed_items[start : start + batch_size]
             real_chunk = real_normed_items[start : start + batch_size]
             logits_fake = self.discriminator_train(self._augment_images(fake_chunk))
-            logits_real = self.discriminator_train(self._augment_images(real_chunk))
+            if real_features is None:
+                logits_real = self.discriminator_train(self._augment_images(real_chunk))
+            else:
+                logits_real = self.discriminator_train(
+                    real_features[start : start + batch_size], from_features=True
+                )
             real_per_image = gan_logits_per_image(logits_real).detach()
             fake_per_image = gan_logits_per_image(logits_fake).detach()
             chunk_loss = gan_discriminator_loss(
@@ -1171,6 +1239,7 @@ class RAEStage1Trainer(Trainer):
             )
             gan_weight *= min(ramp_progress, 1.0)
         use_perceptual = step >= gan.perceptual_start_step and gan.perceptual_weight > 0
+        use_fm = use_gan and gan.feature_matching_weight > 0
         num_microbatches = self.gradient_accumulation_steps
         images_batches: list[ImageBatch] = []
         cached_latents: list[
@@ -1184,24 +1253,112 @@ class RAEStage1Trainer(Trainer):
         reconstruction_metric = perceptual_metric = adversarial_metric = None
         adaptive_metric = None
         generator_logits_metric = None
+        fm_metric = None
         non_padding_tokens = 0
         padding_capacity_tokens = 0
         num_images_per_step = 0
-        for _ in range(num_microbatches):
-            with self._phase_profiler.phase("data"):
-                images, encoder_input = self._next_images(data_iterator)
-            images_batches.append(images)
-            image_items = self._image_items(images)
-            # Encode once per microbatch; the encoder is frozen and
-            # deterministic, so the discriminator phase below re-decodes these
-            # cached clean latents instead of re-running the vision tower.
-            with self._phase_profiler.phase("encode"):
-                latents, grid_thw, fps, temporal_start = self._encode(
-                    images, encoder_input
+        microbatch_targets: list[list[torch.Tensor]] | None = None
+        step_real_features: list[list[torch.Tensor]] | None = None
+        step_aug_params: AugmentationParams | None = None
+        if use_fm:
+            # Feature matching needs the step's real supervision features
+            # before the first decode, and the discriminator phase below
+            # reuses them for the real pass. Fetch and encode every
+            # microbatch first; the supervision sizes follow from grid_thw
+            # (unpatchify maps each grid entry to (h * patch_size,
+            # w * patch_size)) without decoding. The frozen encoder is
+            # deterministic and consumes no RNG, so this hoist leaves the
+            # random stream of the training loop unchanged.
+            microbatch_targets = []
+            with torch.no_grad():
+                for _ in range(num_microbatches):
+                    with self._phase_profiler.phase("data"):
+                        images, encoder_input = self._next_images(data_iterator)
+                    images_batches.append(images)
+                    with self._phase_profiler.phase("encode"):
+                        latents, grid_thw, fps, temporal_start = self._encode(
+                            images, encoder_input
+                        )
+                    cached_latents.append((latents, grid_thw, fps, temporal_start))
+                    batch_tokens = int(grid_thw.prod(dim=-1).sum().item())
+                    self.metrics_processor.ntokens_since_last_log += batch_tokens
+                    non_padding_tokens += batch_tokens
+                    self._tokens_current_epoch += batch_tokens
+                    padding_capacity_tokens += (
+                        self._static_sequence_length
+                        if self._static_sequence_length > 0
+                        else batch_tokens
+                    )
+                    num_images_per_step += len(self._image_items(images))
+                    target_sizes: list[tuple[int, int]] = [
+                        (
+                            int(entry[1]) * decoder.patch_size,
+                            int(entry[2]) * decoder.patch_size,
+                        )
+                        for entry in grid_thw.reshape(-1, 3)
+                    ]
+                    microbatch_targets.append(
+                        self._image_items(
+                            self._supervision_images(images, target_sizes)
+                        )
+                    )
+                flat_targets = [
+                    target
+                    for target_items in microbatch_targets
+                    for target in target_items
+                ]
+                # One augmentation draw per step image, in the step's image
+                # order. The same params augment the real-feature cache below
+                # and the gen-phase fakes: the discriminator-phase real pass
+                # keeps its augmented distribution (no augmentation-detecting
+                # shortcut against the augmented fakes), and feature matching
+                # compares spatially aligned real/fake pairs.
+                step_aug_params = self.discriminator_augmentation.sample_params(
+                    len(flat_targets), self.device
                 )
-            cached_latents.append((latents, grid_thw, fps, temporal_start))
-            batch_tokens = int(grid_thw.prod(dim=-1).sum().item())
-            self.metrics_processor.ntokens_since_last_log += batch_tokens
+                augmented_reals = self._augment_images(
+                    [target * 2.0 - 1.0 for target in flat_targets],
+                    params=step_aug_params,
+                )
+                step_real_features = self.discriminator.cache_real_features(
+                    [(real + 1.0) * 0.5 for real in augmented_reals]
+                )
+        feature_offset = 0
+        for microbatch_index in range(num_microbatches):
+            if microbatch_targets is None:
+                with self._phase_profiler.phase("data"):
+                    images, encoder_input = self._next_images(data_iterator)
+                images_batches.append(images)
+                image_items = self._image_items(images)
+                # Encode once per microbatch; the encoder is frozen and
+                # deterministic, so the discriminator phase below re-decodes
+                # these cached clean latents instead of re-running the vision
+                # tower.
+                with self._phase_profiler.phase("encode"):
+                    latents, grid_thw, fps, temporal_start = self._encode(
+                        images, encoder_input
+                    )
+                cached_latents.append((latents, grid_thw, fps, temporal_start))
+                batch_tokens = int(grid_thw.prod(dim=-1).sum().item())
+                self.metrics_processor.ntokens_since_last_log += batch_tokens
+                target_items = None
+                real_features_items = None
+                aug_params_items = None
+            else:
+                images = images_batches[microbatch_index]
+                image_items = self._image_items(images)
+                latents, grid_thw, fps, temporal_start = cached_latents[
+                    microbatch_index
+                ]
+                target_items = microbatch_targets[microbatch_index]
+                assert step_real_features is not None and step_aug_params is not None
+                feature_end = feature_offset + len(target_items)
+                real_features_items = step_real_features[feature_offset:feature_end]
+                aug_params_items = AugmentationParams(
+                    gates=step_aug_params.gates,
+                    uniforms=step_aug_params.uniforms[:, feature_offset:feature_end],
+                )
+                feature_offset = feature_end
             with torch.autocast(
                 device_type=self.device.type,
                 dtype=torch.bfloat16,
@@ -1219,13 +1376,14 @@ class RAEStage1Trainer(Trainer):
                         temporal_start,
                     )
                 with self._phase_profiler.phase("supervision"):
-                    target_sizes = [
-                        tuple(reconstruction.shape[-2:])
-                        for reconstruction in recon_items
-                    ]
-                    target_items = self._image_items(
-                        self._supervision_images(images, target_sizes)
-                    )
+                    if target_items is None:
+                        target_sizes = [
+                            (reconstruction.shape[-2], reconstruction.shape[-1])
+                            for reconstruction in recon_items
+                        ]
+                        target_items = self._image_items(
+                            self._supervision_images(images, target_sizes)
+                        )
                     reconstruction_loss = torch.stack(
                         [
                             F.l1_loss(reconstruction, target)
@@ -1251,21 +1409,48 @@ class RAEStage1Trainer(Trainer):
                 )
                 if use_gan:
                     with self._phase_profiler.phase("gan"):
-                        fake_augmented = self._augment_images(
-                            [
-                                reconstruction * 2.0 - 1.0
-                                for reconstruction in recon_items
-                            ]
-                        )
-                        logits_fake = self.discriminator_train(fake_augmented)
+                        fake_items = [
+                            reconstruction * 2.0 - 1.0 for reconstruction in recon_items
+                        ]
+                        if use_fm:
+                            assert aug_params_items is not None
+                            # Each fake is augmented with the same draws as its
+                            # paired real (whose augmented features are in the
+                            # step-start cache), so the feature-matching pairs
+                            # stay spatially aligned. The draws come from the
+                            # same distribution as fresh sampling, so the
+                            # adversarial loss keeps its marginal.
+                            fake_augmented = self._augment_images(
+                                fake_items, params=aug_params_items
+                            )
+                            logits_fake, fake_features = self.discriminator_train(
+                                fake_augmented, return_features=True
+                            )
+                            assert real_features_items is not None
+                            fm_loss = self.discriminator.feature_matching(
+                                real_features_items, fake_features
+                            )
+                        else:
+                            fake_augmented = self._augment_images(fake_items)
+                            logits_fake = self.discriminator_train(fake_augmented)
+                            fm_loss = None
                         generator_logits_metric = gan_logits_mean(logits_fake).detach()
                         adversarial_loss = gan_generator_loss(
                             logits_fake, gan.generator_loss
                         )
+                        # Feature matching folds into the GAN term so the
+                        # adaptive weight balances the whole GAN-side gradient
+                        # against reconstruction.
+                        adversarial_total = (
+                            adversarial_loss
+                            if fm_loss is None
+                            else adversarial_loss
+                            + gan.feature_matching_weight * fm_loss
+                        )
                         with self._dmuon_reduce_suppressed():
                             adaptive_weight = self._adaptive_weight(
                                 reconstruction_total,
-                                adversarial_loss,
+                                adversarial_total,
                                 decoder.decoder_pred.weight,
                                 gan.max_adaptive_weight,
                             )
@@ -1282,26 +1467,30 @@ class RAEStage1Trainer(Trainer):
                                 self._warned_adaptive_weight_unavailable = True
                         total_loss = (
                             reconstruction_total
-                            + gan_weight * adaptive_weight * adversarial_loss
+                            + gan_weight * adaptive_weight * adversarial_total
                         )
                 else:
                     adversarial_loss = reconstruction_loss.new_zeros(())
                     adaptive_weight = reconstruction_loss.new_zeros(())
+                    fm_loss = None
                     total_loss = reconstruction_total
                 with self._phase_profiler.phase("backward"):
                     (total_loss / num_microbatches).backward()
-            non_padding_tokens += batch_tokens
-            self._tokens_current_epoch += batch_tokens
-            padding_capacity_tokens += (
-                self._static_sequence_length
-                if self._static_sequence_length > 0
-                else batch_tokens
-            )
-            num_images_per_step += len(image_items)
+            if microbatch_targets is None:
+                non_padding_tokens += batch_tokens
+                self._tokens_current_epoch += batch_tokens
+                padding_capacity_tokens += (
+                    self._static_sequence_length
+                    if self._static_sequence_length > 0
+                    else batch_tokens
+                )
+                num_images_per_step += len(image_items)
             reconstruction_metric = reconstruction_loss.detach()
             perceptual_metric = perceptual_loss.detach()
             adversarial_metric = adversarial_loss.detach()
             adaptive_metric = adaptive_weight.detach()
+            if fm_loss is not None:
+                fm_metric = fm_loss.detach()
 
         assert (
             reconstruction_metric is not None
@@ -1354,7 +1543,7 @@ class RAEStage1Trainer(Trainer):
                             temporal_start,
                         )
                     ]
-                target_sizes = [tuple(fake.shape[-2:]) for fake in fake_items]
+                target_sizes = [(fake.shape[-2], fake.shape[-1]) for fake in fake_items]
                 real_items = self._image_items(
                     self._supervision_images(image_items, target_sizes)
                 )
@@ -1371,7 +1560,11 @@ class RAEStage1Trainer(Trainer):
                     discriminator_real_metric,
                     discriminator_fake_metric,
                     discriminator_accuracy_metric,
-                ) = self._update_discriminator(fake_normed_items, real_normed_items)
+                ) = self._update_discriminator(
+                    fake_normed_items,
+                    real_normed_items,
+                    real_features=step_real_features,
+                )
                 if update_index == 0:
                     # Logging-only DINO feature distance (uncalibrated
                     # LPIPS-style metric) on a 16-pair subsample. Eager and
@@ -1432,6 +1625,7 @@ class RAEStage1Trainer(Trainer):
                     discriminator_fake_metric,
                     discriminator_accuracy_metric,
                     dino_distance_metric,
+                    fm_metric if fm_metric is not None else metric_source.new_zeros(()),
                 ),
                 metrics_processor=self.metrics_processor,
                 non_padding_ratio=non_padding_tokens / padding_capacity_tokens,
@@ -1544,6 +1738,49 @@ class RAEStage1Trainer(Trainer):
         )
 
 
+def _nearest_neighbor_indices(images: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Per-anchor nearest neighbor in 32x32 grayscale pixel space (L2)."""
+    gray_ND = torch.stack(
+        [
+            F.interpolate(
+                image_CHW.unsqueeze(0).float(),
+                size=(32, 32),
+                mode="bilinear",
+                antialias=True,
+            )
+            .mean(dim=1)
+            .flatten(1)[0]
+            for image_CHW in images
+        ]
+    )
+    distances_NN = torch.cdist(gray_ND, gray_ND)
+    distances_NN.fill_diagonal_(float("inf"))
+    return distances_NN.argmin(dim=1)
+
+
+def _r_phi_ratio(
+    phi_a: Sequence[torch.Tensor],
+    phi_b: Sequence[torch.Tensor],
+    phi_m: Sequence[torch.Tensor],
+) -> float | None:
+    """Mean over pairs of 2*|phi(m)-phi(a)| / |phi(b)-phi(a)| (L1 means).
+
+    m is the (quantized) midpoint of a and b. Pairs whose endpoints coincide
+    in feature space (zero denominator) are skipped; None when no pair
+    qualifies.
+    """
+    ratios = []
+    for anchor, neighbor, midpoint in zip(phi_a, phi_b, phi_m, strict=True):
+        denominator = (neighbor.float() - anchor.float()).abs().mean()
+        if denominator.item() == 0.0:
+            continue
+        numerator = 2.0 * (midpoint.float() - anchor.float()).abs().mean()
+        ratios.append((numerator / denominator).item())
+    if not ratios:
+        return None
+    return sum(ratios) / len(ratios)
+
+
 class RAEValidator(BaseValidator):
     """Validate RAE reconstructions and optionally log a comparison image."""
 
@@ -1611,13 +1848,121 @@ class RAEValidator(BaseValidator):
         )
 
     @torch.no_grad()
+    def _off_manifold_metrics(
+        self,
+        eval_pairs: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> dict[str, float]:
+        """R_phi off-manifold penalties and a normalized feature distance.
+
+        Anchors pair with their nearest neighbor within the same resolution
+        (feature diffs require a shared token grid). For each pair (a, b) the
+        midpoint m = (a+b)/2 in [-1, 1] is quantized to the 8-bit grid used
+        for discriminator fakes, and R_phi = 2*|phi(m)-phi(a)| / |phi(b)-phi(a)|
+        is computed per probed backbone depth and on the concatenated head
+        logits. dino_dist_normalized divides the real-vs-reconstruction
+        backbone distance by the mean real-to-neighbor distance. Everything
+        is eager and no-grad, once per validation round.
+        """
+        discriminator = self.trainer.discriminator
+        was_training = discriminator.training
+        discriminator.eval()
+        try:
+            targets = [target.float() for target, _ in eval_pairs]
+            groups: dict[tuple[int, int], list[int]] = {}
+            for index, target in enumerate(targets):
+                groups.setdefault((target.shape[-2], target.shape[-1]), []).append(
+                    index
+                )
+            anchor_indices: list[int] = []
+            neighbor_indices: list[int] = []
+            for indices in groups.values():
+                if len(indices) < 2:
+                    continue
+                neighbors = _nearest_neighbor_indices(
+                    [targets[index] for index in indices]
+                )
+                anchor_indices.extend(indices)
+                neighbor_indices.extend(
+                    indices[int(neighbor)] for neighbor in neighbors.tolist()
+                )
+            if not anchor_indices:
+                return {}
+            a01 = [targets[index] for index in anchor_indices]
+            b01 = [targets[index] for index in neighbor_indices]
+            mid_neg1 = [
+                torch.round((ta + tb) * 127.5) / 127.5 - 1.0
+                for ta, tb in zip(a01, b01, strict=True)
+            ]
+            mid01 = [(midpoint + 1.0) * 0.5 for midpoint in mid_neg1]
+            num_pairs = len(a01)
+            features = discriminator.features(a01 + b01 + mid01)
+            phi_a, phi_b, phi_m = (
+                features[:num_pairs],
+                features[num_pairs : 2 * num_pairs],
+                features[2 * num_pairs :],
+            )
+            metrics: dict[str, float] = {}
+            neighbor_distances: list[float] = []
+            depth_ratios: list[float] = []
+            for depth in range(len(phi_a[0])):
+                anchors = [per_image[depth] for per_image in phi_a]
+                neighbors = [per_image[depth] for per_image in phi_b]
+                midpoints = [per_image[depth] for per_image in phi_m]
+                ratio = _r_phi_ratio(anchors, neighbors, midpoints)
+                if ratio is not None:
+                    metrics[f"rae/r_phi_backbone_depth{depth}"] = ratio
+                    depth_ratios.append(ratio)
+                neighbor_distances.extend(
+                    (neighbor.float() - anchor.float()).abs().mean().item()
+                    for anchor, neighbor in zip(anchors, neighbors, strict=True)
+                )
+            if depth_ratios:
+                metrics["rae/r_phi_backbone"] = sum(depth_ratios) / len(depth_ratios)
+            # Disc-feature R_phi: phi is the concatenated per-patch logits of
+            # all heads, the learned adversarial space.
+            logits = discriminator(
+                [image * 2.0 - 1.0 for image in a01]
+                + [image * 2.0 - 1.0 for image in b01]
+                + mid_neg1
+            )
+            disc_a, disc_b, disc_m = (
+                logits[:num_pairs],
+                logits[num_pairs : 2 * num_pairs],
+                logits[2 * num_pairs :],
+            )
+            disc_ratio = _r_phi_ratio(
+                [logit.flatten() for logit in disc_a],
+                [logit.flatten() for logit in disc_b],
+                [logit.flatten() for logit in disc_m],
+            )
+            if disc_ratio is not None:
+                metrics["rae/r_phi_disc"] = disc_ratio
+            dino_distance = discriminator.feature_distance(
+                [(target * 2.0 - 1.0) for target, _ in eval_pairs[:16]],
+                [
+                    (reconstruction * 2.0 - 1.0).clamp(-1.0, 1.0)
+                    for _, reconstruction in eval_pairs[:16]
+                ],
+            )
+            mean_neighbor_distance = sum(neighbor_distances) / len(neighbor_distances)
+            if mean_neighbor_distance > 0:
+                metrics["rae/dino_dist_normalized"] = (
+                    float(dino_distance) / mean_neighbor_distance
+                )
+            return metrics
+        finally:
+            discriminator.train(was_training)
+
+    @torch.no_grad()
     def validate(self, model_parts: list[torch.nn.Module], step: int) -> None:
         decoder = model_parts[0]
         was_training = decoder.training
         decoder.eval()
+        collect_r_phi = self.trainer.config.discriminator.backbone_kind == "hf"
         validation_dataloader = self._validation_dataloader()
         validation_iterator = iter(iterate_and_close_dataloader(validation_dataloader))
         losses: list[torch.Tensor] = []
+        eval_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
         comparison_image = None
         num_batches = 0
         num_tokens = 0
@@ -1662,7 +2007,7 @@ class RAEValidator(BaseValidator):
                 )
                 self.trainer.metrics_processor.ntokens_since_last_log += batch_tokens
                 target_sizes = [
-                    tuple(reconstruction.shape[-2:])
+                    (reconstruction.shape[-2], reconstruction.shape[-1])
                     for reconstruction in reconstructions
                 ]
                 targets = self.trainer._image_items(
@@ -1674,6 +2019,13 @@ class RAEValidator(BaseValidator):
                         reconstructions, targets, strict=True
                     )
                 )
+                if collect_r_phi and len(eval_pairs) < 32:
+                    eval_pairs.extend(
+                        (target.detach(), reconstruction.detach())
+                        for target, reconstruction in zip(
+                            targets, reconstructions, strict=True
+                        )
+                    )
                 if comparison_image is None and (
                     self.trainer.config.metrics.enable_wandb
                     or self.trainer.config.metrics.enable_swanlab
@@ -1697,6 +2049,8 @@ class RAEValidator(BaseValidator):
             ),
             "validation_metrics/num_images_per_step": num_images,
         }
+        if collect_r_phi and len(eval_pairs) >= 2:
+            extras.update(self._off_manifold_metrics(eval_pairs[:32]))
         if comparison_image is not None:
             extras[
                 "validation_images/ground_truth_vs_reconstruction"

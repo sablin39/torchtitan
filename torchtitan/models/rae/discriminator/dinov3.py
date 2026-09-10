@@ -35,7 +35,7 @@ import math
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import cast, Literal, overload
 
 import torch
 import torch.nn as nn
@@ -587,7 +587,21 @@ class RAEFeatureDiscriminator(nn.Module):
         """Frozen-backbone activations (B, C, L) at the probed depths."""
         return self.backbone(images_BCHW, key_depths=self.key_depths)
 
-    def _forward_group(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+    @overload
+    def _forward_group(
+        self, images_BCHW: torch.Tensor, *, return_activations: Literal[False] = False
+    ) -> torch.Tensor:
+        ...
+
+    @overload
+    def _forward_group(
+        self, images_BCHW: torch.Tensor, *, return_activations: Literal[True]
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        ...
+
+    def _forward_group(
+        self, images_BCHW: torch.Tensor, *, return_activations: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Per-patch logits (B, H, L) for one same-resolution batch.
 
         The heads stay eager even when the backbone is compiled: their
@@ -604,7 +618,10 @@ class RAEFeatureDiscriminator(nn.Module):
             head(activation_BCL)
             for head, activation_BCL in zip(self.heads, activations_BCL, strict=True)
         ]
-        return torch.cat(logits_BHL, dim=1)
+        logits_BHL = torch.cat(logits_BHL, dim=1)
+        if return_activations:
+            return logits_BHL, activations_BCL
+        return logits_BHL
 
     def _group_by_shape(
         self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
@@ -648,39 +665,176 @@ class RAEFeatureDiscriminator(nn.Module):
                 yield chunk, (group_BCHW - mean_1C11) / std_1C11
 
     def _forward_hf(
-        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
-    ) -> torch.Tensor | list[torch.Tensor]:
+        self,
+        images_BCHW: torch.Tensor | Sequence[torch.Tensor],
+        *,
+        return_features: bool = False,
+    ) -> (
+        torch.Tensor
+        | list[torch.Tensor]
+        | tuple[torch.Tensor | list[torch.Tensor], list[list[torch.Tensor]]]
+    ):
         images, groups, return_stacked = self._group_by_shape(images_BCHW)
         outputs: list[torch.Tensor | None] = [None] * len(images)
+        feature_outputs: list[list[torch.Tensor] | None] | None = (
+            [None] * len(images) if return_features else None
+        )
         for chunk, group_BCHW in self._normalized_group_chunks(images, groups):
-            logits_BHL = self._forward_group(group_BCHW)
-            for chunk_index, image_index in enumerate(chunk):
-                outputs[image_index] = logits_BHL[chunk_index]
+            if feature_outputs is not None:
+                logits_BHL, activations_BCL = self._forward_group(
+                    group_BCHW, return_activations=True
+                )
+                for chunk_index, image_index in enumerate(chunk):
+                    outputs[image_index] = logits_BHL[chunk_index]
+                    feature_outputs[image_index] = [
+                        activation_BCL[chunk_index]
+                        for activation_BCL in activations_BCL
+                    ]
+            else:
+                logits_BHL = self._forward_group(group_BCHW)
+                for chunk_index, image_index in enumerate(chunk):
+                    outputs[image_index] = logits_BHL[chunk_index]
         if any(output is None for output in outputs):
             raise RuntimeError("HF vision discriminator did not produce every output")
-        if return_stacked:
-            return torch.stack(outputs)  # type: ignore[arg-type]
-        return outputs  # type: ignore[return-value]
+        final_outputs = cast(list[torch.Tensor], outputs)
+        logits = torch.stack(final_outputs) if return_stacked else final_outputs
+        if feature_outputs is None:
+            return logits
+        final_features = cast(list[list[torch.Tensor]], feature_outputs)
+        return logits, final_features
 
     def features(
-        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
+        self,
+        images_BCHW: torch.Tensor | Sequence[torch.Tensor],
+        *,
+        use_compiled: bool = False,
     ) -> list[list[torch.Tensor]]:
         """Per-image frozen-backbone activations (C, L_i) at each probed depth.
 
-        Eager by design: this path exists for no-gradient metric logging on
+        Eager by default: this path exists for no-gradient metric logging on
         small subsamples, and bypasses the compiled backbone so no extra
-        autograd variant gets compiled mid-run.
+        autograd variant gets compiled mid-run. ``use_compiled`` routes the HF
+        backbone through the compiled forward for the step-start real-feature
+        cache. HF inputs are [0, 1] images; fixed-kind inputs are [-1, 1].
         """
+        if not self._is_hf_model:
+            items = (
+                list(images_BCHW.unbind(0))
+                if isinstance(images_BCHW, torch.Tensor)
+                else list(images_BCHW)
+            )
+            groups: dict[tuple[int, int], list[int]] = {}
+            for index, image_CHW in enumerate(items):
+                height, width = image_CHW.shape[-2:]
+                groups.setdefault((height, width), []).append(index)
+            outputs: list[list[torch.Tensor] | None] = [None] * len(items)
+            for indices in groups.values():
+                group_BCHW = torch.stack([items[index] for index in indices])
+                group_features = self.backbone(group_BCHW)
+                for group_index, image_index in enumerate(indices):
+                    outputs[image_index] = [
+                        level_BCL[group_index] for level_BCL in group_features
+                    ]
+            if any(output is None for output in outputs):
+                raise RuntimeError("RAE discriminator did not produce every output")
+            return outputs  # type: ignore[return-value]
         images, groups, _ = self._group_by_shape(images_BCHW)
-        outputs: list[list[torch.Tensor] | None] = [None] * len(images)
+        backbone = (
+            self._compiled_backbone
+            if use_compiled and self._compiled_backbone is not None
+            else self._backbone_features
+        )
+        outputs = [None] * len(images)
         for chunk, group_BCHW in self._normalized_group_chunks(images, groups):
-            group_activations = self._backbone_features(group_BCHW)
+            group_activations = backbone(group_BCHW)
             for chunk_index, image_index in enumerate(chunk):
                 outputs[image_index] = [
                     activation_BCL[chunk_index] for activation_BCL in group_activations
                 ]
         if any(output is None for output in outputs):
             raise RuntimeError("HF vision discriminator did not produce every output")
+        return outputs  # type: ignore[return-value]
+
+    def cache_real_features(
+        self, images_01: Sequence[torch.Tensor]
+    ) -> list[list[torch.Tensor]]:
+        """Step-start cache of per-image real activations for feature matching.
+
+        Takes [0, 1] images (the trainer passes the step's supervision reals
+        after the shared augmentation draws, so the discriminator-phase real
+        pass keeps its augmented distribution) and returns per-image per-depth
+        activations, computed through the compiled HF backbone when available.
+        The trainer reuses the cache for the discriminator-phase real pass, so
+        the real backbone forward runs once per step instead of twice.
+        """
+        if self._is_hf_model:
+            return self.features(list(images_01), use_compiled=True)
+        return self.features([image * 2.0 - 1.0 for image in images_01])
+
+    def feature_matching(
+        self,
+        real_features: Sequence[Sequence[torch.Tensor]],
+        fake_features: Sequence[Sequence[torch.Tensor]],
+    ) -> torch.Tensor:
+        """Per-patch feature-matching loss between paired activations.
+
+        Per image and depth: the mean over channels of |fake - real| (diffs in
+        fp32, as in feature_distance) gives a per-patch map, reduced to a
+        scalar by the patch mean. The loss averages over depths, then images.
+        """
+        if len(real_features) != len(fake_features) or not real_features:
+            raise ValueError("feature_matching expects paired non-empty lists")
+        per_image = [
+            torch.stack(
+                [
+                    (fake_CL.float() - real_CL.float()).abs().mean(dim=0).mean()
+                    for fake_CL, real_CL in zip(fake_depths, real_depths, strict=True)
+                ]
+            ).mean()
+            for fake_depths, real_depths in zip(
+                fake_features, real_features, strict=True
+            )
+        ]
+        return torch.stack(per_image).mean()
+
+    def _heads_from_feature_batch(self, features: list[torch.Tensor]) -> torch.Tensor:
+        """Per-patch logits (B, H, L) from one same-shape activation batch."""
+        # Fixed-kind pyramid levels shrink by stride 2; pool each head's
+        # per-patch logits to the coarsest grid so the heads stack into one
+        # (B, H, L) tensor. For the HF backbone every depth shares L and the
+        # pool is the identity.
+        min_tokens = min(feature.shape[-1] for feature in features)
+        return torch.cat(
+            [
+                F.adaptive_avg_pool1d(head(feature), min_tokens)
+                for head, feature in zip(self.heads, features, strict=True)
+            ],
+            dim=1,
+        )
+
+    def _logits_from_features(
+        self, features_per_image: Sequence[Sequence[torch.Tensor]]
+    ) -> list[torch.Tensor]:
+        """Eager head logits (H, L_i) from cached per-image activations."""
+        if not features_per_image:
+            raise ValueError("RAE discriminator requires at least one image")
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for index, feature_depths in enumerate(features_per_image):
+            groups.setdefault(
+                tuple(depth_CL.shape[-1] for depth_CL in feature_depths), []
+            ).append(index)
+        outputs: list[torch.Tensor | None] = [None] * len(features_per_image)
+        for indices in groups.values():
+            num_depths = len(features_per_image[indices[0]])
+            stacked_BCL = [
+                torch.stack([features_per_image[index][depth] for index in indices])
+                for depth in range(num_depths)
+            ]
+            logits_BHL = self._heads_from_feature_batch(stacked_BCL)
+            for group_index, image_index in enumerate(indices):
+                outputs[image_index] = logits_BHL[group_index]
+        if any(output is None for output in outputs):
+            raise RuntimeError("RAE discriminator did not produce every output")
         return outputs  # type: ignore[return-value]
 
     def feature_distance(
@@ -724,52 +878,94 @@ class RAEFeatureDiscriminator(nn.Module):
             list(fake_items),
         ).mean()
 
-    def _forward_fixed_batch(self, images_BCHW: torch.Tensor) -> torch.Tensor:
+    @overload
+    def _forward_fixed_batch(
+        self, images_BCHW: torch.Tensor, *, return_features: Literal[False] = False
+    ) -> torch.Tensor:
+        ...
+
+    @overload
+    def _forward_fixed_batch(
+        self, images_BCHW: torch.Tensor, *, return_features: Literal[True]
+    ) -> tuple[torch.Tensor, list[list[torch.Tensor]]]:
+        ...
+
+    def _forward_fixed_batch(
+        self, images_BCHW: torch.Tensor, *, return_features: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, list[list[torch.Tensor]]]:
         """Per-patch logits (B, H, L) for the fixed feature pyramid."""
         features = self.backbone(images_BCHW)
-        # Pyramid levels shrink by stride 2; pool each head's per-patch logits
-        # to the coarsest grid so the heads stack into one (B, H, L) tensor.
-        min_tokens = min(feature.shape[-1] for feature in features)
-        return torch.cat(
-            [
-                F.adaptive_avg_pool1d(head(feature), min_tokens)
-                for head, feature in zip(self.heads, features, strict=True)
-            ],
-            dim=1,
-        )
+        logits_BHL = self._heads_from_feature_batch(features)
+        if not return_features:
+            return logits_BHL
+        per_image = [
+            [level_BCL[index] for level_BCL in features]
+            for index in range(images_BCHW.shape[0])
+        ]
+        return logits_BHL, per_image
 
     def forward(
-        self, images_BCHW: torch.Tensor | Sequence[torch.Tensor]
-    ) -> torch.Tensor | list[torch.Tensor]:
+        self,
+        images_BCHW: torch.Tensor
+        | Sequence[torch.Tensor]
+        | Sequence[Sequence[torch.Tensor]],
+        *,
+        return_features: bool = False,
+        from_features: bool = False,
+    ) -> (
+        torch.Tensor
+        | list[torch.Tensor]
+        | tuple[torch.Tensor | list[torch.Tensor], list[list[torch.Tensor]]]
+    ):
+        if from_features:
+            # Cached per-image backbone activations (see cache_real_features):
+            # only the eager heads run, which is what the discriminator-phase
+            # real pass needs once the step's real features are cached.
+            return self._logits_from_features(images_BCHW)  # type: ignore[arg-type]
+        images_input = cast(torch.Tensor | Sequence[torch.Tensor], images_BCHW)
         if self._is_hf_model:
-            if isinstance(images_BCHW, torch.Tensor):
-                images = (images_BCHW + 1.0) * 0.5
+            if isinstance(images_input, torch.Tensor):
+                images = (images_input + 1.0) * 0.5
             else:
-                images = [(image + 1.0) * 0.5 for image in images_BCHW]
-            return self._forward_hf(images)
-        if isinstance(images_BCHW, torch.Tensor):
-            if images_BCHW.ndim != 4:
+                images = [(image + 1.0) * 0.5 for image in images_input]
+            return self._forward_hf(images, return_features=return_features)
+        if isinstance(images_input, torch.Tensor):
+            if images_input.ndim != 4:
                 raise ValueError("Fixed RAE discriminator expects BCHW images")
-            return self._forward_fixed_batch(images_BCHW)
-        image_items = list(images_BCHW)
+            return self._forward_fixed_batch(
+                images_input, return_features=return_features
+            )
+        image_items = list(images_input)
         if not image_items:
             raise ValueError("RAE discriminator requires at least one image")
         for image_CHW in image_items:
             if image_CHW.ndim != 3 or image_CHW.shape[0] != 3:
                 raise ValueError("RAE discriminator expects three-channel CHW images")
         outputs: list[torch.Tensor | None] = [None] * len(image_items)
+        feature_outputs: list[list[torch.Tensor] | None] | None = (
+            [None] * len(image_items) if return_features else None
+        )
         groups: dict[tuple[int, int], list[int]] = {}
         for index, image_CHW in enumerate(image_items):
-            groups.setdefault(tuple(image_CHW.shape[-2:]), []).append(index)
+            height, width = image_CHW.shape[-2:]
+            groups.setdefault((height, width), []).append(index)
         for indices in groups.values():
-            logits_BHL = self._forward_fixed_batch(
-                torch.stack([image_items[index] for index in indices])
-            )
+            group_BCHW = torch.stack([image_items[index] for index in indices])
+            if return_features:
+                logits_BHL, group_features = self._forward_fixed_batch(
+                    group_BCHW, return_features=True
+                )
+            else:
+                logits_BHL = self._forward_fixed_batch(group_BCHW)
             for group_index, image_index in enumerate(indices):
                 outputs[image_index] = logits_BHL[group_index]
+                if feature_outputs is not None:
+                    feature_outputs[image_index] = group_features[group_index]
         if any(output is None for output in outputs):
             raise RuntimeError("RAE discriminator did not produce every output")
-        return outputs  # type: ignore[return-value]
+        if feature_outputs is None:
+            return outputs  # type: ignore[return-value]
+        return outputs, feature_outputs  # type: ignore[return-value]
 
 
 __all__ = ["DINOv3ViTBackbone", "RAEFeatureDiscriminator"]

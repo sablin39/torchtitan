@@ -38,6 +38,9 @@ from torchtitan.models.rae.encoder import (
     RAEEncoderConfig,
 )
 from torchtitan.models.rae.trainer import (
+    _nearest_neighbor_indices,
+    _r_phi_ratio,
+    AugmentationParams,
     DiscriminatorAugmentation,
     log_stage1_metrics,
     RAEGANConfig,
@@ -694,6 +697,169 @@ def test_feature_distance_is_zero_for_identical_pairs() -> None:
     assert different.item() > 0.0
 
 
+def test_feature_matching_loss_flows_gradient_to_decoder_side() -> None:
+    torch.manual_seed(0)
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40)]
+    real_features = discriminator.cache_real_features(targets)
+    fakes = [
+        (torch.rand(3, 32, 32) * 2.0 - 1.0).requires_grad_(True),
+        (torch.rand(3, 24, 40) * 2.0 - 1.0).requires_grad_(True),
+    ]
+    logits, fake_features = discriminator(fakes, return_features=True)
+    assert len(logits) == len(fakes) == len(fake_features)
+    fm_loss = discriminator.feature_matching(real_features, fake_features)
+    assert fm_loss.item() > 0.0
+    fm_loss.backward()
+    for fake in fakes:
+        assert fake.grad is not None
+        assert fake.grad.abs().sum() > 0
+
+
+def test_feature_matching_loss_is_zero_for_identical_features() -> None:
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    real_features = discriminator.cache_real_features([torch.rand(3, 32, 32)])
+    assert discriminator.feature_matching(
+        real_features, real_features
+    ).item() == pytest.approx(0.0, abs=1e-7)
+
+
+def _translation_params(offset_fill: float) -> AugmentationParams:
+    # Identity color factors (0.5 fills), translation gated on, offsets driven
+    # by the fill: 0.0 -> -delta, ~1.0 -> +delta with delta = round(side/8).
+    gates = torch.tensor([True, True, True])
+    random_B = torch.full((7, 1, 1, 1), 0.5)
+    random_B[0] = offset_fill
+    random_B[1] = offset_fill
+    return AugmentationParams(gates=gates, uniforms=random_B)
+
+
+def test_discriminator_augmentation_call_matches_sample_then_apply() -> None:
+    augmentation = DiscriminatorAugmentation(probability=1.0, cutout=0.0)
+    images = torch.randn(2, 3, 16, 16)
+    torch.manual_seed(0)
+    expected = augmentation(images)
+    torch.manual_seed(0)
+    params = augmentation.sample_params(2, images.device)
+    torch.testing.assert_close(augmentation.apply(images, params), expected)
+
+
+def test_feature_matching_with_shared_params_is_aligned() -> None:
+    torch.manual_seed(0)
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    augmentation = DiscriminatorAugmentation(probability=1.0, cutout=0.0)
+    real = torch.rand(3, 32, 32) * 2.0 - 1.0
+    fake = real.clone()
+    params_a = _translation_params(0.0)
+    params_b = _translation_params(0.999999)
+    fake_augmented = augmentation.apply(fake.unsqueeze(0), params_a).squeeze(0)
+    real_same_params = augmentation.apply(real.unsqueeze(0), params_a).squeeze(0)
+    real_other_params = augmentation.apply(real.unsqueeze(0), params_b).squeeze(0)
+    fake_features = discriminator.features([fake_augmented])
+    aligned = discriminator.feature_matching(
+        discriminator.features([real_same_params]), fake_features
+    )
+    misaligned = discriminator.feature_matching(
+        discriminator.features([real_other_params]), fake_features
+    )
+    assert aligned.item() == pytest.approx(0.0, abs=1e-6)
+    assert misaligned.item() > 0.01
+
+
+def test_cached_real_features_carry_augmentation() -> None:
+    torch.manual_seed(0)
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    discriminator.eval()
+    augmentation = DiscriminatorAugmentation(probability=1.0, cutout=0.0)
+    target = torch.rand(3, 32, 32)
+    real_neg1 = target * 2.0 - 1.0
+    augmented = augmentation.apply(
+        real_neg1.unsqueeze(0), _translation_params(0.0)
+    ).squeeze(0)
+    cache = discriminator.cache_real_features([(augmented + 1.0) * 0.5])
+    logits_from_cache = discriminator(cache, from_features=True)[0]
+    logits_augmented = discriminator([augmented])[0]
+    logits_unaugmented = discriminator([real_neg1])[0]
+    torch.testing.assert_close(logits_from_cache, logits_augmented)
+    assert not torch.allclose(logits_from_cache, logits_unaugmented)
+
+
+def test_feature_matching_weight_defaults_and_validation() -> None:
+    assert RAEGANConfig().feature_matching_weight == 1.0
+    with pytest.raises(ValueError, match="feature_matching_weight"):
+        RAEGANConfig(feature_matching_weight=-0.5)
+    # The debug recipe keeps the pre-feature-matching loss.
+    assert rae_stage1_debug().gan.feature_matching_weight == 0.0
+    production = rae_stage1_openimages_static_96k_uvit()
+    assert production.gan.feature_matching_weight == 1.0
+
+
+def test_discriminator_update_reuses_cached_real_features() -> None:
+    torch.manual_seed(0)
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    # eval() pins the spectral-norm weights so the cached and uncached real
+    # passes are comparable.
+    discriminator.eval()
+    trainer = object.__new__(RAEStage1Trainer)
+    trainer.config = SimpleNamespace(
+        gan=RAEGANConfig(discriminator_update_batch_size=16)
+    )
+    trainer.device = torch.device("cpu")
+    trainer.discriminator_train = discriminator
+    trainer.discriminator_augmentation = DiscriminatorAugmentation(probability=0.0)
+    targets = [torch.rand(3, 16, 16) for _ in range(4)]
+    real = [target * 2.0 - 1.0 for target in targets]
+    fake = [torch.randn(3, 16, 16) for _ in range(4)]
+    real_features = discriminator.cache_real_features(targets)
+    _, real_logits_cached, _, _ = trainer._update_discriminator(
+        fake, real, real_features=real_features
+    )
+    _, real_logits_uncached, _, _ = trainer._update_discriminator(fake, real)
+    torch.testing.assert_close(real_logits_cached, real_logits_uncached)
+    head_grads = [
+        parameter.grad
+        for parameter in discriminator.heads.parameters()
+        if parameter.grad is not None
+    ]
+    assert head_grads
+
+
+def test_r_phi_ratio_identity_feature_map_is_one() -> None:
+    # phi = identity: phi(m) = (phi(a) + phi(b)) / 2 exactly, so R = 1.
+    anchors = [torch.tensor([0.0, 0.0]), torch.tensor([1.0, 1.0])]
+    neighbors = [torch.tensor([2.0, 0.0]), torch.tensor([1.0, 5.0])]
+    midpoints = [(a + b) / 2 for a, b in zip(anchors, neighbors, strict=True)]
+    assert _r_phi_ratio(anchors, neighbors, midpoints) == pytest.approx(1.0)
+
+
+def test_r_phi_ratio_skips_degenerate_pairs() -> None:
+    anchors = [torch.tensor([0.0, 0.0]), torch.tensor([3.0, 3.0])]
+    # The first pair has coinciding endpoints (zero denominator) and is
+    # skipped; the second pair is the identity case with R = 1.
+    neighbors = [torch.tensor([0.0, 0.0]), torch.tensor([5.0, 3.0])]
+    midpoints = [torch.tensor([0.0, 0.0]), torch.tensor([4.0, 3.0])]
+    assert _r_phi_ratio(anchors, neighbors, midpoints) == pytest.approx(1.0)
+    assert _r_phi_ratio([anchors[0]], [neighbors[0]], [midpoints[0]]) is None
+
+
+def test_nearest_neighbor_indices_match_pixel_content() -> None:
+    black_a = torch.zeros(3, 16, 16)
+    black_b = torch.full((3, 16, 16), 0.01)
+    white = torch.ones(3, 16, 16)
+    neighbors = _nearest_neighbor_indices([black_a, black_b, white])
+    assert neighbors.tolist() == [1, 0, 1]
+
+
 def test_perceptual_list_path_groups_shapes_and_matches_loop() -> None:
     torch.manual_seed(0)
     loss = RAEPerceptualLoss(kind="fixed", channels=8)
@@ -775,7 +941,7 @@ def test_stage1_metrics_include_packing_stats() -> None:
 
     log_stage1_metrics(
         1,
-        [torch.zeros(()) for _ in range(12)],
+        [torch.zeros(()) for _ in range(13)],
         metrics_processor=Metrics(),
         non_padding_ratio=0.75,
         num_images_per_step=16.0,
@@ -784,6 +950,7 @@ def test_stage1_metrics_include_packing_stats() -> None:
     assert extra_metrics["rae/non_padding_ratio"] == 0.75
     assert extra_metrics["rae/num_images_per_step"] == 16.0
     assert "rae/discriminator_accuracy" in extra_metrics
+    assert "rae/feature_matching_loss" in extra_metrics
 
 
 def test_rae_recipe_enables_wandb_and_swanlab_tracking() -> None:
@@ -829,7 +996,7 @@ def test_openimages_static_recipe_keeps_token_budget_and_tar_train_shards() -> N
     assert config.training.num_tokens_per_microbatch_per_dp_rank == 97280
     assert config.training.num_tokens_per_train_step == 3112960
     assert config.validator.enable
-    assert config.validator.steps == 16
+    assert config.validator.steps == 64
     assert config.validator.freq == 500
 
 

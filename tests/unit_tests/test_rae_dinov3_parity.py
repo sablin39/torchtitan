@@ -163,6 +163,18 @@ def test_integrated_discriminator_matches_hf(
         logits_BHL = discriminator(torch.rand(2, 3, 224, 224, device="cuda"))
         assert logits_BHL.shape == (2, len(KEY_DEPTHS) + 1, 14 * 14)
         assert torch.isfinite(logits_BHL).all()
+        # return_features / from_features round trip used by feature matching.
+        # Eval mode pins the spectral-norm weights; train-mode buffer mutation
+        # between passes makes a bitwise round trip impossible by design.
+        discriminator.eval()
+        logits2_BHL, feats = discriminator(
+            torch.rand(2, 3, 224, 224, device="cuda"), return_features=True
+        )
+        assert len(feats) == 2
+        assert len(feats[0]) == len(KEY_DEPTHS) + 1
+        assert feats[0][0].shape == (768, 14 * 14)
+        logits3_BHL = discriminator(feats, from_features=True)
+        _assert_close(logits3_BHL, logits2_BHL, label="from_features round trip")
         # Eager features() logging path used by feature_distance.
         features = discriminator.features([torch.rand(3, 224, 224, device="cuda")])
         assert len(features) == 1 and len(features[0]) == len(KEY_DEPTHS) + 1
