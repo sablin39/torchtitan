@@ -365,6 +365,42 @@ def test_hf_cursor_restores_through_grain_wrappers(tmp_path):
     assert [next(restored) for _ in range(5)] == expected
 
 
+def test_hf_cursor_state_layout_is_position_independent(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    write_jsonl(path, [{"id": index} for index in range(20)])
+    config = SingleDatasetConfig(
+        source=HuggingFaceStreamingSource.Config(
+            path="json",
+            split="train",
+            load_dataset_kwargs={"data_files": str(path)},
+        ),
+    )
+    policy = dataset_iteration_policy(repeat=True, shuffle=True)
+
+    def leaf_keys(state, prefix=()):
+        if isinstance(state, dict):
+            keys = set()
+            for key, value in state.items():
+                keys |= leaf_keys(value, prefix + (key,))
+            return keys
+        return {prefix}
+
+    iterator = iter(config.build(context=CONTEXT, dataset_iteration_policy=policy))
+    fresh_keys = leaf_keys(iterator.get_state())
+    for _ in range(7):
+        next(iterator)
+    state = iterator.get_state()
+    # DCP builds the load plan from a fresh dataloader, so the state layout
+    # must not depend on the iteration position.
+    assert leaf_keys(state) == fresh_keys
+    expected = [next(iterator) for _ in range(6)]
+
+    restored = iter(config.build(context=CONTEXT, dataset_iteration_policy=policy))
+    restored.set_state(state)
+
+    assert [next(restored) for _ in range(6)] == expected
+
+
 @pytest.mark.parametrize(
     ("source_type", "streaming"),
     [

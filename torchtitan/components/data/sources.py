@@ -6,6 +6,7 @@
 
 """Storage adapters for Grain datasets."""
 
+import copy
 import fnmatch
 import glob
 import json
@@ -419,6 +420,73 @@ def _file_patterns_to_paths(patterns: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(paths)
 
 
+def _extract_shard_position(state: dict[str, Any]) -> tuple[int, int, int] | None:
+    """Effective next-to-yield position in an HF examples-iterable state tree.
+
+    Returns (shard_idx, shard_example_idx, examples_since): the first two are
+    a position HF can seek a shard reader to directly (a table/chunk boundary
+    held in the ``previous_state`` resume bookkeeping) and the third counts
+    examples consumed past that boundary. Layers whose inner reader runs
+    ahead of what they yielded (arrow table readers buffer whole tables) are
+    still exact. ``previous_state`` subtrees are never descended into; they
+    are consumed by their parent node instead.
+    """
+    previous = state.get("previous_state")
+    if isinstance(previous, dict):
+        for counter in (
+            "num_chunks_since_previous_state",
+            "num_examples_since_previous_state",
+        ):
+            if counter in state:
+                return (
+                    previous["shard_idx"],
+                    previous["shard_example_idx"],
+                    state[counter],
+                )
+    if "shard_idx" in state and "shard_example_idx" in state:
+        return state["shard_idx"], state["shard_example_idx"], 0
+    for key, value in state.items():
+        if key != "previous_state" and isinstance(value, dict):
+            position = _extract_shard_position(value)
+            if position is not None:
+                return position
+    return None
+
+
+def _patch_shard_position(
+    state: dict[str, Any],
+    shard_idx: int,
+    shard_example_idx: int,
+    examples_since: int,
+) -> bool:
+    """Write a shard position into a fresh HF state tree, in place."""
+    if "previous_state" in state:
+        for counter in (
+            "num_chunks_since_previous_state",
+            "num_examples_since_previous_state",
+        ):
+            if counter in state:
+                state["previous_state"] = {
+                    "shard_idx": shard_idx,
+                    "shard_example_idx": shard_example_idx,
+                }
+                state[counter] = examples_since
+                if "cropped_chunk_length" in state:
+                    state["cropped_chunk_length"] = 0
+                return True
+    if "shard_idx" in state and "shard_example_idx" in state:
+        state["shard_idx"] = shard_idx
+        state["shard_example_idx"] = shard_example_idx
+        return True
+    for key, value in state.items():
+        if key != "previous_state" and isinstance(value, dict):
+            if _patch_shard_position(
+                value, shard_idx, shard_example_idx, examples_since
+            ):
+                return True
+    return False
+
+
 class _HuggingFaceCursorIterator(grain.DatasetIterator):
     """Exposes a Hugging Face streaming cursor to Grain checkpoint recursion."""
 
@@ -455,9 +523,22 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
             return next(self._iterator)
 
     def get_state(self) -> dict[str, Any]:
+        # Checkpoint only the epoch and the shard position. HF's full
+        # state_dict changes shape with iteration position (previous_state
+        # resume bookkeeping is None fresh and a nested dict mid-iteration),
+        # which a static-layout checkpoint loader (DCP) cannot round-trip;
+        # the bare position has the same layout at every position.
+        position = _extract_shard_position(self._dataset.state_dict())
+        if position is None:
+            raise ValueError(
+                "Hugging Face streaming state does not expose a shard position"
+            )
+        shard_idx, shard_example_idx, examples_since = position
         return {
             "epoch": self._epoch,
-            "hf": self._dataset.state_dict(),
+            "shard_idx": shard_idx,
+            "shard_example_idx": shard_example_idx,
+            "examples_since_shard_position": examples_since,
         }
 
     def set_state(self, state: dict[str, Any]) -> None:
@@ -466,5 +547,21 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
             self._source._current_epoch = self._epoch
         if self._shuffle:
             self._dataset.set_epoch(self._epoch)
-        self._dataset.load_state_dict(state["hf"])
+        # Seek directly to the shard position: HF re-initializes the examples
+        # chain on the next __iter__ and merge-patches it with the starting
+        # state. The merge rejects keys the fresh chain does not have, so
+        # patch the chain's own fresh layout (captured at construction)
+        # instead of hand-building a chain-shaped dict.
+        seek_state = copy.deepcopy(self._initial_state)
+        if not _patch_shard_position(
+            seek_state,
+            state["shard_idx"],
+            state["shard_example_idx"],
+            state["examples_since_shard_position"],
+        ):
+            raise ValueError(
+                "Hugging Face streaming state does not expose a shard position"
+            )
+        seek_state["epoch"] = self._dataset.epoch
+        self._dataset.load_state_dict(seek_state)
         self._iterator = iter(self._dataset)
