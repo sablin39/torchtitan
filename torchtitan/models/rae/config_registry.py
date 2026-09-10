@@ -368,6 +368,11 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
             # them.
             discriminator_lr=1e-4,
             discriminator_warmup_steps=625,
+            # Earlier than the RAE-paper 0.375/0.5 defaults: at ~407
+            # steps/epoch this starts disc training ~2.5 epochs in and the
+            # adversarial term ~3.75 epochs in.
+            discriminator_update_start_fraction=0.25,
+            discriminator_start_fraction=0.375,
             # The discriminator has fully separated real/fake by the time the
             # adversarial term starts, so ramp its weight in instead of taking
             # the full gradient spike on the first GAN step.
