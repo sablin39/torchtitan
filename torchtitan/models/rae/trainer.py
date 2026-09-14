@@ -212,8 +212,8 @@ def log_stage1_metrics(
 ) -> None:
     """Log the scalar metrics emitted by one RAE Stage 1 update."""
     values = [float(loss.detach().item()) for loss in losses]
-    if len(values) != 13:
-        raise ValueError(f"RAE Stage 1 metrics require 13 values, got {len(values)}")
+    if len(values) != 14:
+        raise ValueError(f"RAE Stage 1 metrics require 14 values, got {len(values)}")
     if metrics_processor is not None:
         extra_metrics: dict[str, float] = {
             "rae/reconstruction_loss": values[0],
@@ -229,6 +229,7 @@ def log_stage1_metrics(
             "rae/discriminator_accuracy": values[10],
             "rae/dino_feature_distance": values[11],
             "rae/feature_matching_loss": values[12],
+            "rae/dinov3_perceptual_loss": values[13],
             "rae/non_padding_ratio": non_padding_ratio,
             "rae/num_images_per_step": num_images_per_step,
         }
@@ -249,7 +250,7 @@ def log_stage1_metrics(
             "[RAE Stage 1 | step %d] recon=%.5f perceptual=%.5f "
             "gan=%.5f disc=%.5f adaptive=%.5f decoder_grad=%.5f "
             "disc_grad=%.5f gen_logit=%.5f real_logit=%.5f fake_logit=%.5f "
-            "disc_acc=%.5f dino_dist=%.5f fm=%.5f non_padding=%.5f "
+            "disc_acc=%.5f dino_dist=%.5f fm=%.5f dino_perc=%.5f non_padding=%.5f "
             "images_per_step=%.2f%s",
             step,
             *values,
@@ -365,6 +366,17 @@ class RAEGANConfig:
     feature_matching_weight: float = 1.0
     """Weight of the per-patch DINOv3 feature-matching term folded into the
     adaptive-weighted adversarial loss; 0 disables it."""
+    dinov3_perceptual_weight: float = 0.0
+    """Weight of the fixed (non-adaptive) DINOv3 feature-space perceptual
+    term. Computed from the same backbone passes as feature matching (the
+    step's augmented real-feature cache and the generator-phase fake
+    features), so it costs one reduction per microbatch and no extra sweep;
+    it is only active while the GAN phase runs -- pre-GAN training keeps the
+    VGG/LPIPS perceptual term alone. 0 disables it."""
+    dinov3_perceptual_depths: tuple[int, ...] | None = None
+    """Which probed backbone depths the DINOv3 perceptual term reduces over,
+    as indices into the probed feature list (0 is the final block output,
+    1.. are hf_key_depths in order); None uses every probed depth."""
     perceptual_weight: float = 1.0
     discriminator_updates: int = 1
     discriminator_update_batch_size: int = 256
@@ -402,6 +414,12 @@ class RAEGANConfig:
             raise ValueError("GAN and perceptual weights must be non-negative")
         if self.feature_matching_weight < 0:
             raise ValueError("gan.feature_matching_weight must be non-negative")
+        if self.dinov3_perceptual_weight < 0:
+            raise ValueError("gan.dinov3_perceptual_weight must be non-negative")
+        if self.dinov3_perceptual_depths is not None and any(
+            depth < 0 for depth in self.dinov3_perceptual_depths
+        ):
+            raise ValueError("gan.dinov3_perceptual_depths must be non-negative")
         if not 0.0 <= self.ema_decay < 1.0:
             raise ValueError("gan.ema_decay must be in [0, 1)")
         for name in (
@@ -426,7 +444,7 @@ class RAEGANConfig:
             raise ValueError(
                 f"Unsupported discriminator GAN loss: {self.discriminator_loss}"
             )
-        if self.perceptual_kind not in {"fixed", "lpips", "dinov3"}:
+        if self.perceptual_kind not in {"fixed", "lpips"}:
             raise ValueError(
                 f"Unsupported perceptual loss kind: {self.perceptual_kind}"
             )
@@ -609,21 +627,13 @@ class RAEStage1Trainer(Trainer):
         else:
             self.discriminator_train = self.discriminator
 
-        if config.gan.perceptual_kind == "dinov3":
-            if config.discriminator.backbone_kind != "hf":
-                raise ValueError(
-                    "gan.perceptual_kind='dinov3' requires "
-                    "discriminator.backbone_kind='hf'"
-                )
-            self.perceptual_loss = None
-        else:
-            self.perceptual_loss = RAEPerceptualLoss(
-                kind=config.gan.perceptual_kind,
-                channels=config.discriminator.feature_channels,
-                calibration_checkpoint_path=config.gan.lpips_calibration_checkpoint_path,
-                vgg_checkpoint_path=config.gan.lpips_vgg_checkpoint_path,
-                resize_long_side=config.gan.perceptual_resize_long_side,
-            ).to(self.device)
+        self.perceptual_loss = RAEPerceptualLoss(
+            kind=config.gan.perceptual_kind,
+            channels=config.discriminator.feature_channels,
+            calibration_checkpoint_path=config.gan.lpips_calibration_checkpoint_path,
+            vgg_checkpoint_path=config.gan.lpips_vgg_checkpoint_path,
+            resize_long_side=config.gan.perceptual_resize_long_side,
+        ).to(self.device)
         self.discriminator_augmentation = DiscriminatorAugmentation(
             probability=config.gan.augment.probability,
             cutout=config.gan.augment.cutout,
@@ -683,34 +693,15 @@ class RAEStage1Trainer(Trainer):
                 warmup_logits = self.discriminator(self._augment_images(dummy_items))
             torch.stack([logits.sum() for logits in warmup_logits]).sum().backward()
             self.discriminator.zero_grad(set_to_none=True)
-            if config.gan.feature_matching_weight > 0:
+            if (
+                config.gan.feature_matching_weight > 0
+                or config.gan.dinov3_perceptual_weight > 0
+            ):
                 # The step-start real-feature cache calls the compiled backbone
                 # in a no-grad variant; warm it here so the first
                 # feature-matching step does not compile mid-run.
                 with torch.no_grad():
                     self.discriminator.cache_real_features(dummy_items)
-            self.discriminator.eval()
-            self.discriminator.set_head_requires_grad(False)
-        if warmup_discriminator and config.gan.perceptual_kind == "dinov3":
-            # The DINOv3 perceptual term runs from step 0 through its own
-            # features-only autograd variants (no-grad reals, grad-carrying
-            # fakes, backward through the feature-matching reduction); warm
-            # them here or the first perceptual step compiles mid-run.
-            self.discriminator.eval()
-            self.discriminator.set_head_requires_grad(False)
-            perceptual_dummies = [
-                item.detach().clone().requires_grad_(True) for item in dummy_items
-            ]
-            with torch.autocast(
-                device_type=self.device.type,
-                dtype=torch.bfloat16,
-                enabled=autocast_bf16,
-            ):
-                warmup_perceptual = self._perceptual_loss(
-                    dummy_items, perceptual_dummies
-                )
-            warmup_perceptual.backward()
-            self.discriminator.zero_grad(set_to_none=True)
             self.discriminator.eval()
             self.discriminator.set_head_requires_grad(False)
 
@@ -1159,22 +1150,6 @@ class RAEStage1Trainer(Trainer):
         real_items: list[torch.Tensor],
         fake_items: list[torch.Tensor],
     ) -> torch.Tensor:
-        if self.config.gan.perceptual_kind == "dinov3":
-            # DINOv3 feature-space perceptual term on clean (un-augmented)
-            # pairs at native resolution: the real branch runs no-grad, the
-            # fake branch carries gradients to the decoder through the frozen
-            # backbone. Same per-patch reduction as feature matching, but it
-            # enters from step 0 under the fixed perceptual weight.
-            with torch.no_grad():
-                real_features = self.discriminator.features(
-                    [(image + 1.0) * 0.5 for image in real_items],
-                    use_compiled=True,
-                )
-            fake_features = self.discriminator.features(
-                [(image + 1.0) * 0.5 for image in fake_items],
-                use_compiled=True,
-            )
-            return self.discriminator.feature_matching(real_features, fake_features)
         # One grouped call per microbatch: equal-shape images share backbone
         # forwards, and the real branch runs under no_grad.
         return self.perceptual_loss.forward_per_sample_list(
@@ -1294,7 +1269,9 @@ class RAEStage1Trainer(Trainer):
             )
             gan_weight *= min(ramp_progress, 1.0)
         use_perceptual = step >= gan.perceptual_start_step and gan.perceptual_weight > 0
-        use_fm = use_gan and gan.feature_matching_weight > 0
+        use_fm = use_gan and (
+            gan.feature_matching_weight > 0 or gan.dinov3_perceptual_weight > 0
+        )
         num_microbatches = self.gradient_accumulation_steps
         images_batches: list[ImageBatch] = []
         cached_latents: list[
@@ -1309,6 +1286,7 @@ class RAEStage1Trainer(Trainer):
         adaptive_metric = None
         generator_logits_metric = None
         fm_metric = None
+        dino_perceptual_metric = None
         non_padding_tokens = 0
         padding_capacity_tokens = 0
         num_images_per_step = 0
@@ -1316,9 +1294,9 @@ class RAEStage1Trainer(Trainer):
         step_real_features: list[list[torch.Tensor]] | None = None
         step_aug_params: AugmentationParams | None = None
         if use_fm:
-            # Feature matching needs the step's real supervision features
-            # before the first decode, and the discriminator phase below
-            # reuses them for the real pass. Fetch and encode every
+            # Feature matching and the DINOv3 perceptual term need the step's
+            # real supervision features before the first decode, and the
+            # discriminator phase below reuses them for the real pass. Fetch and encode every
             # microbatch first; the supervision sizes follow from grid_thw
             # (unpatchify maps each grid entry to (h * patch_size,
             # w * patch_size)) without decoding. The frozen encoder is
@@ -1482,13 +1460,36 @@ class RAEStage1Trainer(Trainer):
                                 fake_augmented, return_features=True
                             )
                             assert real_features_items is not None
-                            fm_loss = self.discriminator.feature_matching(
-                                real_features_items, fake_features
+                            fm_loss = (
+                                self.discriminator.feature_matching(
+                                    real_features_items, fake_features
+                                )
+                                if gan.feature_matching_weight > 0
+                                else None
                             )
+                            # The DINOv3 perceptual term reuses the same
+                            # tensors as feature matching (no extra backbone
+                            # sweep); it enters the reconstruction side under
+                            # its own fixed weight, so the adaptive weight
+                            # below accounts for it.
+                            if gan.dinov3_perceptual_weight > 0:
+                                dino_perceptual_loss = (
+                                    fm_loss
+                                    if fm_loss is not None
+                                    and gan.dinov3_perceptual_depths is None
+                                    else self.discriminator.feature_matching(
+                                        real_features_items,
+                                        fake_features,
+                                        depth_indices=gan.dinov3_perceptual_depths,
+                                    )
+                                )
+                            else:
+                                dino_perceptual_loss = None
                         else:
                             fake_augmented = self._augment_images(fake_items)
                             logits_fake = self.discriminator_train(fake_augmented)
                             fm_loss = None
+                            dino_perceptual_loss = None
                         generator_logits_metric = gan_logits_mean(logits_fake).detach()
                         adversarial_loss = gan_generator_loss(
                             logits_fake, gan.generator_loss
@@ -1502,6 +1503,11 @@ class RAEStage1Trainer(Trainer):
                             else adversarial_loss
                             + gan.feature_matching_weight * fm_loss
                         )
+                        if dino_perceptual_loss is not None:
+                            reconstruction_total = (
+                                reconstruction_total
+                                + gan.dinov3_perceptual_weight * dino_perceptual_loss
+                            )
                         with self._dmuon_reduce_suppressed():
                             adaptive_weight = self._adaptive_weight(
                                 reconstruction_total,
@@ -1528,6 +1534,7 @@ class RAEStage1Trainer(Trainer):
                     adversarial_loss = reconstruction_loss.new_zeros(())
                     adaptive_weight = reconstruction_loss.new_zeros(())
                     fm_loss = None
+                    dino_perceptual_loss = None
                     total_loss = reconstruction_total
                 with self._phase_profiler.phase("backward"):
                     (total_loss / num_microbatches).backward()
@@ -1546,6 +1553,8 @@ class RAEStage1Trainer(Trainer):
             adaptive_metric = adaptive_weight.detach()
             if fm_loss is not None:
                 fm_metric = fm_loss.detach()
+            if dino_perceptual_loss is not None:
+                dino_perceptual_metric = dino_perceptual_loss.detach()
 
         assert (
             reconstruction_metric is not None
@@ -1681,6 +1690,9 @@ class RAEStage1Trainer(Trainer):
                     discriminator_accuracy_metric,
                     dino_distance_metric,
                     fm_metric if fm_metric is not None else metric_source.new_zeros(()),
+                    dino_perceptual_metric
+                    if dino_perceptual_metric is not None
+                    else metric_source.new_zeros(()),
                 ),
                 metrics_processor=self.metrics_processor,
                 non_padding_ratio=non_padding_tokens / padding_capacity_tokens,

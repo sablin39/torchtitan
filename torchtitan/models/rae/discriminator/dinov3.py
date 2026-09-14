@@ -465,15 +465,12 @@ class DINOv3ViTBackbone(nn.Module):
         sin_T1D = sin_TD.unsqueeze(1)
         block_outputs_TC = []
         for block in self.layer:
-            x_TC = block.forward_varlen(
-                x_TC, cos_T1D, sin_T1D, cu_seqlens, max_seqlen
-            )
+            x_TC = block.forward_varlen(x_TC, cos_T1D, sin_T1D, cu_seqlens, max_seqlen)
             block_outputs_TC.append(x_TC)
         normed_TC = [self.norm(block_outputs_TC[-1])]
         normed_TC += [self.norm(block_outputs_TC[depth]) for depth in key_depths]
         return [
-            activation_TC[patch_dest_P].transpose(0, 1)
-            for activation_TC in normed_TC
+            activation_TC[patch_dest_P].transpose(0, 1) for activation_TC in normed_TC
         ]
 
 
@@ -830,7 +827,10 @@ class RAEFeatureDiscriminator(nn.Module):
             max_seqlen,
             key_depths=self.key_depths,
         )
-        per_depth = [torch.split(activation_CL, sizes, dim=-1) for activation_CL in activations_CL]
+        per_depth = [
+            torch.split(activation_CL, sizes, dim=-1)
+            for activation_CL in activations_CL
+        ]
         return [
             [per_depth[depth][index] for depth in range(len(per_depth))]
             for index in range(len(images))
@@ -1042,15 +1042,25 @@ class RAEFeatureDiscriminator(nn.Module):
         self,
         real_features: Sequence[Sequence[torch.Tensor]],
         fake_features: Sequence[Sequence[torch.Tensor]],
+        depth_indices: Sequence[int] | None = None,
     ) -> torch.Tensor:
         """Per-patch feature-matching loss between paired activations.
 
         Per image and depth: the mean over channels of |fake - real| (diffs in
         fp32, as in feature_distance) gives a per-patch map, reduced to a
         scalar by the patch mean. The loss averages over depths, then images.
+        ``depth_indices`` selects which probed depths enter the average (None
+        uses all of them).
         """
         if len(real_features) != len(fake_features) or not real_features:
             raise ValueError("feature_matching expects paired non-empty lists")
+        if depth_indices is not None:
+            real_features = [
+                [depths[i] for i in depth_indices] for depths in real_features
+            ]
+            fake_features = [
+                [depths[i] for i in depth_indices] for depths in fake_features
+            ]
         per_image = [
             torch.stack(
                 [

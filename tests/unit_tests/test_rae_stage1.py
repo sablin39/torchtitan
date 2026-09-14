@@ -802,12 +802,55 @@ def test_feature_matching_weight_defaults_and_validation() -> None:
     assert production.gan.feature_matching_weight == 1.0
 
 
-def test_dinov3_perceptual_kind_validation() -> None:
-    RAEGANConfig(perceptual_kind="dinov3")
+def test_perceptual_kind_validation() -> None:
+    RAEGANConfig(perceptual_kind="fixed")
     with pytest.raises(ValueError, match="perceptual"):
-        RAEGANConfig(perceptual_kind="vgg")
+        RAEGANConfig(perceptual_kind="dinov3")
     with pytest.raises(ValueError, match="lpips_calibration_checkpoint_path"):
         RAEGANConfig(perceptual_kind="lpips")
+
+
+def test_dinov3_perceptual_weight_and_depths_validation() -> None:
+    assert RAEGANConfig().dinov3_perceptual_weight == 0.0
+    assert RAEGANConfig().dinov3_perceptual_depths is None
+    RAEGANConfig(dinov3_perceptual_weight=1.0, dinov3_perceptual_depths=(0, 2))
+    with pytest.raises(ValueError, match="dinov3_perceptual_weight"):
+        RAEGANConfig(dinov3_perceptual_weight=-0.5)
+    with pytest.raises(ValueError, match="dinov3_perceptual_depths"):
+        RAEGANConfig(dinov3_perceptual_depths=(-1,))
+
+
+def test_feature_matching_depth_indices_selects_subset() -> None:
+    torch.manual_seed(0)
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40)]
+    real_features = discriminator.cache_real_features(targets)
+    fakes = [torch.rand(3, 32, 32), torch.rand(3, 24, 40)]
+    fake_features = discriminator.features(fakes)
+    num_depths = len(fake_features[0])
+    assert num_depths > 1
+    full = discriminator.feature_matching(real_features, fake_features)
+    subset = discriminator.feature_matching(
+        real_features, fake_features, depth_indices=(0,)
+    )
+    expected_first = torch.stack(
+        [
+            (fake_CL.float() - real_CL.float()).abs().mean(dim=0).mean()
+            for fake_CL, real_CL in zip(
+                [depths[0] for depths in fake_features],
+                [depths[0] for depths in real_features],
+                strict=True,
+            )
+        ]
+    ).mean()
+    assert subset.item() == pytest.approx(expected_first.item(), abs=1e-6)
+    assert subset.item() != pytest.approx(full.item(), abs=1e-6)
+    # depth_indices=None reproduces the no-argument call.
+    assert discriminator.feature_matching(
+        real_features, fake_features, depth_indices=None
+    ).item() == pytest.approx(full.item(), abs=1e-7)
 
 
 def test_discriminator_update_reuses_cached_real_features() -> None:
@@ -949,7 +992,7 @@ def test_stage1_metrics_include_packing_stats() -> None:
 
     log_stage1_metrics(
         1,
-        [torch.zeros(()) for _ in range(13)],
+        [torch.zeros(()) for _ in range(14)],
         metrics_processor=Metrics(),
         non_padding_ratio=0.75,
         num_images_per_step=16.0,
@@ -959,6 +1002,7 @@ def test_stage1_metrics_include_packing_stats() -> None:
     assert extra_metrics["rae/num_images_per_step"] == 16.0
     assert "rae/discriminator_accuracy" in extra_metrics
     assert "rae/feature_matching_loss" in extra_metrics
+    assert "rae/dinov3_perceptual_loss" in extra_metrics
 
 
 def test_rae_recipe_enables_wandb_and_swanlab_tracking() -> None:
