@@ -264,20 +264,45 @@ def log_stage1_metrics(
 
 ImageBatch = torch.Tensor | list[torch.Tensor]
 
+_CHARBONNIER_EPS = 1e-3
+"""Charbonnier epsilon, matching the ViTok-v2 pixel-term formulation."""
+
+
+def pixel_reconstruction_loss(
+    reconstruction_CHW: torch.Tensor,
+    target_CHW: torch.Tensor,
+    kind: str,
+) -> torch.Tensor:
+    """Per-pixel reconstruction loss for one image pair.
+
+    ``charbonnier`` is sqrt(d^2 + eps^2) with eps=1e-3 (the ViTok-v2 pixel
+    term, arXiv 2605.05331): a smooth L1 approximation with gradients that
+    vanish linearly near zero instead of taking a constant step. Computed in
+    fp32; ``l1`` keeps the plain absolute error.
+    """
+    if kind == "charbonnier":
+        difference = reconstruction_CHW.float() - target_CHW.float()
+        return (difference.pow(2) + _CHARBONNIER_EPS**2).sqrt().mean()
+    if kind == "l1":
+        return F.l1_loss(reconstruction_CHW, target_CHW)
+    raise ValueError(f"Unsupported pixel loss kind: {kind}")
+
 
 def gradient_difference_loss(
     reconstructions: Sequence[torch.Tensor],
     targets: Sequence[torch.Tensor],
+    kind: str = "l1",
 ) -> torch.Tensor:
-    """Mean per-image L1 on horizontal/vertical finite-difference mismatches.
+    """Mean per-image penalty on horizontal/vertical finite-difference mismatches.
 
-    Per-pixel L1 does not penalize discontinuities at decoder patch
+    Per-pixel losses do not penalize discontinuities at decoder patch
     boundaries: a seam costs the same as the same error spread smoothly.
     Matching spatial gradients makes each boundary crossing answer to the
     ground-truth gradient (and sharpens real edges). Equal-shape images are
     stacked so each packed microbatch costs a handful of kernels, and the
     differences are computed in fp32 because bf16 resolves neighboring-pixel
-    deltas poorly.
+    deltas poorly. ``kind`` selects the penalty (``l1`` or ``charbonnier``),
+    matching the configured pixel reconstruction loss.
     """
     if len(reconstructions) != len(targets) or not targets:
         raise ValueError("gradient_difference_loss expects paired non-empty lists")
@@ -296,7 +321,17 @@ def gradient_difference_loss(
         dy = (reconstruction_BCHW[..., 1:, :] - reconstruction_BCHW[..., :-1, :]) - (
             target_BCHW[..., 1:, :] - target_BCHW[..., :-1, :]
         )
-        per_image.append(dx.abs().mean(dim=(1, 2, 3)) + dy.abs().mean(dim=(1, 2, 3)))
+        if kind == "charbonnier":
+            per_image.append(
+                (dx.pow(2) + _CHARBONNIER_EPS**2).sqrt().mean(dim=(1, 2, 3))
+                + (dy.pow(2) + _CHARBONNIER_EPS**2).sqrt().mean(dim=(1, 2, 3))
+            )
+        elif kind == "l1":
+            per_image.append(
+                dx.abs().mean(dim=(1, 2, 3)) + dy.abs().mean(dim=(1, 2, 3))
+            )
+        else:
+            raise ValueError(f"Unsupported pixel loss kind: {kind}")
     return torch.cat(per_image).mean()
 
 
@@ -404,17 +439,24 @@ class RAEGANConfig:
     """Weight of the per-patch DINOv3 feature-matching term folded into the
     adaptive-weighted adversarial loss; 0 disables it."""
     dinov3_perceptual_weight: float = 0.0
-    """Weight of the fixed (non-adaptive) DINOv3 feature-space perceptual
-    term. Computed from the same backbone passes as feature matching (the
-    step's augmented real-feature cache and the generator-phase fake
-    features), so it costs one reduction per microbatch and no extra sweep;
-    it is only active while the GAN phase runs -- pre-GAN training keeps the
-    VGG/LPIPS perceptual term alone. 0 disables it."""
+    """Weight of the fixed (non-adaptive) DINOv3 perceptual term, following
+    the ViTok-v2 formulation (arXiv 2605.05331): per-token L2-normalized
+    features with MSE over channels. Computed from the same backbone passes
+    as feature matching (the step's augmented real-feature cache and the
+    generator-phase fake features), so it costs one reduction per microbatch
+    and no extra sweep; it is only active while the GAN phase runs --
+    pre-GAN training keeps the VGG/LPIPS perceptual term alone. 0 disables
+    it."""
     dinov3_perceptual_depths: tuple[int, ...] | None = None
     """Which probed backbone depths the DINOv3 perceptual term reduces over,
     as indices into the probed feature list (0 is the final block output,
     1.. are hf_key_depths in order); None uses every probed depth."""
     perceptual_weight: float = 1.0
+    pixel_loss: str = "charbonnier"
+    """Per-pixel reconstruction loss kind: ``charbonnier`` (sqrt(d^2 + eps^2)
+    with eps=1e-3, the ViTok-v2 pixel term -- a smooth L1 with gradients that
+    vanish linearly near zero) or ``l1``. Applied to both the pixel
+    reconstruction term and the gradient-difference penalty."""
     gradient_loss_weight: float = 0.0
     """Weight of the gradient-difference term on the reconstruction side.
     Per-pixel L1 cannot see decoder patch seams (a boundary discontinuity
@@ -461,6 +503,8 @@ class RAEGANConfig:
             raise ValueError("gan.dinov3_perceptual_weight must be non-negative")
         if self.gradient_loss_weight < 0:
             raise ValueError("gan.gradient_loss_weight must be non-negative")
+        if self.pixel_loss not in {"l1", "charbonnier"}:
+            raise ValueError(f"Unsupported pixel loss kind: {self.pixel_loss}")
         if self.dinov3_perceptual_depths is not None and any(
             depth < 0 for depth in self.dinov3_perceptual_depths
         ):
@@ -1465,14 +1509,18 @@ class RAEStage1Trainer(Trainer):
                         )
                     reconstruction_loss = torch.stack(
                         [
-                            F.l1_loss(reconstruction, target)
+                            pixel_reconstruction_loss(
+                                reconstruction, target, gan.pixel_loss
+                            )
                             for reconstruction, target in zip(
                                 recon_items, target_items, strict=True
                             )
                         ]
                     ).mean()
                     gradient_loss = (
-                        gradient_difference_loss(recon_items, target_items)
+                        gradient_difference_loss(
+                            recon_items, target_items, kind=gan.pixel_loss
+                        )
                         if gan.gradient_loss_weight > 0
                         else reconstruction_loss.new_zeros(())
                     )
@@ -1520,17 +1568,15 @@ class RAEStage1Trainer(Trainer):
                                 if gan.feature_matching_weight > 0
                                 else None
                             )
-                            # The DINOv3 perceptual term reuses the same
-                            # tensors as feature matching (no extra backbone
-                            # sweep); it enters the reconstruction side under
-                            # its own fixed weight, so the adaptive weight
-                            # below accounts for it.
+                            # The DINOv3 perceptual term (ViTok-v2
+                            # formulation: token-wise L2-normalized MSE)
+                            # reuses the same tensors as feature matching --
+                            # no extra backbone sweep. It enters the
+                            # reconstruction side under its own fixed weight,
+                            # so the adaptive weight below accounts for it.
                             if gan.dinov3_perceptual_weight > 0:
                                 dino_perceptual_loss = (
-                                    fm_loss
-                                    if fm_loss is not None
-                                    and gan.dinov3_perceptual_depths is None
-                                    else self.discriminator.feature_matching(
+                                    self.discriminator.perceptual_distance(
                                         real_features_items,
                                         fake_features,
                                         depth_indices=gan.dinov3_perceptual_depths,
@@ -2137,7 +2183,11 @@ class RAEValidator(BaseValidator):
                     self.trainer._supervision_images(images, target_sizes)
                 )
                 losses.extend(
-                    F.l1_loss(reconstruction, target).detach()
+                    pixel_reconstruction_loss(
+                        reconstruction,
+                        target,
+                        self.trainer.config.gan.pixel_loss,
+                    ).detach()
                     for reconstruction, target in zip(
                         reconstructions, targets, strict=True
                     )
@@ -2188,6 +2238,7 @@ class RAEValidator(BaseValidator):
 __all__ = [
     "DiscriminatorAugmentation",
     "gradient_difference_loss",
+    "pixel_reconstruction_loss",
     "RAEGANAugmentConfig",
     "RAEGANConfig",
     "RAEStage1Trainer",

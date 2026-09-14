@@ -44,6 +44,7 @@ from torchtitan.models.rae.trainer import (
     DiscriminatorAugmentation,
     gradient_difference_loss,
     log_stage1_metrics,
+    pixel_reconstruction_loss,
     RAEGANConfig,
     RAEStage1Trainer,
 )
@@ -904,6 +905,82 @@ def test_gradient_difference_loss_mixed_resolutions() -> None:
     ]
     expected = torch.stack(per_image).mean()
     assert loss.item() == pytest.approx(expected.item(), abs=1e-6)
+
+
+def test_pixel_loss_config_validation() -> None:
+    assert RAEGANConfig().pixel_loss == "charbonnier"
+    RAEGANConfig(pixel_loss="l1")
+    with pytest.raises(ValueError, match="pixel loss"):
+        RAEGANConfig(pixel_loss="l2")
+    production = rae_stage1_openimages_static_96k_uvit()
+    assert production.gan.pixel_loss == "charbonnier"
+    assert production.gan.dinov3_perceptual_weight == 100.0
+
+
+def test_pixel_reconstruction_loss_kinds() -> None:
+    torch.manual_seed(0)
+    target = torch.rand(3, 32, 32)
+    # Charbonnier bottoms out at eps for identical images with zero gradient
+    # there (smooth L1), while l1 is exactly zero with a constant-step subgradient.
+    identical = pixel_reconstruction_loss(target, target, "charbonnier")
+    assert identical.item() == pytest.approx(1e-3, abs=1e-7)
+    reconstruction = target.clone().requires_grad_(True)
+    pixel_reconstruction_loss(reconstruction, target, "charbonnier").backward()
+    assert reconstruction.grad.abs().max().item() < 1e-4
+    different = torch.rand(3, 32, 32)
+    charbonnier = pixel_reconstruction_loss(different, target, "charbonnier")
+    l1 = pixel_reconstruction_loss(different, target, "l1")
+    assert l1.item() == pytest.approx(
+        torch.nn.functional.l1_loss(different, target).item(), abs=1e-7
+    )
+    assert charbonnier.item() > l1.item()
+    with pytest.raises(ValueError, match="pixel loss"):
+        pixel_reconstruction_loss(different, target, "l2")
+
+
+def test_gradient_difference_loss_charbonnier_kind() -> None:
+    torch.manual_seed(0)
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40)]
+    # Identical images bottom out at 2 * eps (dx and dy terms).
+    identical = gradient_difference_loss(targets, list(targets), kind="charbonnier")
+    assert identical.item() == pytest.approx(2e-3, abs=1e-6)
+    reconstructions = [torch.rand_like(target) for target in targets]
+    charbonnier = gradient_difference_loss(reconstructions, targets, kind="charbonnier")
+    l1 = gradient_difference_loss(reconstructions, targets, kind="l1")
+    assert charbonnier.item() > l1.item() > 0.0
+    with pytest.raises(ValueError, match="pixel loss"):
+        gradient_difference_loss(reconstructions, targets, kind="l2")
+
+
+def test_perceptual_distance_vitok_formulation() -> None:
+    torch.manual_seed(0)
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40)]
+    real_features = discriminator.cache_real_features(targets)
+    assert discriminator.perceptual_distance(
+        real_features, real_features
+    ).item() == pytest.approx(0.0, abs=1e-7)
+    fakes = [
+        (torch.rand(3, 32, 32) * 2.0 - 1.0).requires_grad_(True),
+        (torch.rand(3, 24, 40) * 2.0 - 1.0).requires_grad_(True),
+    ]
+    _, fake_features = discriminator(fakes, return_features=True)
+    loss = discriminator.perceptual_distance(real_features, fake_features)
+    assert loss.item() > 0.0
+    loss.backward()
+    for fake in fakes:
+        assert fake.grad is not None
+        assert fake.grad.abs().sum() > 0
+    # Token-wise normalization bounds the per-patch MSE: two unit vectors
+    # differ by at most squared distance 4, spread over C channels.
+    num_channels = fake_features[0][0].shape[0]
+    assert loss.item() < 4.0 / num_channels * 2
+    subset = discriminator.perceptual_distance(
+        real_features, fake_features, depth_indices=(0,)
+    )
+    assert subset.item() != pytest.approx(loss.item(), abs=1e-6)
 
 
 def test_discriminator_update_reuses_cached_real_features() -> None:

@@ -1074,6 +1074,51 @@ class RAEFeatureDiscriminator(nn.Module):
         ]
         return torch.stack(per_image).mean()
 
+    def perceptual_distance(
+        self,
+        real_features: Sequence[Sequence[torch.Tensor]],
+        fake_features: Sequence[Sequence[torch.Tensor]],
+        depth_indices: Sequence[int] | None = None,
+    ) -> torch.Tensor:
+        """ViTok-v2-style DINOv3 perceptual loss between paired activations.
+
+        Follows the ViTok-v2 DINOv3 perceptual formulation (arXiv 2605.05331,
+        after Sauer et al. 2024): per-token L2-normalize the features of every
+        probed depth, then MSE over channels, computed in fp32. Per image and
+        depth the per-patch values reduce by the patch mean; the loss averages
+        over depths, then images. ``depth_indices`` selects which probed
+        depths enter the average (None uses all of them). ViTok-v2 samples
+        224x224 tiles because of fixed positional embeddings; this backbone
+        consumes native resolutions, so full aligned images are compared.
+        """
+        if len(real_features) != len(fake_features) or not real_features:
+            raise ValueError("perceptual_distance expects paired non-empty lists")
+        if depth_indices is not None:
+            real_features = [
+                [depths[i] for i in depth_indices] for depths in real_features
+            ]
+            fake_features = [
+                [depths[i] for i in depth_indices] for depths in fake_features
+            ]
+        per_image = [
+            torch.stack(
+                [
+                    (
+                        F.normalize(fake_CL.float(), p=2, dim=0)
+                        - F.normalize(real_CL.float(), p=2, dim=0)
+                    )
+                    .pow(2)
+                    .mean(dim=0)
+                    .mean()
+                    for fake_CL, real_CL in zip(fake_depths, real_depths, strict=True)
+                ]
+            ).mean()
+            for fake_depths, real_depths in zip(
+                fake_features, real_features, strict=True
+            )
+        ]
+        return torch.stack(per_image).mean()
+
     def _heads_from_feature_batch(self, features: list[torch.Tensor]) -> torch.Tensor:
         """Per-patch logits (B, H, L) from one same-shape activation batch."""
         # Fixed-kind pyramid levels shrink by stride 2; pool each head's

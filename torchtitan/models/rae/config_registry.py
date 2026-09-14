@@ -386,6 +386,13 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
             # ground truth. 2.0 keeps the term below L1 at convergence
             # (gradient magnitudes are ~10x smaller than pixel errors).
             gradient_loss_weight=2.0,
+            # ViTok-v2-style DINOv3 perceptual term (token-wise L2-normalized
+            # MSE) once the GAN phase runs. ViTok-v2 uses 500-1000 in its
+            # GAN-free, LPIPS-free recipe where this is the only perceptual
+            # signal; here it is auxiliary alongside LPIPS + the adversarial
+            # term, and the token-normalized MSE is O(1e-4..1e-3), so 100
+            # lands the contribution around the pixel loss.
+            dinov3_perceptual_weight=100.0,
         ),
         discriminator=RAEFeatureDiscriminator.Config(
             feature_channels=768,
