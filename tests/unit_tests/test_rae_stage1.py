@@ -802,6 +802,14 @@ def test_feature_matching_weight_defaults_and_validation() -> None:
     assert production.gan.feature_matching_weight == 1.0
 
 
+def test_dinov3_perceptual_kind_validation() -> None:
+    RAEGANConfig(perceptual_kind="dinov3")
+    with pytest.raises(ValueError, match="perceptual"):
+        RAEGANConfig(perceptual_kind="vgg")
+    with pytest.raises(ValueError, match="lpips_calibration_checkpoint_path"):
+        RAEGANConfig(perceptual_kind="lpips")
+
+
 def test_discriminator_update_reuses_cached_real_features() -> None:
     torch.manual_seed(0)
     discriminator = RAEFeatureDiscriminator(
