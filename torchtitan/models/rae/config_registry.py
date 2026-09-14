@@ -382,17 +382,20 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
             feature_matching_weight=1.0,
             # L1 cannot see the 16px decoder patch grid (measured ~1.8x
             # ground-truth gradient energy at patch boundaries through step
-            # 2000); match spatial gradients so seam crossings answer to the
-            # ground truth. 2.0 keeps the term below L1 at convergence
-            # (gradient magnitudes are ~10x smaller than pixel errors).
-            gradient_loss_weight=2.0,
-            # ViTok-v2-style DINOv3 perceptual term (token-wise L2-normalized
-            # MSE) once the GAN phase runs. ViTok-v2 uses 500-1000 in its
-            # GAN-free, LPIPS-free recipe where this is the only perceptual
-            # signal; here it is auxiliary alongside LPIPS + the adversarial
-            # term, and the token-normalized MSE is O(1e-4..1e-3), so 100
-            # lands the contribution around the pixel loss.
-            dinov3_perceptual_weight=100.0,
+            # 2000). The SWT wavelet term (WGSR, arXiv 2402.19215) supervises
+            # that error by scale and orientation -- a superset of GDL's
+            # axis-aligned finest-scale view; 2 levels recover mid-frequency
+            # structure. Flip to structure_loss='gdl' for an A/B.
+            structure_loss="wavelet",
+            structure_loss_levels=2,
+            structure_loss_weight=2.0,
+            # ViTok-v2 loss weights (arXiv 2605.05331): Charbonnier at 1.0
+            # (the pixel_loss default), SSIM at 0.1, and the DINOv3
+            # perceptual term at their balanced lambda_p=500. ViTok-v2 runs
+            # this recipe GAN-free and LPIPS-free; here the terms are
+            # auxiliary alongside LPIPS + the adversarial term.
+            ssim_weight=0.1,
+            dinov3_perceptual_weight=500.0,
         ),
         discriminator=RAEFeatureDiscriminator.Config(
             feature_channels=768,

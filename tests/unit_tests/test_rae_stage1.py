@@ -40,13 +40,17 @@ from torchtitan.models.rae.encoder import (
 from torchtitan.models.rae.trainer import (
     _nearest_neighbor_indices,
     _r_phi_ratio,
+    _swt_haar,
     AugmentationParams,
     DiscriminatorAugmentation,
     gradient_difference_loss,
     log_stage1_metrics,
     pixel_reconstruction_loss,
+    pixel_reconstruction_losses,
     RAEGANConfig,
     RAEStage1Trainer,
+    ssim_loss,
+    wavelet_structure_loss,
 )
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -855,11 +859,23 @@ def test_feature_matching_depth_indices_selects_subset() -> None:
     ).item() == pytest.approx(full.item(), abs=1e-7)
 
 
-def test_gradient_loss_weight_defaults_and_validation() -> None:
-    assert RAEGANConfig().gradient_loss_weight == 0.0
-    with pytest.raises(ValueError, match="gradient_loss_weight"):
-        RAEGANConfig(gradient_loss_weight=-0.5)
-    assert rae_stage1_openimages_static_96k_uvit().gan.gradient_loss_weight == 2.0
+def test_structure_loss_config_defaults_and_validation() -> None:
+    assert RAEGANConfig().structure_loss_weight == 0.0
+    assert RAEGANConfig().structure_loss == "gdl"
+    assert RAEGANConfig().structure_loss_levels == 1
+    with pytest.raises(ValueError, match="structure_loss_weight"):
+        RAEGANConfig(structure_loss_weight=-0.5)
+    with pytest.raises(ValueError, match="structure loss"):
+        RAEGANConfig(structure_loss="fft")
+    with pytest.raises(ValueError, match="structure_loss_levels"):
+        RAEGANConfig(structure_loss_levels=0)
+    with pytest.raises(ValueError, match="ssim_weight"):
+        RAEGANConfig(ssim_weight=-0.1)
+    production = rae_stage1_openimages_static_96k_uvit()
+    assert production.gan.structure_loss == "wavelet"
+    assert production.gan.structure_loss_levels == 2
+    assert production.gan.structure_loss_weight == 2.0
+    assert production.gan.ssim_weight == 0.1
 
 
 def test_gradient_difference_loss_zero_for_identical_images() -> None:
@@ -914,7 +930,7 @@ def test_pixel_loss_config_validation() -> None:
         RAEGANConfig(pixel_loss="l2")
     production = rae_stage1_openimages_static_96k_uvit()
     assert production.gan.pixel_loss == "charbonnier"
-    assert production.gan.dinov3_perceptual_weight == 100.0
+    assert production.gan.dinov3_perceptual_weight == 500.0
 
 
 def test_pixel_reconstruction_loss_kinds() -> None:
@@ -952,6 +968,131 @@ def test_gradient_difference_loss_charbonnier_kind() -> None:
         gradient_difference_loss(reconstructions, targets, kind="l2")
 
 
+def test_pixel_reconstruction_losses_grouped_matches_per_image() -> None:
+    torch.manual_seed(0)
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40), torch.rand(3, 32, 32)]
+    reconstructions = [torch.rand_like(target) for target in targets]
+    for kind in ("charbonnier", "l1"):
+        grouped = pixel_reconstruction_losses(reconstructions, targets, kind)
+        per_image = torch.stack(
+            [
+                pixel_reconstruction_loss(reconstruction, target, kind)
+                for reconstruction, target in zip(reconstructions, targets, strict=True)
+            ]
+        )
+        assert grouped.mean().item() == pytest.approx(per_image.mean().item(), abs=1e-6)
+
+
+def test_ssim_loss_behaviour_and_grouping() -> None:
+    torch.manual_seed(0)
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40), torch.rand(3, 32, 32)]
+    assert ssim_loss(targets, list(targets)).item() == pytest.approx(0.0, abs=1e-6)
+    reconstructions = [torch.rand_like(target) for target in targets]
+    loss = ssim_loss(reconstructions, targets)
+    # SSIM can dip slightly negative for uncorrelated images, so only a
+    # positivity check applies here.
+    assert loss.item() > 0.0
+    per_image = [
+        ssim_loss([reconstruction], [target])
+        for reconstruction, target in zip(reconstructions, targets, strict=True)
+    ]
+    assert loss.item() == pytest.approx(torch.stack(per_image).mean().item(), abs=1e-6)
+    # A blurred reconstruction is closer than a shuffled one.
+    blurred = [
+        torch.nn.functional.avg_pool2d(
+            torch.nn.functional.pad(
+                target.unsqueeze(0), (1, 1, 1, 1), mode="replicate"
+            ),
+            kernel_size=3,
+            stride=1,
+        ).squeeze(0)
+        for target in targets
+    ]
+    assert ssim_loss(blurred, targets).item() < loss.item()
+
+
+def test_swt_haar_band_layout() -> None:
+    # Regression test for the grouped-conv band ordering: output channels
+    # must come out as (channel, band), and ll/lh/hl must match the
+    # reference 2x2 Haar filters.
+    torch.manual_seed(0)
+    image = torch.rand(1, 3, 8, 8)
+    ll, lh, hl, hh = _swt_haar(image)
+    padded = torch.nn.functional.pad(image, (0, 1, 0, 1), mode="replicate")
+    expected_ll = (
+        padded[:, :, :-1, :-1]
+        + padded[:, :, :-1, 1:]
+        + padded[:, :, 1:, :-1]
+        + padded[:, :, 1:, 1:]
+    ) / 4
+    expected_lh = (
+        padded[:, :, :-1, :-1]
+        + padded[:, :, :-1, 1:]
+        - padded[:, :, 1:, :-1]
+        - padded[:, :, 1:, 1:]
+    ) / 4
+    expected_hl = (
+        padded[:, :, :-1, :-1]
+        - padded[:, :, :-1, 1:]
+        + padded[:, :, 1:, :-1]
+        - padded[:, :, 1:, 1:]
+    ) / 4
+    expected_hh = (
+        padded[:, :, :-1, :-1]
+        - padded[:, :, :-1, 1:]
+        - padded[:, :, 1:, :-1]
+        + padded[:, :, 1:, 1:]
+    ) / 4
+    torch.testing.assert_close(ll, expected_ll)
+    torch.testing.assert_close(lh, expected_lh)
+    torch.testing.assert_close(hl, expected_hl)
+    torch.testing.assert_close(hh, expected_hh)
+    constant = torch.full((1, 3, 8, 8), 0.7)
+    const_ll, const_lh, const_hl, const_hh = _swt_haar(constant)
+    torch.testing.assert_close(const_ll, torch.full_like(const_ll, 0.7))
+    for band in (const_lh, const_hl, const_hh):
+        assert band.abs().max().item() == 0.0
+
+
+def test_wavelet_structure_loss_behaviour() -> None:
+    torch.manual_seed(0)
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40)]
+    # Identical images bottom out at eps: each detail band contributes the
+    # Charbonnier floor, and the per-band mean is normalized by band count.
+    identical = wavelet_structure_loss(targets, list(targets), kind="charbonnier")
+    assert identical.item() == pytest.approx(1e-3, abs=1e-5)
+    identical_l1 = wavelet_structure_loss(targets, list(targets), kind="l1")
+    assert identical_l1.item() == pytest.approx(0.0, abs=1e-7)
+    reconstructions = [torch.rand_like(target) for target in targets]
+    for levels in (1, 2):
+        loss = wavelet_structure_loss(
+            reconstructions, targets, kind="charbonnier", levels=levels
+        )
+        assert loss.item() > 1e-3
+    with pytest.raises(ValueError, match="levels"):
+        wavelet_structure_loss(reconstructions, targets, levels=0)
+
+
+def test_wavelet_structure_loss_prefers_seams_over_smooth_error() -> None:
+    torch.manual_seed(0)
+    target = torch.rand(3, 32, 64) * 0.4
+    seamed = target.clone()
+    seamed[:, :, 32:] += 0.1
+    smooth = target + 0.1
+    seam_loss = wavelet_structure_loss([seamed], [target], kind="l1")
+    smooth_loss = wavelet_structure_loss([smooth], [target], kind="l1")
+    assert smooth_loss.item() == pytest.approx(0.0, abs=1e-7)
+    assert seam_loss.item() > 1e-4
+
+
+def test_wavelet_structure_loss_constant_image_has_no_detail() -> None:
+    target = torch.full((3, 32, 32), 0.5)
+    reconstruction = target.clone()
+    assert wavelet_structure_loss(
+        [reconstruction], [target], kind="l1", levels=2
+    ).item() == pytest.approx(0.0, abs=1e-7)
+
+
 def test_perceptual_distance_vitok_formulation() -> None:
     torch.manual_seed(0)
     discriminator = RAEFeatureDiscriminator(
@@ -981,6 +1122,37 @@ def test_perceptual_distance_vitok_formulation() -> None:
         real_features, fake_features, depth_indices=(0,)
     )
     assert subset.item() != pytest.approx(loss.item(), abs=1e-6)
+
+
+def test_perceptual_distance_grouped_matches_per_image() -> None:
+    torch.manual_seed(0)
+    discriminator = RAEFeatureDiscriminator(
+        RAEFeatureDiscriminator.Config(feature_channels=8)
+    )
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40), torch.rand(3, 32, 32)]
+    real_features = discriminator.cache_real_features(targets)
+    fake_features = discriminator.features([torch.rand_like(t) for t in targets])
+    grouped = discriminator.perceptual_distance(real_features, fake_features)
+    manual = torch.stack(
+        [
+            torch.stack(
+                [
+                    (
+                        torch.nn.functional.normalize(fake_CL.float(), p=2, dim=0)
+                        - torch.nn.functional.normalize(real_CL.float(), p=2, dim=0)
+                    )
+                    .pow(2)
+                    .mean(dim=0)
+                    .mean()
+                    for fake_CL, real_CL in zip(fake_depths, real_depths, strict=True)
+                ]
+            ).mean()
+            for fake_depths, real_depths in zip(
+                fake_features, real_features, strict=True
+            )
+        ]
+    ).mean()
+    assert grouped.item() == pytest.approx(manual.item(), abs=1e-6)
 
 
 def test_discriminator_update_reuses_cached_real_features() -> None:
@@ -1122,7 +1294,7 @@ def test_stage1_metrics_include_packing_stats() -> None:
 
     log_stage1_metrics(
         1,
-        [torch.zeros(()) for _ in range(15)],
+        [torch.zeros(()) for _ in range(16)],
         metrics_processor=Metrics(),
         non_padding_ratio=0.75,
         num_images_per_step=16.0,
@@ -1133,7 +1305,8 @@ def test_stage1_metrics_include_packing_stats() -> None:
     assert "rae/discriminator_accuracy" in extra_metrics
     assert "rae/feature_matching_loss" in extra_metrics
     assert "rae/dinov3_perceptual_loss" in extra_metrics
-    assert "rae/gradient_loss" in extra_metrics
+    assert "rae/structure_loss" in extra_metrics
+    assert "rae/ssim_loss" in extra_metrics
 
 
 def test_rae_recipe_enables_wandb_and_swanlab_tracking() -> None:

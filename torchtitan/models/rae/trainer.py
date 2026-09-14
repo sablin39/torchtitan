@@ -212,8 +212,8 @@ def log_stage1_metrics(
 ) -> None:
     """Log the scalar metrics emitted by one RAE Stage 1 update."""
     values = [float(loss.detach().item()) for loss in losses]
-    if len(values) != 15:
-        raise ValueError(f"RAE Stage 1 metrics require 15 values, got {len(values)}")
+    if len(values) != 16:
+        raise ValueError(f"RAE Stage 1 metrics require 16 values, got {len(values)}")
     if metrics_processor is not None:
         extra_metrics: dict[str, float] = {
             "rae/reconstruction_loss": values[0],
@@ -230,7 +230,8 @@ def log_stage1_metrics(
             "rae/dino_feature_distance": values[11],
             "rae/feature_matching_loss": values[12],
             "rae/dinov3_perceptual_loss": values[13],
-            "rae/gradient_loss": values[14],
+            "rae/structure_loss": values[14],
+            "rae/ssim_loss": values[15],
             "rae/non_padding_ratio": non_padding_ratio,
             "rae/num_images_per_step": num_images_per_step,
         }
@@ -251,8 +252,8 @@ def log_stage1_metrics(
             "[RAE Stage 1 | step %d] recon=%.5f perceptual=%.5f "
             "gan=%.5f disc=%.5f adaptive=%.5f decoder_grad=%.5f "
             "disc_grad=%.5f gen_logit=%.5f real_logit=%.5f fake_logit=%.5f "
-            "disc_acc=%.5f dino_dist=%.5f fm=%.5f dino_perc=%.5f gdl=%.5f "
-            "non_padding=%.5f "
+            "disc_acc=%.5f dino_dist=%.5f fm=%.5f dino_perc=%.5f struct=%.5f "
+            "ssim=%.5f non_padding=%.5f "
             "images_per_step=%.2f%s",
             step,
             *values,
@@ -268,24 +269,174 @@ _CHARBONNIER_EPS = 1e-3
 """Charbonnier epsilon, matching the ViTok-v2 pixel-term formulation."""
 
 
+def _pixel_penalty(difference: torch.Tensor, kind: str) -> torch.Tensor:
+    """Elementwise pixel-loss penalty (input must already be fp32)."""
+    if kind == "charbonnier":
+        return (difference.pow(2) + _CHARBONNIER_EPS**2).sqrt()
+    if kind == "l1":
+        return difference.abs()
+    raise ValueError(f"Unsupported pixel loss kind: {kind}")
+
+
+def pixel_reconstruction_losses(
+    reconstructions: Sequence[torch.Tensor],
+    targets: Sequence[torch.Tensor],
+    kind: str,
+) -> torch.Tensor:
+    """Per-image pixel reconstruction losses as one concatenated vector.
+
+    Equal-shape images are stacked so a packed varlen microbatch costs a
+    handful of kernels instead of one loss chain per image; the reduction
+    stays per-image (callers typically take the mean). ``charbonnier`` is
+    sqrt(d^2 + eps^2) with eps=1e-3 (the ViTok-v2 pixel term, arXiv
+    2605.05331): a smooth L1 approximation with gradients that vanish
+    linearly near zero instead of taking a constant step. Computed in fp32;
+    ``l1`` keeps the plain absolute error.
+    """
+    if len(reconstructions) != len(targets) or not targets:
+        raise ValueError("pixel_reconstruction_losses expects paired non-empty lists")
+    grouped: dict[tuple[int, int], list[int]] = {}
+    for index, target in enumerate(targets):
+        grouped.setdefault((target.shape[-2], target.shape[-1]), []).append(index)
+    per_image = []
+    for indices in grouped.values():
+        reconstruction_BCHW = torch.stack(
+            [reconstructions[index] for index in indices]
+        ).float()
+        target_BCHW = torch.stack([targets[index] for index in indices]).float()
+        difference = reconstruction_BCHW - target_BCHW
+        per_image.append(_pixel_penalty(difference, kind).mean(dim=(1, 2, 3)))
+    return torch.cat(per_image)
+
+
 def pixel_reconstruction_loss(
     reconstruction_CHW: torch.Tensor,
     target_CHW: torch.Tensor,
     kind: str,
 ) -> torch.Tensor:
-    """Per-pixel reconstruction loss for one image pair.
+    """Per-pixel reconstruction loss for one image pair."""
+    return pixel_reconstruction_losses([reconstruction_CHW], [target_CHW], kind)[0]
 
-    ``charbonnier`` is sqrt(d^2 + eps^2) with eps=1e-3 (the ViTok-v2 pixel
-    term, arXiv 2605.05331): a smooth L1 approximation with gradients that
-    vanish linearly near zero instead of taking a constant step. Computed in
-    fp32; ``l1`` keeps the plain absolute error.
+
+def ssim_loss(
+    reconstructions: Sequence[torch.Tensor],
+    targets: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Mean per-image 1 - SSIM (the ViTok-v2 structural term, weight 0.1).
+
+    Standard 11x11 Gaussian window (sigma 1.5) with C1=0.01^2, C2=0.03^2 for
+    [0, 1] images, computed in fp32 with equal-shape images stacked, so a
+    packed varlen microbatch costs three grouped convs.
     """
-    if kind == "charbonnier":
-        difference = reconstruction_CHW.float() - target_CHW.float()
-        return (difference.pow(2) + _CHARBONNIER_EPS**2).sqrt().mean()
-    if kind == "l1":
-        return F.l1_loss(reconstruction_CHW, target_CHW)
-    raise ValueError(f"Unsupported pixel loss kind: {kind}")
+    if len(reconstructions) != len(targets) or not targets:
+        raise ValueError("ssim_loss expects paired non-empty lists")
+    coords = torch.arange(11, dtype=torch.float32) - 5.0
+    kernel_1d = torch.exp(-(coords**2) / (2 * 1.5**2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_2d = torch.outer(kernel_1d, kernel_1d)
+    grouped: dict[tuple[int, int], list[int]] = {}
+    for index, target in enumerate(targets):
+        grouped.setdefault((target.shape[-2], target.shape[-1]), []).append(index)
+    per_image = []
+    for indices in grouped.values():
+        reconstruction_BCHW = torch.stack(
+            [reconstructions[index] for index in indices]
+        ).float()
+        target_BCHW = torch.stack([targets[index] for index in indices]).float()
+        channels = reconstruction_BCHW.shape[1]
+        window = (
+            kernel_2d.to(device=reconstruction_BCHW.device)
+            .expand(channels, 1, 11, 11)
+            .contiguous()
+        )
+
+        def _blur(values: torch.Tensor) -> torch.Tensor:
+            return F.conv2d(values, window, groups=channels)
+
+        mu_x = _blur(reconstruction_BCHW)
+        mu_y = _blur(target_BCHW)
+        sigma_x = _blur(reconstruction_BCHW * reconstruction_BCHW) - mu_x * mu_x
+        sigma_y = _blur(target_BCHW * target_BCHW) - mu_y * mu_y
+        sigma_xy = _blur(reconstruction_BCHW * target_BCHW) - mu_x * mu_y
+        c1, c2 = 0.01**2, 0.03**2
+        ssim_map = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
+            (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2)
+        )
+        per_image.append(1.0 - ssim_map.mean(dim=(1, 2, 3)))
+    return torch.cat(per_image).mean()
+
+
+def _swt_haar(values_BCHW: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """One level of an undecimated (stationary) Haar transform.
+
+    Returns (ll, lh, hl, hh) subbands at the input resolution: the 2x2 Haar
+    filters run at stride 1 over a replicate-padded image, so unlike a
+    decimated DWT every subband coefficient stays coupled to its spatial
+    location (the property WGSR relies on, arXiv 2402.19215).
+    """
+    channels = values_BCHW.shape[1]
+    filters = (
+        values_BCHW.new_tensor(
+            [
+                [[1.0, 1.0], [1.0, 1.0]],
+                [[1.0, 1.0], [-1.0, -1.0]],
+                [[1.0, -1.0], [1.0, -1.0]],
+                [[1.0, -1.0], [-1.0, 1.0]],
+            ]
+        )
+        * 0.25
+    )
+    # groups=channels needs each group's four band filters consecutive:
+    # [ll, lh, hl, hh] repeated per channel. The output then lays out as
+    # (channel, band), not (band, channel).
+    weight = filters.unsqueeze(1).repeat(channels, 1, 1, 1)
+    padded = F.pad(values_BCHW, (0, 1, 0, 1), mode="replicate")
+    bands = F.conv2d(padded, weight, stride=1, groups=channels)
+    batch = values_BCHW.shape[0]
+    return bands.view(batch, channels, 4, *values_BCHW.shape[-2:]).unbind(dim=2)
+
+
+def wavelet_structure_loss(
+    reconstructions: Sequence[torch.Tensor],
+    targets: Sequence[torch.Tensor],
+    kind: str = "charbonnier",
+    levels: int = 1,
+) -> torch.Tensor:
+    """Mean per-image penalty on SWT high-frequency subband mismatches.
+
+    The WGSR wavelet-domain fidelity idea (arXiv 2402.19215) restricted to
+    the detail subbands: each level's LH/HL/HH coefficients of the
+    reconstruction answer to the ground truth under the configured pixel
+    penalty, so error is supervised by scale and orientation instead of only
+    per-pixel. The LL band is intentionally excluded -- the pixel loss
+    already supervises it. ``levels`` re-decomposes LL (2 recovers
+    mid-frequency structures best in WGSR). Equal-shape images are stacked,
+    so a packed varlen microbatch costs 4 convs per level.
+    """
+    if len(reconstructions) != len(targets) or not targets:
+        raise ValueError("wavelet_structure_loss expects paired non-empty lists")
+    if levels < 1:
+        raise ValueError("wavelet_structure_loss levels must be positive")
+    grouped: dict[tuple[int, int], list[int]] = {}
+    for index, target in enumerate(targets):
+        grouped.setdefault((target.shape[-2], target.shape[-1]), []).append(index)
+    per_image = []
+    for indices in grouped.values():
+        reconstruction_BCHW = torch.stack(
+            [reconstructions[index] for index in indices]
+        ).float()
+        target_BCHW = torch.stack([targets[index] for index in indices]).float()
+        level_loss = reconstruction_BCHW.new_zeros(reconstruction_BCHW.shape[0])
+        for _ in range(levels):
+            rec_bands = _swt_haar(reconstruction_BCHW)
+            tgt_bands = _swt_haar(target_BCHW)
+            for rec_band, tgt_band in zip(rec_bands[1:], tgt_bands[1:], strict=True):
+                level_loss = level_loss + _pixel_penalty(
+                    rec_band - tgt_band, kind
+                ).mean(dim=(1, 2, 3))
+            reconstruction_BCHW, target_BCHW = rec_bands[0], tgt_bands[0]
+        per_image.append(level_loss / (3 * levels))
+    return torch.cat(per_image).mean()
 
 
 def gradient_difference_loss(
@@ -321,17 +472,10 @@ def gradient_difference_loss(
         dy = (reconstruction_BCHW[..., 1:, :] - reconstruction_BCHW[..., :-1, :]) - (
             target_BCHW[..., 1:, :] - target_BCHW[..., :-1, :]
         )
-        if kind == "charbonnier":
-            per_image.append(
-                (dx.pow(2) + _CHARBONNIER_EPS**2).sqrt().mean(dim=(1, 2, 3))
-                + (dy.pow(2) + _CHARBONNIER_EPS**2).sqrt().mean(dim=(1, 2, 3))
-            )
-        elif kind == "l1":
-            per_image.append(
-                dx.abs().mean(dim=(1, 2, 3)) + dy.abs().mean(dim=(1, 2, 3))
-            )
-        else:
-            raise ValueError(f"Unsupported pixel loss kind: {kind}")
+        per_image.append(
+            _pixel_penalty(dx, kind).mean(dim=(1, 2, 3))
+            + _pixel_penalty(dy, kind).mean(dim=(1, 2, 3))
+        )
     return torch.cat(per_image).mean()
 
 
@@ -452,17 +596,31 @@ class RAEGANConfig:
     as indices into the probed feature list (0 is the final block output,
     1.. are hf_key_depths in order); None uses every probed depth."""
     perceptual_weight: float = 1.0
+    ssim_weight: float = 0.0
+    """Weight of the SSIM structural term on the reconstruction side (the
+    ViTok-v2 recipe uses 0.1 alongside Charbonnier and its DINOv3
+    perceptual term); 0 disables it."""
     pixel_loss: str = "charbonnier"
     """Per-pixel reconstruction loss kind: ``charbonnier`` (sqrt(d^2 + eps^2)
     with eps=1e-3, the ViTok-v2 pixel term -- a smooth L1 with gradients that
-    vanish linearly near zero) or ``l1``. Applied to both the pixel
-    reconstruction term and the gradient-difference penalty."""
-    gradient_loss_weight: float = 0.0
-    """Weight of the gradient-difference term on the reconstruction side.
-    Per-pixel L1 cannot see decoder patch seams (a boundary discontinuity
-    costs the same as the same error spread smoothly), so reconstructions
-    keep a visible 16px grid; matching spatial finite differences against
-    the ground truth penalizes exactly those crossings. 0 disables it."""
+    vanish linearly near zero) or ``l1``. Applied to the pixel reconstruction
+    term and as the penalty of the structure loss."""
+    structure_loss: str = "gdl"
+    """High-frequency structure supervision kind: ``gdl`` matches horizontal/
+    vertical finite differences (single-scale gradients); ``wavelet``
+    matches the LH/HL/HH subbands of an undecimated Haar transform (WGSR,
+    arXiv 2402.19215), which supervises error by scale and orientation --
+    a strict superset of GDL's axis-aligned finest-scale view that also
+    covers diagonal structure and (with levels=2) mid frequencies."""
+    structure_loss_levels: int = 1
+    """SWT decomposition levels for structure_loss='wavelet' (2 recovers
+    mid-frequency structures best in WGSR); ignored for 'gdl'."""
+    structure_loss_weight: float = 0.0
+    """Weight of the structure term on the reconstruction side. Per-pixel
+    losses cannot see decoder patch seams (a boundary discontinuity costs
+    the same as the same error spread smoothly), so reconstructions keep a
+    visible 16px grid; the structure term makes those crossings answer to
+    the ground truth in the gradient or wavelet domain. 0 disables it."""
     discriminator_updates: int = 1
     discriminator_update_batch_size: int = 256
     """Images per backward in one discriminator update. A packed step holds
@@ -501,8 +659,14 @@ class RAEGANConfig:
             raise ValueError("gan.feature_matching_weight must be non-negative")
         if self.dinov3_perceptual_weight < 0:
             raise ValueError("gan.dinov3_perceptual_weight must be non-negative")
-        if self.gradient_loss_weight < 0:
-            raise ValueError("gan.gradient_loss_weight must be non-negative")
+        if self.ssim_weight < 0:
+            raise ValueError("gan.ssim_weight must be non-negative")
+        if self.structure_loss_weight < 0:
+            raise ValueError("gan.structure_loss_weight must be non-negative")
+        if self.structure_loss not in {"gdl", "wavelet"}:
+            raise ValueError(f"Unsupported structure loss: {self.structure_loss}")
+        if self.structure_loss_levels < 1:
+            raise ValueError("gan.structure_loss_levels must be positive")
         if self.pixel_loss not in {"l1", "charbonnier"}:
             raise ValueError(f"Unsupported pixel loss kind: {self.pixel_loss}")
         if self.dinov3_perceptual_depths is not None and any(
@@ -1372,7 +1536,8 @@ class RAEStage1Trainer(Trainer):
         self.discriminator.eval()
         self.discriminator.set_head_requires_grad(False)
         reconstruction_metric = perceptual_metric = adversarial_metric = None
-        gradient_metric = None
+        structure_metric = None
+        ssim_metric = None
         adaptive_metric = None
         generator_logits_metric = None
         fm_metric = None
@@ -1507,21 +1672,26 @@ class RAEStage1Trainer(Trainer):
                         target_items = self._image_items(
                             self._supervision_images(images, target_sizes)
                         )
-                    reconstruction_loss = torch.stack(
-                        [
-                            pixel_reconstruction_loss(
-                                reconstruction, target, gan.pixel_loss
-                            )
-                            for reconstruction, target in zip(
-                                recon_items, target_items, strict=True
-                            )
-                        ]
+                    reconstruction_loss = pixel_reconstruction_losses(
+                        recon_items, target_items, gan.pixel_loss
                     ).mean()
-                    gradient_loss = (
-                        gradient_difference_loss(
-                            recon_items, target_items, kind=gan.pixel_loss
-                        )
-                        if gan.gradient_loss_weight > 0
+                    if gan.structure_loss_weight > 0:
+                        if gan.structure_loss == "wavelet":
+                            structure_loss = wavelet_structure_loss(
+                                recon_items,
+                                target_items,
+                                kind=gan.pixel_loss,
+                                levels=gan.structure_loss_levels,
+                            )
+                        else:
+                            structure_loss = gradient_difference_loss(
+                                recon_items, target_items, kind=gan.pixel_loss
+                            )
+                    else:
+                        structure_loss = reconstruction_loss.new_zeros(())
+                    ssim_term = (
+                        ssim_loss(recon_items, target_items)
+                        if gan.ssim_weight > 0
                         else reconstruction_loss.new_zeros(())
                     )
                 with self._phase_profiler.phase("perceptual"):
@@ -1539,7 +1709,8 @@ class RAEStage1Trainer(Trainer):
                 reconstruction_total = (
                     reconstruction_loss
                     + gan.perceptual_weight * perceptual_loss
-                    + gan.gradient_loss_weight * gradient_loss
+                    + gan.structure_loss_weight * structure_loss
+                    + gan.ssim_weight * ssim_term
                 )
                 if use_gan:
                     with self._phase_profiler.phase("gan"):
@@ -1648,7 +1819,8 @@ class RAEStage1Trainer(Trainer):
                 num_images_per_step += len(image_items)
             reconstruction_metric = reconstruction_loss.detach()
             perceptual_metric = perceptual_loss.detach()
-            gradient_metric = gradient_loss.detach()
+            structure_metric = structure_loss.detach()
+            ssim_metric = ssim_term.detach()
             adversarial_metric = adversarial_loss.detach()
             adaptive_metric = adaptive_weight.detach()
             if fm_loss is not None:
@@ -1659,7 +1831,8 @@ class RAEStage1Trainer(Trainer):
         assert (
             reconstruction_metric is not None
             and perceptual_metric is not None
-            and gradient_metric is not None
+            and structure_metric is not None
+            and ssim_metric is not None
             and adversarial_metric is not None
             and adaptive_metric is not None
         )
@@ -1794,7 +1967,8 @@ class RAEStage1Trainer(Trainer):
                     dino_perceptual_metric
                     if dino_perceptual_metric is not None
                     else metric_source.new_zeros(()),
-                    gradient_metric,
+                    structure_metric,
+                    ssim_metric,
                 ),
                 metrics_processor=self.metrics_processor,
                 non_padding_ratio=non_padding_tokens / padding_capacity_tokens,
@@ -2183,14 +2357,11 @@ class RAEValidator(BaseValidator):
                     self.trainer._supervision_images(images, target_sizes)
                 )
                 losses.extend(
-                    pixel_reconstruction_loss(
-                        reconstruction,
-                        target,
+                    pixel_reconstruction_losses(
+                        reconstructions,
+                        targets,
                         self.trainer.config.gan.pixel_loss,
                     ).detach()
-                    for reconstruction, target in zip(
-                        reconstructions, targets, strict=True
-                    )
                 )
                 if collect_r_phi and len(eval_pairs) < 32:
                     eval_pairs.extend(
@@ -2239,6 +2410,9 @@ __all__ = [
     "DiscriminatorAugmentation",
     "gradient_difference_loss",
     "pixel_reconstruction_loss",
+    "pixel_reconstruction_losses",
+    "ssim_loss",
+    "wavelet_structure_loss",
     "RAEGANAugmentConfig",
     "RAEGANConfig",
     "RAEStage1Trainer",

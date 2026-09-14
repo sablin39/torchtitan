@@ -1093,31 +1093,39 @@ class RAEFeatureDiscriminator(nn.Module):
         """
         if len(real_features) != len(fake_features) or not real_features:
             raise ValueError("perceptual_distance expects paired non-empty lists")
-        if depth_indices is not None:
-            real_features = [
-                [depths[i] for i in depth_indices] for depths in real_features
-            ]
-            fake_features = [
-                [depths[i] for i in depth_indices] for depths in fake_features
-            ]
-        per_image = [
-            torch.stack(
-                [
+        num_depths = len(real_features[0])
+        selected = (
+            list(range(num_depths)) if depth_indices is None else list(depth_indices)
+        )
+        # Group same-shape features into one stacked batch per depth so a
+        # packed varlen microbatch costs a handful of kernels instead of one
+        # normalize+MSE chain per image.
+        per_image_values: list[list[torch.Tensor]] = [[] for _ in real_features]
+        for depth in selected:
+            grouped: dict[torch.Size, list[int]] = {}
+            for index, depths in enumerate(real_features):
+                grouped.setdefault(depths[depth].shape, []).append(index)
+            for indices in grouped.values():
+                real_BCL = torch.stack(
+                    [real_features[index][depth] for index in indices]
+                ).float()
+                fake_BCL = torch.stack(
+                    [fake_features[index][depth] for index in indices]
+                ).float()
+                patch_mse_BL = (
                     (
-                        F.normalize(fake_CL.float(), p=2, dim=0)
-                        - F.normalize(real_CL.float(), p=2, dim=0)
+                        F.normalize(fake_BCL, p=2, dim=1)
+                        - F.normalize(real_BCL, p=2, dim=1)
                     )
                     .pow(2)
-                    .mean(dim=0)
-                    .mean()
-                    for fake_CL, real_CL in zip(fake_depths, real_depths, strict=True)
-                ]
-            ).mean()
-            for fake_depths, real_depths in zip(
-                fake_features, real_features, strict=True
-            )
-        ]
-        return torch.stack(per_image).mean()
+                    .mean(dim=1)
+                )
+                patch_mean_B = patch_mse_BL.mean(dim=1)
+                for position, index in enumerate(indices):
+                    per_image_values[index].append(patch_mean_B[position])
+        return torch.stack(
+            [torch.stack(values).mean() for values in per_image_values]
+        ).mean()
 
     def _heads_from_feature_batch(self, features: list[torch.Tensor]) -> torch.Tensor:
         """Per-patch logits (B, H, L) from one same-shape activation batch."""
