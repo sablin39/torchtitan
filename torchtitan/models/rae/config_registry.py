@@ -380,6 +380,12 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
             # Per-patch DINOv3 feature matching joins the adversarial term
             # under the same adaptive weight.
             feature_matching_weight=1.0,
+            # L1 cannot see the 16px decoder patch grid (measured ~1.8x
+            # ground-truth gradient energy at patch boundaries through step
+            # 2000); match spatial gradients so seam crossings answer to the
+            # ground truth. 2.0 keeps the term below L1 at convergence
+            # (gradient magnitudes are ~10x smaller than pixel errors).
+            gradient_loss_weight=2.0,
         ),
         discriminator=RAEFeatureDiscriminator.Config(
             feature_channels=768,

@@ -42,6 +42,7 @@ from torchtitan.models.rae.trainer import (
     _r_phi_ratio,
     AugmentationParams,
     DiscriminatorAugmentation,
+    gradient_difference_loss,
     log_stage1_metrics,
     RAEGANConfig,
     RAEStage1Trainer,
@@ -853,6 +854,58 @@ def test_feature_matching_depth_indices_selects_subset() -> None:
     ).item() == pytest.approx(full.item(), abs=1e-7)
 
 
+def test_gradient_loss_weight_defaults_and_validation() -> None:
+    assert RAEGANConfig().gradient_loss_weight == 0.0
+    with pytest.raises(ValueError, match="gradient_loss_weight"):
+        RAEGANConfig(gradient_loss_weight=-0.5)
+    assert rae_stage1_openimages_static_96k_uvit().gan.gradient_loss_weight == 2.0
+
+
+def test_gradient_difference_loss_zero_for_identical_images() -> None:
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40)]
+    assert gradient_difference_loss(targets, list(targets)).item() == pytest.approx(
+        0.0, abs=1e-7
+    )
+
+
+def test_gradient_difference_loss_flows_gradient() -> None:
+    target = torch.rand(3, 32, 32)
+    reconstruction = torch.rand(3, 32, 32, requires_grad=True)
+    loss = gradient_difference_loss([reconstruction], [target])
+    assert loss.item() > 0.0
+    loss.backward()
+    assert reconstruction.grad is not None
+    assert reconstruction.grad.abs().sum() > 0
+
+
+def test_gradient_difference_loss_prefers_seams_over_smooth_error() -> None:
+    # A boundary discontinuity and a constant offset with the same L1 cost
+    # must not tie: the seam is what the term exists to penalize, while a
+    # constant offset leaves every finite difference untouched.
+    torch.manual_seed(0)
+    target = torch.rand(3, 32, 64) * 0.4
+    seamed = target.clone()
+    seamed[:, :, 32:] += 0.1  # step at the patch boundary, L1 = 0.1
+    smooth = target + 0.1  # constant offset, L1 = 0.1
+    seam_loss = gradient_difference_loss([seamed], [target])
+    smooth_loss = gradient_difference_loss([smooth], [target])
+    assert smooth_loss.item() == pytest.approx(0.0, abs=1e-7)
+    assert seam_loss.item() > 1e-3
+
+
+def test_gradient_difference_loss_mixed_resolutions() -> None:
+    torch.manual_seed(0)
+    targets = [torch.rand(3, 32, 32), torch.rand(3, 24, 40), torch.rand(3, 32, 32)]
+    reconstructions = [torch.rand_like(target) for target in targets]
+    loss = gradient_difference_loss(reconstructions, targets)
+    per_image = [
+        gradient_difference_loss([reconstruction], [target])
+        for reconstruction, target in zip(reconstructions, targets, strict=True)
+    ]
+    expected = torch.stack(per_image).mean()
+    assert loss.item() == pytest.approx(expected.item(), abs=1e-6)
+
+
 def test_discriminator_update_reuses_cached_real_features() -> None:
     torch.manual_seed(0)
     discriminator = RAEFeatureDiscriminator(
@@ -992,7 +1045,7 @@ def test_stage1_metrics_include_packing_stats() -> None:
 
     log_stage1_metrics(
         1,
-        [torch.zeros(()) for _ in range(14)],
+        [torch.zeros(()) for _ in range(15)],
         metrics_processor=Metrics(),
         non_padding_ratio=0.75,
         num_images_per_step=16.0,
@@ -1003,6 +1056,7 @@ def test_stage1_metrics_include_packing_stats() -> None:
     assert "rae/discriminator_accuracy" in extra_metrics
     assert "rae/feature_matching_loss" in extra_metrics
     assert "rae/dinov3_perceptual_loss" in extra_metrics
+    assert "rae/gradient_loss" in extra_metrics
 
 
 def test_rae_recipe_enables_wandb_and_swanlab_tracking() -> None:

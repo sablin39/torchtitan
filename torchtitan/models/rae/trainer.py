@@ -212,8 +212,8 @@ def log_stage1_metrics(
 ) -> None:
     """Log the scalar metrics emitted by one RAE Stage 1 update."""
     values = [float(loss.detach().item()) for loss in losses]
-    if len(values) != 14:
-        raise ValueError(f"RAE Stage 1 metrics require 14 values, got {len(values)}")
+    if len(values) != 15:
+        raise ValueError(f"RAE Stage 1 metrics require 15 values, got {len(values)}")
     if metrics_processor is not None:
         extra_metrics: dict[str, float] = {
             "rae/reconstruction_loss": values[0],
@@ -230,6 +230,7 @@ def log_stage1_metrics(
             "rae/dino_feature_distance": values[11],
             "rae/feature_matching_loss": values[12],
             "rae/dinov3_perceptual_loss": values[13],
+            "rae/gradient_loss": values[14],
             "rae/non_padding_ratio": non_padding_ratio,
             "rae/num_images_per_step": num_images_per_step,
         }
@@ -250,7 +251,8 @@ def log_stage1_metrics(
             "[RAE Stage 1 | step %d] recon=%.5f perceptual=%.5f "
             "gan=%.5f disc=%.5f adaptive=%.5f decoder_grad=%.5f "
             "disc_grad=%.5f gen_logit=%.5f real_logit=%.5f fake_logit=%.5f "
-            "disc_acc=%.5f dino_dist=%.5f fm=%.5f dino_perc=%.5f non_padding=%.5f "
+            "disc_acc=%.5f dino_dist=%.5f fm=%.5f dino_perc=%.5f gdl=%.5f "
+            "non_padding=%.5f "
             "images_per_step=%.2f%s",
             step,
             *values,
@@ -261,6 +263,41 @@ def log_stage1_metrics(
 
 
 ImageBatch = torch.Tensor | list[torch.Tensor]
+
+
+def gradient_difference_loss(
+    reconstructions: Sequence[torch.Tensor],
+    targets: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    """Mean per-image L1 on horizontal/vertical finite-difference mismatches.
+
+    Per-pixel L1 does not penalize discontinuities at decoder patch
+    boundaries: a seam costs the same as the same error spread smoothly.
+    Matching spatial gradients makes each boundary crossing answer to the
+    ground-truth gradient (and sharpens real edges). Equal-shape images are
+    stacked so each packed microbatch costs a handful of kernels, and the
+    differences are computed in fp32 because bf16 resolves neighboring-pixel
+    deltas poorly.
+    """
+    if len(reconstructions) != len(targets) or not targets:
+        raise ValueError("gradient_difference_loss expects paired non-empty lists")
+    grouped: dict[tuple[int, int], list[int]] = {}
+    for index, target in enumerate(targets):
+        grouped.setdefault((target.shape[-2], target.shape[-1]), []).append(index)
+    per_image = []
+    for indices in grouped.values():
+        reconstruction_BCHW = torch.stack(
+            [reconstructions[index] for index in indices]
+        ).float()
+        target_BCHW = torch.stack([targets[index] for index in indices]).float()
+        dx = (reconstruction_BCHW[..., :, 1:] - reconstruction_BCHW[..., :, :-1]) - (
+            target_BCHW[..., :, 1:] - target_BCHW[..., :, :-1]
+        )
+        dy = (reconstruction_BCHW[..., 1:, :] - reconstruction_BCHW[..., :-1, :]) - (
+            target_BCHW[..., 1:, :] - target_BCHW[..., :-1, :]
+        )
+        per_image.append(dx.abs().mean(dim=(1, 2, 3)) + dy.abs().mean(dim=(1, 2, 3)))
+    return torch.cat(per_image).mean()
 
 
 class _PhaseProfiler:
@@ -378,6 +415,12 @@ class RAEGANConfig:
     as indices into the probed feature list (0 is the final block output,
     1.. are hf_key_depths in order); None uses every probed depth."""
     perceptual_weight: float = 1.0
+    gradient_loss_weight: float = 0.0
+    """Weight of the gradient-difference term on the reconstruction side.
+    Per-pixel L1 cannot see decoder patch seams (a boundary discontinuity
+    costs the same as the same error spread smoothly), so reconstructions
+    keep a visible 16px grid; matching spatial finite differences against
+    the ground truth penalizes exactly those crossings. 0 disables it."""
     discriminator_updates: int = 1
     discriminator_update_batch_size: int = 256
     """Images per backward in one discriminator update. A packed step holds
@@ -416,6 +459,8 @@ class RAEGANConfig:
             raise ValueError("gan.feature_matching_weight must be non-negative")
         if self.dinov3_perceptual_weight < 0:
             raise ValueError("gan.dinov3_perceptual_weight must be non-negative")
+        if self.gradient_loss_weight < 0:
+            raise ValueError("gan.gradient_loss_weight must be non-negative")
         if self.dinov3_perceptual_depths is not None and any(
             depth < 0 for depth in self.dinov3_perceptual_depths
         ):
@@ -1283,6 +1328,7 @@ class RAEStage1Trainer(Trainer):
         self.discriminator.eval()
         self.discriminator.set_head_requires_grad(False)
         reconstruction_metric = perceptual_metric = adversarial_metric = None
+        gradient_metric = None
         adaptive_metric = None
         generator_logits_metric = None
         fm_metric = None
@@ -1425,6 +1471,11 @@ class RAEStage1Trainer(Trainer):
                             )
                         ]
                     ).mean()
+                    gradient_loss = (
+                        gradient_difference_loss(recon_items, target_items)
+                        if gan.gradient_loss_weight > 0
+                        else reconstruction_loss.new_zeros(())
+                    )
                 with self._phase_profiler.phase("perceptual"):
                     perceptual_loss = (
                         self._perceptual_loss(
@@ -1438,7 +1489,9 @@ class RAEStage1Trainer(Trainer):
                         else reconstruction_loss.new_zeros(())
                     )
                 reconstruction_total = (
-                    reconstruction_loss + gan.perceptual_weight * perceptual_loss
+                    reconstruction_loss
+                    + gan.perceptual_weight * perceptual_loss
+                    + gan.gradient_loss_weight * gradient_loss
                 )
                 if use_gan:
                     with self._phase_profiler.phase("gan"):
@@ -1549,6 +1602,7 @@ class RAEStage1Trainer(Trainer):
                 num_images_per_step += len(image_items)
             reconstruction_metric = reconstruction_loss.detach()
             perceptual_metric = perceptual_loss.detach()
+            gradient_metric = gradient_loss.detach()
             adversarial_metric = adversarial_loss.detach()
             adaptive_metric = adaptive_weight.detach()
             if fm_loss is not None:
@@ -1559,6 +1613,7 @@ class RAEStage1Trainer(Trainer):
         assert (
             reconstruction_metric is not None
             and perceptual_metric is not None
+            and gradient_metric is not None
             and adversarial_metric is not None
             and adaptive_metric is not None
         )
@@ -1693,6 +1748,7 @@ class RAEStage1Trainer(Trainer):
                     dino_perceptual_metric
                     if dino_perceptual_metric is not None
                     else metric_source.new_zeros(()),
+                    gradient_metric,
                 ),
                 metrics_processor=self.metrics_processor,
                 non_padding_ratio=non_padding_tokens / padding_capacity_tokens,
@@ -2131,6 +2187,7 @@ class RAEValidator(BaseValidator):
 
 __all__ = [
     "DiscriminatorAugmentation",
+    "gradient_difference_loss",
     "RAEGANAugmentConfig",
     "RAEGANConfig",
     "RAEStage1Trainer",
