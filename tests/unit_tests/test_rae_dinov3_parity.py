@@ -298,3 +298,171 @@ def test_integrated_bf16_discriminator() -> None:
         distance = discriminator.feature_distance(images, images)
         assert distance.dtype == torch.float32
         assert distance.item() == 0.0
+
+
+def _bf16_discriminator():
+    from torchtitan.models.rae.discriminator.dinov3 import RAEFeatureDiscriminator
+
+    config = RAEFeatureDiscriminator.Config(
+        backbone_kind="hf",
+        hf_model_path=str(CHECKPOINT_DIR),
+        backbone_dtype="bfloat16",
+    )
+    return RAEFeatureDiscriminator(config, device=torch.device("cuda")).cuda()
+
+
+def _dense_reference_features(
+    discriminator, images: list[torch.Tensor]
+) -> list[list[torch.Tensor]]:
+    """Per-image per-depth activations via the dense stacked-batch path."""
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index, image in enumerate(images):
+        groups.setdefault(image.shape[-2:], []).append(index)
+    outputs: list[list[torch.Tensor] | None] = [None] * len(images)
+    with torch.no_grad():
+        for indices in groups.values():
+            group_BCHW = torch.stack([images[index] for index in indices])
+            mean_1C11 = group_BCHW.new_tensor(discriminator.image_mean).view(1, -1, 1, 1)
+            std_1C11 = group_BCHW.new_tensor(discriminator.image_std).view(1, 3, 1, 1)
+            activations = discriminator._backbone_features(
+                (group_BCHW - mean_1C11) / std_1C11
+            )
+            for chunk_index, image_index in enumerate(indices):
+                outputs[image_index] = [
+                    activation_BCL[chunk_index] for activation_BCL in activations
+                ]
+    return outputs
+
+
+def _varlen_images() -> list[torch.Tensor]:
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    return [
+        torch.rand(3, height, width, device="cuda", generator=generator)
+        for height, width in ((224, 224), (256, 192), (112, 336), (96, 304), (256, 192))
+    ]
+
+
+def test_varlen_matches_dense_bf16() -> None:
+    discriminator = _bf16_discriminator()
+    assert discriminator._varlen_supported()
+    images = _varlen_images()
+    packed = discriminator._packed_features(images, use_compiled=False)
+    dense = _dense_reference_features(discriminator, images)
+    for image_index, (packed_depths, dense_depths) in enumerate(zip(packed, dense)):
+        for depth, (packed_CL, dense_CL) in enumerate(zip(packed_depths, dense_depths)):
+            assert packed_CL.shape == dense_CL.shape
+            diff = packed_CL.float() - dense_CL.float()
+            norm_rel = (diff.norm() / dense_CL.float().norm()).item()
+            print(
+                f"varlen bf16 image {image_index} depth {depth}: "
+                f"max abs diff {diff.abs().max().item():.3e}, norm rel {norm_rel:.3e}"
+            )
+            # flash-attn vs sdpa in bf16: reduction-order differences only.
+            assert norm_rel < 5e-2
+
+
+def test_varlen_logits_match_dense_bf16() -> None:
+    discriminator = _bf16_discriminator()
+    discriminator.eval()
+    images = [image * 2.0 - 1.0 for image in _varlen_images()]
+    with torch.no_grad():
+        # Routed forward uses the packed varlen backbone on cuda + bf16.
+        logits_packed = discriminator(images)
+        assert isinstance(logits_packed, list)
+        logits_dense = discriminator._logits_from_features(
+            _dense_reference_features(
+                discriminator, [image * 0.5 + 0.5 for image in images]
+            )
+        )
+    for index, (packed_HL, dense_HL) in enumerate(zip(logits_packed, logits_dense)):
+        assert packed_HL.shape == dense_HL.shape
+        diff = packed_HL.float() - dense_HL.float()
+        norm_rel = (diff.norm() / dense_HL.float().norm().clamp_min(1e-6)).item()
+        print(f"varlen logits image {index}: norm rel {norm_rel:.3e}")
+        assert norm_rel < 5e-2
+
+
+def test_varlen_compiled_matches_eager() -> None:
+    discriminator = _bf16_discriminator()
+    discriminator.compile_forward(backend="inductor")
+    images = _varlen_images()
+    with torch.no_grad():
+        eager = discriminator._packed_features(images, use_compiled=False)
+        compiled = discriminator._packed_features(images, use_compiled=True)
+        # A second, differently-sized pack must not recompile into garbage:
+        # dynamic shapes keep one graph across doc counts.
+        compiled_other = discriminator._packed_features(images[:3], use_compiled=True)
+    assert len(compiled_other) == 3
+    for packed_depths, compiled_depths in zip(eager, compiled):
+        for eager_CL, compiled_CL in zip(packed_depths, compiled_depths):
+            diff = compiled_CL.float() - eager_CL.float()
+            norm_rel = (diff.norm() / eager_CL.float().norm()).item()
+            print(f"varlen compiled vs eager: norm rel {norm_rel:.3e}")
+            # Inductor fuses the elementwise chain and reorders bf16
+            # reductions; same 5e-2 bound as the other bf16 comparisons.
+            assert norm_rel < 5e-2
+
+
+def test_varlen_backward_into_input() -> None:
+    discriminator = _bf16_discriminator()
+    discriminator.compile_forward(backend="inductor")
+    discriminator.eval()
+    images = [
+        (image * 2.0 - 1.0).requires_grad_(True) for image in _varlen_images()[:3]
+    ]
+    logits, features = discriminator(images, return_features=True)
+    loss = sum(image_logits.float().sum() for image_logits in logits) + sum(
+        depth.float().sum() for per_image in features for depth in per_image
+    )
+    grads_first = torch.autograd.grad(loss, images, retain_graph=True)
+    grads_second = torch.autograd.grad(loss, images)
+    for grad_first, grad_second in zip(grads_first, grads_second):
+        assert torch.equal(grad_first, grad_second)
+        assert grad_first.abs().sum() > 0
+
+
+def test_varlen_fp32_matches_dense() -> None:
+    from torchtitan.models.rae.discriminator.dinov3 import RAEFeatureDiscriminator
+
+    config = RAEFeatureDiscriminator.Config(
+        backbone_kind="hf",
+        hf_model_path=str(CHECKPOINT_DIR),
+    )
+    discriminator = RAEFeatureDiscriminator(config, device=torch.device("cuda")).cuda()
+    # fp32 does not auto-route to varlen; call the packed path explicitly.
+    assert not discriminator._varlen_supported()
+    images = _varlen_images()[:3]
+    (
+        patches_PK,
+        patch_dest_P,
+        prefix_rows_R,
+        cos_TD,
+        sin_TD,
+        cu_seqlens,
+        max_seqlen,
+        sizes,
+    ) = discriminator._pack_varlen(images)
+    with torch.no_grad():
+        packed_depths = discriminator.backbone.forward_varlen(
+            patches_PK,
+            patch_dest_P,
+            prefix_rows_R,
+            cos_TD,
+            sin_TD,
+            cu_seqlens,
+            max_seqlen,
+            key_depths=discriminator.key_depths,
+        )
+        dense = _dense_reference_features(discriminator, images)
+    offset = 0
+    for image_index, dense_depths in enumerate(dense):
+        size = sizes[image_index]
+        for depth, (packed_CL, dense_CL) in enumerate(zip(packed_depths, dense_depths)):
+            packed_image_CL = packed_CL[:, offset : offset + size]
+            diff = packed_image_CL.float() - dense_CL.float()
+            norm_rel = (diff.norm() / dense_CL.float().norm()).item()
+            print(
+                f"varlen fp32 image {image_index} depth {depth}: norm rel {norm_rel:.3e}"
+            )
+            assert norm_rel < 1e-4
+        offset += size

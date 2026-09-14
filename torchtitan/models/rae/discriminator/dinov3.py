@@ -40,6 +40,7 @@ from typing import cast, Literal, overload
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_varlen_func
 from safetensors.torch import load_file
 
 from .discriminator import FrozenImageFeatures
@@ -183,6 +184,57 @@ class DINOv3ViTAttention(nn.Module):
         out_BLC = out_BHLD.transpose(1, 2).reshape(batch_size, num_tokens, -1)
         return self.o_proj(out_BLC)
 
+    def forward_varlen(
+        self,
+        x_TC: torch.Tensor,
+        cos_T1D: torch.Tensor,
+        sin_T1D: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Block-diagonal attention over packed per-image documents.
+
+        ``cos_T1D``/``sin_T1D`` cover every packed token; prefix rows carry
+        cos=1/sin=0 so the cls/register tokens stay untouched, matching the
+        prefix skip in the dense ``forward``.
+        """
+        num_tokens = x_TC.shape[0]
+        q_TND = self.q_proj(x_TC).view(num_tokens, self.num_heads, self.head_dim)
+        k_TND = self.k_proj(x_TC).view(num_tokens, self.num_heads, self.head_dim)
+        v_TND = self.v_proj(x_TC).view(num_tokens, self.num_heads, self.head_dim)
+        q_TND = q_TND * cos_T1D + _rotate_half(q_TND) * sin_T1D
+        k_TND = k_TND * cos_T1D + _rotate_half(k_TND) * sin_T1D
+        if q_TND.dtype in (torch.float16, torch.bfloat16):
+            out_TND = flash_attn_varlen_func(
+                q_TND,
+                k_TND,
+                v_TND,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=self.scaling,
+                causal=False,
+            )
+        else:
+            # flash-attn only supports fp16/bf16; the fp32 path is eager-only
+            # (it syncs on cu_seqlens) and exists for high-precision parity
+            # checks against the dense sdpa implementation.
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            outputs = []
+            start = 0
+            for length in lengths:
+                q_1NTD = q_TND[start : start + length].transpose(0, 1).unsqueeze(0)
+                k_1NTD = k_TND[start : start + length].transpose(0, 1).unsqueeze(0)
+                v_1NTD = v_TND[start : start + length].transpose(0, 1).unsqueeze(0)
+                out_1NTD = F.scaled_dot_product_attention(
+                    q_1NTD, k_1NTD, v_1NTD, scale=self.scaling
+                )
+                outputs.append(out_1NTD.squeeze(0).transpose(0, 1))
+                start += length
+            out_TND = torch.cat(outputs, dim=0)
+        return self.o_proj(out_TND.reshape(num_tokens, -1))
+
 
 class DINOv3ViTLayerScale(nn.Module):
     def __init__(self, *, hidden_size: int) -> None:
@@ -239,6 +291,22 @@ class DINOv3ViTLayer(nn.Module):
         )
         x_BLC = x_BLC + self.layer_scale2(self.mlp(self.norm2(x_BLC)))
         return x_BLC
+
+    def forward_varlen(
+        self,
+        x_TC: torch.Tensor,
+        cos_T1D: torch.Tensor,
+        sin_T1D: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        x_TC = x_TC + self.layer_scale1(
+            self.attention.forward_varlen(
+                self.norm1(x_TC), cos_T1D, sin_T1D, cu_seqlens, max_seqlen
+            )
+        )
+        x_TC = x_TC + self.layer_scale2(self.mlp(self.norm2(x_TC)))
+        return x_TC
 
 
 class DINOv3ViTBackbone(nn.Module):
@@ -350,6 +418,62 @@ class DINOv3ViTBackbone(nn.Module):
         return [
             activation_BLC[:, self.num_prefix_tokens :].transpose(1, 2)
             for activation_BLC in normed_BLC
+        ]
+
+    def forward_varlen(
+        self,
+        patches_PK: torch.Tensor,
+        patch_dest_P: torch.Tensor,
+        prefix_rows_R: torch.Tensor,
+        cos_TD: torch.Tensor,
+        sin_TD: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        key_depths: tuple[int, ...] = (2, 5, 8, 11),
+    ) -> list[torch.Tensor]:
+        """One packed forward over many images with block-diagonal attention.
+
+        ``patches_PK`` holds every image's flattened, normalized patches
+        (row-major, (C, ph, pw) inner order, as the dense pixel unshuffle
+        produces). ``patch_dest_P`` maps each packed patch to its row in the
+        token sequence; ``prefix_rows_R`` lists the cls/register rows (each
+        document contributes ``num_prefix_tokens`` rows, and its RoPE table
+        rows are cos=1/sin=0 so the prefix stays untouched). Returns the same
+        probed depths as ``forward``, as packed (hidden_size, total_P) patch
+        activations; the caller splits per image with ``torch.split``.
+        """
+        if any(not 0 <= depth < len(self.layer) for depth in key_depths):
+            raise ValueError(
+                f"DINOv3 backbone key_depths must index blocks 0..{len(self.layer) - 1}, "
+                f"got {key_depths}"
+            )
+        compute_dtype = self.embeddings.patch_embeddings.weight.dtype
+        patches_PK = patches_PK.to(compute_dtype)
+        cos_TD = cos_TD.to(compute_dtype)
+        sin_TD = sin_TD.to(compute_dtype)
+        patch_tokens_PC = self.embeddings.patch_embeddings(patches_PK)
+        x_TC = patch_tokens_PC.new_zeros((cos_TD.shape[0], self.hidden_size))
+        x_TC[patch_dest_P] = patch_tokens_PC
+        prefix_TC = torch.cat(
+            (self.embeddings.cls_token[0], self.embeddings.register_tokens[0]),
+            dim=0,
+        )
+        x_TC[prefix_rows_R] = prefix_TC.repeat(
+            prefix_rows_R.shape[0] // self.num_prefix_tokens, 1
+        )
+        cos_T1D = cos_TD.unsqueeze(1)
+        sin_T1D = sin_TD.unsqueeze(1)
+        block_outputs_TC = []
+        for block in self.layer:
+            x_TC = block.forward_varlen(
+                x_TC, cos_T1D, sin_T1D, cu_seqlens, max_seqlen
+            )
+            block_outputs_TC.append(x_TC)
+        normed_TC = [self.norm(block_outputs_TC[-1])]
+        normed_TC += [self.norm(block_outputs_TC[depth]) for depth in key_depths]
+        return [
+            activation_TC[patch_dest_P].transpose(0, 1)
+            for activation_TC in normed_TC
         ]
 
 
@@ -553,6 +677,9 @@ class RAEFeatureDiscriminator(nn.Module):
             self._compiled_backbone: (
                 Callable[[torch.Tensor], list[torch.Tensor]] | None
             ) = None
+            self._compiled_backbone_varlen: (
+                Callable[..., list[torch.Tensor]] | None
+            ) = None
         else:
             raise ValueError(
                 f"Unsupported discriminator backbone: {config.backbone_kind}"
@@ -578,10 +705,131 @@ class RAEFeatureDiscriminator(nn.Module):
         self._compiled_backbone = torch.compile(
             self._backbone_features, backend=backend, dynamic=True
         )
+        self._compiled_backbone_varlen = torch.compile(
+            self.backbone.forward_varlen, backend=backend, dynamic=True
+        )
 
     def set_head_requires_grad(self, enabled: bool) -> None:
         self.backbone.requires_grad_(False)
         self.heads.requires_grad_(enabled)
+
+    def _varlen_supported(self) -> bool:
+        """Whether the packed varlen backbone path applies (flash-attn dtype)."""
+        if not self._is_hf_model:
+            return False
+        weight = self.backbone.embeddings.patch_embeddings.weight
+        return weight.device.type == "cuda" and weight.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        )
+
+    def _pack_varlen(
+        self, images: list[torch.Tensor]
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        list[int],
+    ]:
+        """Flatten variable-resolution [0, 1] images into one packed varlen call.
+
+        All indexing metadata derives from CPU-side shape knowledge, so
+        building the pack never synchronizes the GPU. Returns the packed
+        normalized patches, scatter indices, RoPE tables (identity on prefix
+        rows), cu_seqlens, max_seqlen, and per-image patch counts.
+        """
+        backbone = self.backbone
+        device = backbone.embeddings.patch_embeddings.weight.device
+        patch = self.patch_size
+        prefix = backbone.num_prefix_tokens
+        patches: list[torch.Tensor] = []
+        grids: list[tuple[int, int]] = []
+        compute_dtype = backbone.embeddings.patch_embeddings.weight.dtype
+        for image_CHW in images:
+            height, width = image_CHW.shape[-2:]
+            mean_311 = image_CHW.new_tensor(self.image_mean).view(3, 1, 1)
+            std_311 = image_CHW.new_tensor(self.image_std).view(3, 1, 1)
+            normalized_3HW = (image_CHW - mean_311) / std_311
+            patches.append(
+                normalized_3HW.view(3, height // patch, patch, width // patch, patch)
+                .permute(1, 3, 0, 2, 4)
+                .reshape(-1, 3 * patch * patch)
+                .to(compute_dtype)
+            )
+            grids.append((height // patch, width // patch))
+        sizes = [height * width for height, width in grids]
+        patch_dest: list[int] = []
+        prefix_rows: list[int] = []
+        cu_seqlens = [0]
+        max_seqlen = 0
+        offset = 0
+        for size in sizes:
+            doc_len = size + prefix
+            patch_dest.extend(range(offset + prefix, offset + doc_len))
+            prefix_rows.extend(range(offset, offset + prefix))
+            offset += doc_len
+            cu_seqlens.append(offset)
+            max_seqlen = max(max_seqlen, doc_len)
+        patch_dest_P = torch.tensor(patch_dest, dtype=torch.long, device=device)
+        head_dim = backbone.head_dim
+        cos_TD = torch.ones(offset, head_dim, dtype=torch.float32, device=device)
+        sin_TD = torch.zeros(offset, head_dim, dtype=torch.float32, device=device)
+        cos_tables, sin_tables = [], []
+        for grid_h, grid_w in grids:
+            cos_PD, sin_PD = backbone._rope_cos_sin(grid_h, grid_w, device)
+            cos_tables.append(cos_PD)
+            sin_tables.append(sin_PD)
+        cos_TD[patch_dest_P] = torch.cat(cos_tables, dim=0)
+        sin_TD[patch_dest_P] = torch.cat(sin_tables, dim=0)
+        return (
+            torch.cat(patches, dim=0),
+            patch_dest_P,
+            torch.tensor(prefix_rows, dtype=torch.long, device=device),
+            cos_TD,
+            sin_TD,
+            torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
+            max_seqlen,
+            sizes,
+        )
+
+    def _packed_features(
+        self, images: list[torch.Tensor], *, use_compiled: bool
+    ) -> list[list[torch.Tensor]]:
+        """Per-image per-depth (C, L_i) activations from one packed forward."""
+        (
+            patches_PK,
+            patch_dest_P,
+            prefix_rows_R,
+            cos_TD,
+            sin_TD,
+            cu_seqlens,
+            max_seqlen,
+            sizes,
+        ) = self._pack_varlen(images)
+        backbone_varlen = (
+            self._compiled_backbone_varlen
+            if use_compiled and self._compiled_backbone_varlen is not None
+            else self.backbone.forward_varlen
+        )
+        activations_CL = backbone_varlen(
+            patches_PK,
+            patch_dest_P,
+            prefix_rows_R,
+            cos_TD,
+            sin_TD,
+            cu_seqlens,
+            max_seqlen,
+            key_depths=self.key_depths,
+        )
+        per_depth = [torch.split(activation_CL, sizes, dim=-1) for activation_CL in activations_CL]
+        return [
+            [per_depth[depth][index] for depth in range(len(per_depth))]
+            for index in range(len(images))
+        ]
 
     def _backbone_features(self, images_BCHW: torch.Tensor) -> list[torch.Tensor]:
         """Frozen-backbone activations (B, C, L) at the probed depths."""
@@ -675,6 +923,18 @@ class RAEFeatureDiscriminator(nn.Module):
         | tuple[torch.Tensor | list[torch.Tensor], list[list[torch.Tensor]]]
     ):
         images, groups, return_stacked = self._group_by_shape(images_BCHW)
+        if self._varlen_supported():
+            # One packed varlen backbone forward for the whole call instead of
+            # per-shape-group stacked batches; the eager heads re-group the
+            # per-image activations by token count.
+            activations = self._packed_features(
+                images, use_compiled=self._compiled_backbone_varlen is not None
+            )
+            logits_items = self._logits_from_features(activations)
+            logits = torch.stack(logits_items) if return_stacked else logits_items
+            if return_features:
+                return logits, activations
+            return logits
         outputs: list[torch.Tensor | None] = [None] * len(images)
         feature_outputs: list[list[torch.Tensor] | None] | None = (
             [None] * len(images) if return_features else None
@@ -739,6 +999,8 @@ class RAEFeatureDiscriminator(nn.Module):
                 raise RuntimeError("RAE discriminator did not produce every output")
             return outputs  # type: ignore[return-value]
         images, groups, _ = self._group_by_shape(images_BCHW)
+        if self._varlen_supported():
+            return self._packed_features(images, use_compiled=use_compiled)
         backbone = (
             self._compiled_backbone
             if use_compiled and self._compiled_backbone is not None
