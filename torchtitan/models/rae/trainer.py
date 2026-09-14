@@ -426,7 +426,7 @@ class RAEGANConfig:
             raise ValueError(
                 f"Unsupported discriminator GAN loss: {self.discriminator_loss}"
             )
-        if self.perceptual_kind not in {"fixed", "lpips"}:
+        if self.perceptual_kind not in {"fixed", "lpips", "dinov3"}:
             raise ValueError(
                 f"Unsupported perceptual loss kind: {self.perceptual_kind}"
             )
@@ -609,13 +609,21 @@ class RAEStage1Trainer(Trainer):
         else:
             self.discriminator_train = self.discriminator
 
-        self.perceptual_loss = RAEPerceptualLoss(
-            kind=config.gan.perceptual_kind,
-            channels=config.discriminator.feature_channels,
-            calibration_checkpoint_path=config.gan.lpips_calibration_checkpoint_path,
-            vgg_checkpoint_path=config.gan.lpips_vgg_checkpoint_path,
-            resize_long_side=config.gan.perceptual_resize_long_side,
-        ).to(self.device)
+        if config.gan.perceptual_kind == "dinov3":
+            if config.discriminator.backbone_kind != "hf":
+                raise ValueError(
+                    "gan.perceptual_kind='dinov3' requires "
+                    "discriminator.backbone_kind='hf'"
+                )
+            self.perceptual_loss = None
+        else:
+            self.perceptual_loss = RAEPerceptualLoss(
+                kind=config.gan.perceptual_kind,
+                channels=config.discriminator.feature_channels,
+                calibration_checkpoint_path=config.gan.lpips_calibration_checkpoint_path,
+                vgg_checkpoint_path=config.gan.lpips_vgg_checkpoint_path,
+                resize_long_side=config.gan.perceptual_resize_long_side,
+            ).to(self.device)
         self.discriminator_augmentation = DiscriminatorAugmentation(
             probability=config.gan.augment.probability,
             cutout=config.gan.augment.cutout,
@@ -1017,7 +1025,12 @@ class RAEStage1Trainer(Trainer):
         images: ImageBatch,
         encoder_input: Mapping[str, Any] | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | float]:
-        """Run the frozen encoder once and return clean latents with metadata."""
+        """Run the frozen encoder once and return clean latents with metadata.
+
+        ``grid_thw`` is the encoder's CPU-side copy: token counts and
+        supervision sizes derive from it without synchronizing the GPU, and
+        the decoder moves it on-device itself where needed.
+        """
         encoder_source = encoder_input if encoder_input is not None else images
         encoded = self.encoder(
             encoder_source,
@@ -1025,7 +1038,10 @@ class RAEStage1Trainer(Trainer):
         )
         if not isinstance(encoded, tuple):
             raise RuntimeError("RAE encoder must return grid metadata for Stage 1")
-        latents, grid_thw = encoded
+        latents, _ = encoded
+        grid_thw = self.encoder.last_grid_thw
+        if grid_thw is None:
+            raise RuntimeError("RAE encoder did not expose grid metadata")
         temporal_start = (
             self.encoder.last_temporal_start
             if self.encoder.last_temporal_start is not None
@@ -1120,6 +1136,22 @@ class RAEStage1Trainer(Trainer):
         real_items: list[torch.Tensor],
         fake_items: list[torch.Tensor],
     ) -> torch.Tensor:
+        if self.config.gan.perceptual_kind == "dinov3":
+            # DINOv3 feature-space perceptual term on clean (un-augmented)
+            # pairs at native resolution: the real branch runs no-grad, the
+            # fake branch carries gradients to the decoder through the frozen
+            # backbone. Same per-patch reduction as feature matching, but it
+            # enters from step 0 under the fixed perceptual weight.
+            with torch.no_grad():
+                real_features = self.discriminator.features(
+                    [(image + 1.0) * 0.5 for image in real_items],
+                    use_compiled=True,
+                )
+            fake_features = self.discriminator.features(
+                [(image + 1.0) * 0.5 for image in fake_items],
+                use_compiled=True,
+            )
+            return self.discriminator.feature_matching(real_features, fake_features)
         # One grouped call per microbatch: equal-shape images share backbone
         # forwards, and the real branch runs under no_grad.
         return self.perceptual_loss.forward_per_sample_list(
