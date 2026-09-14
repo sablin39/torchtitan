@@ -701,13 +701,18 @@ class RAEFeatureDiscriminator(nn.Module):
         # (and recompiling) on every new image shape. Buffer donation is
         # disabled globally: an AOT backward compiled with donated buffers
         # rejects the trainer's retain_graph=True adaptive-weight probes.
+        # Only one variant is compiled: the packed varlen forward serves
+        # every runtime call when the dtype/device support flash attention;
+        # otherwise the dense grouped forward is the runtime path.
         torch._functorch.config.donated_buffer = False
-        self._compiled_backbone = torch.compile(
-            self._backbone_features, backend=backend, dynamic=True
-        )
-        self._compiled_backbone_varlen = torch.compile(
-            self.backbone.forward_varlen, backend=backend, dynamic=True
-        )
+        if self._varlen_supported():
+            self._compiled_backbone_varlen = torch.compile(
+                self.backbone.forward_varlen, backend=backend, dynamic=True
+            )
+        else:
+            self._compiled_backbone = torch.compile(
+                self._backbone_features, backend=backend, dynamic=True
+            )
 
     def set_head_requires_grad(self, enabled: bool) -> None:
         self.backbone.requires_grad_(False)

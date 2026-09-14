@@ -628,21 +628,12 @@ class RAEStage1Trainer(Trainer):
             probability=config.gan.augment.probability,
             cutout=config.gan.augment.cutout,
         )
-        if (
+        warmup_discriminator = (
             config.compile.enable
             and "discriminator" in config.compile.components
-            and config.gan.discriminator_weight > 0
             and config.discriminator.backbone_kind == "hf"
-        ):
-            # Warm both autograd variants of the compiled discriminator during
-            # initialization (covered by the init timeout): the first GAN step
-            # would otherwise compile mid-run, and slow per-rank compilation
-            # can stall the DP collectives. The warmups must replicate the
-            # runtime guards (frozen vs trainable heads, bf16 autocast,
-            # grad-enabled generator-side inputs, CHW list input) or dynamo
-            # compiles separate variants and the warmup is wasted. The forward
-            # is compiled with dynamic shapes, so one warmup per variant
-            # covers the native resolutions seen at runtime.
+        )
+        if warmup_discriminator:
             autocast_bf16 = (
                 self.device.type == "cuda" and config.training.dtype == "bfloat16"
             )
@@ -656,6 +647,16 @@ class RAEStage1Trainer(Trainer):
                 )
                 for _ in range(config.discriminator.backbone_batch_size)
             ]
+        if warmup_discriminator and config.gan.discriminator_weight > 0:
+            # Warm both autograd variants of the compiled discriminator during
+            # initialization (covered by the init timeout): the first GAN step
+            # would otherwise compile mid-run, and slow per-rank compilation
+            # can stall the DP collectives. The warmups must replicate the
+            # runtime guards (frozen vs trainable heads, bf16 autocast,
+            # grad-enabled generator-side inputs, CHW list input) or dynamo
+            # compiles separate variants and the warmup is wasted. The forward
+            # is compiled with dynamic shapes, so one warmup per variant
+            # covers the native resolutions seen at runtime.
             # Generator-side variant: frozen heads, grad-enabled inputs,
             # forward+backward (the backward compiles the backbone's gradient
             # graph, which the first GAN step would otherwise build mid-run).
@@ -688,6 +689,28 @@ class RAEStage1Trainer(Trainer):
                 # feature-matching step does not compile mid-run.
                 with torch.no_grad():
                     self.discriminator.cache_real_features(dummy_items)
+            self.discriminator.eval()
+            self.discriminator.set_head_requires_grad(False)
+        if warmup_discriminator and config.gan.perceptual_kind == "dinov3":
+            # The DINOv3 perceptual term runs from step 0 through its own
+            # features-only autograd variants (no-grad reals, grad-carrying
+            # fakes, backward through the feature-matching reduction); warm
+            # them here or the first perceptual step compiles mid-run.
+            self.discriminator.eval()
+            self.discriminator.set_head_requires_grad(False)
+            perceptual_dummies = [
+                item.detach().clone().requires_grad_(True) for item in dummy_items
+            ]
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.bfloat16,
+                enabled=autocast_bf16,
+            ):
+                warmup_perceptual = self._perceptual_loss(
+                    dummy_items, perceptual_dummies
+                )
+            warmup_perceptual.backward()
+            self.discriminator.zero_grad(set_to_none=True)
             self.discriminator.eval()
             self.discriminator.set_head_requires_grad(False)
 
