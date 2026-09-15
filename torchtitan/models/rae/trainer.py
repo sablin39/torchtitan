@@ -1299,8 +1299,10 @@ class RAEStage1Trainer(Trainer):
             raise ValueError(
                 "RAE static decode expects packed or batched token latents"
             )
-        grid = grid_thw.reshape(-1, 3).to(device=latents.device, dtype=torch.long)
-        sequence_lengths = grid.prod(dim=-1)
+        # grid_thw is the encoder's CPU copy; token counts and RoPE
+        # coordinates derive from it on the host, so decode setup never
+        # stalls the CPU on a deep GPU queue.
+        sequence_lengths = grid_thw.reshape(-1, 3).to(dtype=torch.long).prod(dim=-1)
         valid_length = int(sequence_lengths.sum().item())
         static_length = self._static_sequence_length
         if static_length < valid_length:
@@ -1311,10 +1313,10 @@ class RAEStage1Trainer(Trainer):
         latents_static = F.pad(latents_TD, (0, 0, 0, static_length - valid_length))
         rope = decoder.layers[0].attention.rope
         positions = rope.build_packed_positions(
-            grid,
+            grid_thw.reshape(-1, 3),
             fps=fps,
             temporal_start=temporal_start,
-        )
+        ).to(latents.device, non_blocking=True)
         positions = F.pad(positions, (0, 0, 0, static_length - valid_length))
         metadata = create_rae_static_varlen_metadata(
             sequence_lengths,
@@ -1368,13 +1370,18 @@ class RAEStage1Trainer(Trainer):
         if noise_tau <= 0:
             return latents
         if latents.ndim == 2:
-            tokens_per_item = (
-                grid_thw.reshape(-1, 3).prod(dim=-1).to(device=latents.device)
-            )
+            # Compute the per-item token counts on the incoming grid (CPU in
+            # the hot path) so neither the validation nor the repeat blocks
+            # on the GPU stream; output_size keeps repeat_interleave from
+            # reading the device-side repeats back to size its output.
+            tokens_per_item = grid_thw.reshape(-1, 3).prod(dim=-1)
             if int(tokens_per_item.sum().item()) != latents.shape[0]:
                 raise ValueError(
                     "RAE grid metadata does not match the packed latent count"
                 )
+            tokens_per_item = tokens_per_item.to(
+                device=latents.device, non_blocking=True
+            )
             noise_scale = torch.repeat_interleave(
                 noise_tau
                 * torch.rand(
@@ -1383,6 +1390,7 @@ class RAEStage1Trainer(Trainer):
                     dtype=latents.dtype,
                 ),
                 tokens_per_item,
+                output_size=latents.shape[0],
             ).unsqueeze(-1)
         elif latents.ndim == 3:
             noise_scale = noise_tau * torch.rand(

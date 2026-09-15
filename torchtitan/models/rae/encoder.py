@@ -1005,11 +1005,11 @@ class FrozenRAEEncoder(nn.Module):
                 tokens_BLC = merged_hidden_states
             fps_source = processor_output.get("fps") if fps is None else fps
             fps_values = scalar_values(fps_source, batch_size, 0.0)
-            self.last_fps = torch.tensor(fps_values, device=merged_hidden_states.device)
+            # Keep the metadata CPU-side like last_grid_thw: consumers read it
+            # on the host, so a GPU copy would force a D2H sync per microbatch.
+            self.last_fps = torch.tensor(fps_values)
             start_values = scalar_values(temporal_start, batch_size, 0.0)
-            self.last_temporal_start = torch.tensor(
-                start_values, device=merged_hidden_states.device
-            )
+            self.last_temporal_start = torch.tensor(start_values)
         elif self.kind == "fixed":
             assert images_BCHW is not None
             latent_side = self.image_size // 16

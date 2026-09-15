@@ -332,14 +332,16 @@ def _lengths_tensor(
     device: torch.device | None,
 ) -> torch.Tensor:
     if isinstance(sequence_lengths, torch.Tensor):
-        lengths = sequence_lengths.to(device=device, dtype=torch.long)
-        if lengths.ndim != 1:
+        if sequence_lengths.ndim != 1:
             raise ValueError("RAE sequence_lengths must be one-dimensional")
+        lengths = sequence_lengths.to(dtype=torch.long)
     else:
-        lengths = torch.tensor(sequence_lengths, dtype=torch.long, device=device)
+        lengths = torch.tensor(sequence_lengths, dtype=torch.long)
+    # Validate on the input's own device: free for CPU inputs, so the
+    # trainer's deep GPU queue is never stalled by a D2H readback here.
     if lengths.numel() == 0 or torch.any(lengths <= 0):
         raise ValueError("RAE sequence_lengths must contain positive values")
-    return lengths
+    return lengths.to(device=device)
 
 
 def create_rae_varlen_metadata(
@@ -349,7 +351,12 @@ def create_rae_varlen_metadata(
     include_host_offsets: bool = True,
 ) -> VarlenMetadata:
     """Build FA2 cumulative offsets for packed RAE latent sequences."""
-    lengths = _lengths_tensor(sequence_lengths, device=device).to(dtype=torch.int32)
+    # CPU inputs keep all integer math on the host and pay a single H2D copy
+    # for the offsets, so a deep GPU queue cannot stall the caller.
+    lengths = _lengths_tensor(sequence_lengths, device=None)
+    if lengths.device.type != "cpu":
+        lengths = lengths.to(device=device)
+    lengths = lengths.to(dtype=torch.int32)
     offsets = torch.cat(
         [
             torch.zeros(1, dtype=torch.int32, device=lengths.device),
@@ -362,6 +369,7 @@ def create_rae_varlen_metadata(
         else None
     )
     max_length = int(lengths.max().item())
+    offsets = offsets.to(device=device, non_blocking=True)
     return VarlenMetadata(
         cu_seq_q=offsets,
         cu_seq_k=offsets,
@@ -384,7 +392,12 @@ def create_rae_static_varlen_metadata(
     queries and the cumulative-offset tensor keeps a stable shape for
     compilation and CUDA graph replay.
     """
-    lengths = _lengths_tensor(sequence_lengths, device=device).to(dtype=torch.int32)
+    # CPU inputs keep all integer math on the host and pay a single H2D copy
+    # for the offsets, so a deep GPU queue cannot stall the caller.
+    lengths = _lengths_tensor(sequence_lengths, device=None)
+    if lengths.device.type != "cpu":
+        lengths = lengths.to(device=device)
+    lengths = lengths.to(dtype=torch.int32)
     valid_length = int(lengths.sum().item())
     if static_sequence_length < valid_length:
         raise ValueError(
@@ -406,6 +419,7 @@ def create_rae_static_varlen_metadata(
             torch.cumsum(lengths, dim=0).to(dtype=torch.int32),
         ]
     )
+    offsets = offsets.to(device=device, non_blocking=True)
     return VarlenMetadata(
         cu_seq_q=offsets,
         cu_seq_k=offsets,
@@ -500,8 +514,14 @@ def flatten_latents(
         if grid_thw.ndim not in (1, 2) or grid_thw.shape[-1] != 3:
             raise ValueError("RAE grid_thw must have shape (3,) or (B, 3)")
         if packed:
-            grid = grid_thw.to(device=tokens.device, dtype=torch.long)
-            expected_tokens = int(grid.prod(dim=-1).sum().item())
+            # Token counts come from the incoming grid, so CPU grids validate
+            # on the host without a GPU-stream sync.
+            expected_tokens = int(
+                grid_thw.to(dtype=torch.long).prod(dim=-1).sum().item()
+            )
+            grid = grid_thw.to(
+                device=tokens.device, dtype=torch.long, non_blocking=True
+            )
             if expected_tokens != tokens.shape[0]:
                 raise ValueError(
                     "Packed RAE latent count does not match grid_thw: "
@@ -509,7 +529,14 @@ def flatten_latents(
                 )
         else:
             batch_size = tokens.shape[0]
-            grid_thw = grid_thw.to(device=tokens.device, dtype=torch.long)
+            host_counts = (
+                grid_thw.to(dtype=torch.long).view(-1, 3).prod(dim=-1)
+                if grid_thw.device.type == "cpu"
+                else None
+            )
+            grid_thw = grid_thw.to(
+                device=tokens.device, dtype=torch.long, non_blocking=True
+            )
             grid = (
                 grid_thw.view(1, 3).expand(batch_size, -1)
                 if grid_thw.ndim == 1
@@ -517,7 +544,9 @@ def flatten_latents(
             )
             if grid.shape[0] != batch_size:
                 raise ValueError("RAE grid_thw batch does not match latents")
-            token_counts = grid.prod(dim=-1)
+            token_counts = (
+                host_counts if host_counts is not None else grid.prod(dim=-1)
+            )
             if torch.any(token_counts != tokens.shape[1]):
                 raise ValueError(
                     "Every batched RAE grid_thw entry must match the latent token count"
@@ -1129,6 +1158,11 @@ class RAEDecoder(BaseModel):
                 padded_positions_T3,
                 attention_masks,
             )
+        host_grid = (
+            grid_thw.to(dtype=torch.long)
+            if grid_thw is not None and grid_thw.device.type == "cpu"
+            else None
+        )
         tokens, grid, packed = flatten_latents(
             latents,
             grid_thw,
@@ -1137,11 +1171,21 @@ class RAEDecoder(BaseModel):
         )
         packed_attention = packed or self.config.attention_backend == "varlen"
         if packed_attention:
+            batch_size = tokens.shape[0]
             if not packed:
                 tokens = tokens.reshape(-1, tokens.shape[-1])
             sequence_lengths = grid.prod(dim=-1)
             static_length = self.static_sequence_length
-            valid_length = int(sequence_lengths.sum().item())
+            if host_grid is not None:
+                # Host grids give token counts and RoPE coordinates without
+                # stalling the CPU on a deep GPU queue.
+                host_lengths = host_grid.reshape(-1, 3).prod(dim=-1).tolist()
+                if host_grid.ndim == 1 and not packed:
+                    host_lengths = host_lengths * batch_size
+                valid_length = sum(host_lengths)
+            else:
+                host_lengths = None
+                valid_length = int(sequence_lengths.sum().item())
             if static_length:
                 if self.config.attention_backend != "varlen":
                     raise ValueError(
@@ -1155,7 +1199,7 @@ class RAEDecoder(BaseModel):
             if attention_masks is None:
                 if static_length:
                     attention_masks = create_rae_static_varlen_metadata(
-                        sequence_lengths,
+                        host_lengths if host_lengths is not None else sequence_lengths,
                         static_length,
                         device=tokens.device,
                     )
@@ -1165,7 +1209,8 @@ class RAEDecoder(BaseModel):
                     )
                 else:
                     attention_masks = create_rae_varlen_metadata(
-                        sequence_lengths, device=tokens.device
+                        host_lengths if host_lengths is not None else sequence_lengths,
+                        device=tokens.device,
                     )
             elif static_length and (
                 not isinstance(attention_masks, VarlenMetadata)
@@ -1176,11 +1221,23 @@ class RAEDecoder(BaseModel):
                     "RAE static_sequence_length requires matching fixed varlen metadata"
                 )
             first_layer = cast(RAEBlock, self.layers[0])
-            positions = first_layer.attention.rope.build_packed_positions(
-                grid,
-                fps=fps,
-                temporal_start=temporal_start,
-            )
+            if host_grid is not None:
+                positions_grid = (
+                    host_grid.view(1, 3).expand(batch_size, -1)
+                    if host_grid.ndim == 1 and not packed
+                    else host_grid
+                )
+                positions = first_layer.attention.rope.build_packed_positions(
+                    positions_grid,
+                    fps=fps,
+                    temporal_start=temporal_start,
+                ).to(tokens.device, non_blocking=True)
+            else:
+                positions = first_layer.attention.rope.build_packed_positions(
+                    grid,
+                    fps=fps,
+                    temporal_start=temporal_start,
+                )
             if static_length:
                 positions = F.pad(
                     positions,
