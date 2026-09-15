@@ -46,7 +46,6 @@ from torchtitan.models.rae.trainer import (
     ema_decay_at_step,
     gradient_difference_loss,
     log_stage1_metrics,
-    pixel_reconstruction_loss,
     pixel_reconstruction_losses,
     RAEGANConfig,
     RAEStage1Trainer,
@@ -956,20 +955,21 @@ def test_pixel_reconstruction_loss_kinds() -> None:
     target = torch.rand(3, 32, 32)
     # Charbonnier bottoms out at eps for identical images with zero gradient
     # there (smooth L1), while l1 is exactly zero with a constant-step subgradient.
-    identical = pixel_reconstruction_loss(target, target, "charbonnier")
+    identical = pixel_reconstruction_losses([target], [target], "charbonnier")[0]
     assert identical.item() == pytest.approx(1e-3, abs=1e-7)
     reconstruction = target.clone().requires_grad_(True)
-    pixel_reconstruction_loss(reconstruction, target, "charbonnier").backward()
+    loss = pixel_reconstruction_losses([reconstruction], [target], "charbonnier")
+    loss[0].backward()
     assert reconstruction.grad.abs().max().item() < 1e-4
     different = torch.rand(3, 32, 32)
-    charbonnier = pixel_reconstruction_loss(different, target, "charbonnier")
-    l1 = pixel_reconstruction_loss(different, target, "l1")
+    charbonnier = pixel_reconstruction_losses([different], [target], "charbonnier")[0]
+    l1 = pixel_reconstruction_losses([different], [target], "l1")[0]
     assert l1.item() == pytest.approx(
         torch.nn.functional.l1_loss(different, target).item(), abs=1e-7
     )
     assert charbonnier.item() > l1.item()
     with pytest.raises(ValueError, match="pixel loss"):
-        pixel_reconstruction_loss(different, target, "l2")
+        pixel_reconstruction_losses([different], [target], "l2")
 
 
 def test_gradient_difference_loss_charbonnier_kind() -> None:
@@ -994,7 +994,7 @@ def test_pixel_reconstruction_losses_grouped_matches_per_image() -> None:
         grouped = pixel_reconstruction_losses(reconstructions, targets, kind)
         per_image = torch.stack(
             [
-                pixel_reconstruction_loss(reconstruction, target, kind)
+                pixel_reconstruction_losses([reconstruction], [target], kind)[0]
                 for reconstruction, target in zip(reconstructions, targets, strict=True)
             ]
         )

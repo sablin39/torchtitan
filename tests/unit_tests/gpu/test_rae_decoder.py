@@ -40,7 +40,7 @@ def _cuda_varlen_decoder() -> RAEDecoder:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_rae_varlen_gqa_cuda_forward_backward() -> None:
     model = _cuda_varlen_decoder().train()
-    grid_thw = torch.tensor([[1, 4, 4], [2, 2, 3]], device="cuda")
+    grid_thw = torch.tensor([[1, 4, 4], [2, 2, 3]])
     sequence_lengths = grid_thw.prod(dim=-1)
     metadata = create_rae_varlen_metadata(
         sequence_lengths,
@@ -71,7 +71,7 @@ def test_rae_varlen_gqa_cuda_forward_backward() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_rae_varlen_gqa_cuda_block_fullgraph_compile() -> None:
     model = _cuda_varlen_decoder().eval()
-    grid_thw = torch.tensor([[1, 4, 4], [2, 2, 3]], device="cuda")
+    grid_thw = torch.tensor([[1, 4, 4], [2, 2, 3]])
     sequence_lengths = grid_thw.prod(dim=-1)
     metadata = create_rae_varlen_metadata(
         sequence_lengths,
@@ -87,7 +87,7 @@ def test_rae_varlen_gqa_cuda_block_fullgraph_compile() -> None:
     positions_T3 = model.layers[0].attention.rope.build_packed_positions(
         grid_thw,
         fps=torch.tensor([0.0, 24.0], device="cuda"),
-    )
+    ).to("cuda", non_blocking=True)
 
     compiled_block = torch.compile(model.layers[0], fullgraph=True, dynamic=False)
     output_TD = compiled_block(

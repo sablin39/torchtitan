@@ -334,11 +334,14 @@ def _lengths_tensor(
     if isinstance(sequence_lengths, torch.Tensor):
         if sequence_lengths.ndim != 1:
             raise ValueError("RAE sequence_lengths must be one-dimensional")
+        if sequence_lengths.device.type != "cpu":
+            raise ValueError(
+                "RAE sequence_lengths must be host metadata on the CPU; a "
+                "device tensor would stall the training loop on a D2H readback"
+            )
         lengths = sequence_lengths.to(dtype=torch.long)
     else:
         lengths = torch.tensor(sequence_lengths, dtype=torch.long)
-    # Validate on the input's own device: free for CPU inputs, so the
-    # trainer's deep GPU queue is never stalled by a D2H readback here.
     if lengths.numel() == 0 or torch.any(lengths <= 0):
         raise ValueError("RAE sequence_lengths must contain positive values")
     return lengths.to(device=device)
@@ -351,12 +354,9 @@ def create_rae_varlen_metadata(
     include_host_offsets: bool = True,
 ) -> VarlenMetadata:
     """Build FA2 cumulative offsets for packed RAE latent sequences."""
-    # CPU inputs keep all integer math on the host and pay a single H2D copy
-    # for the offsets, so a deep GPU queue cannot stall the caller.
-    lengths = _lengths_tensor(sequence_lengths, device=None)
-    if lengths.device.type != "cpu":
-        lengths = lengths.to(device=device)
-    lengths = lengths.to(dtype=torch.int32)
+    # All integer math stays on the host; the offsets pay a single H2D copy,
+    # so a deep GPU queue cannot stall the caller.
+    lengths = _lengths_tensor(sequence_lengths, device=None).to(dtype=torch.int32)
     offsets = torch.cat(
         [
             torch.zeros(1, dtype=torch.int32, device=lengths.device),
@@ -392,12 +392,9 @@ def create_rae_static_varlen_metadata(
     queries and the cumulative-offset tensor keeps a stable shape for
     compilation and CUDA graph replay.
     """
-    # CPU inputs keep all integer math on the host and pay a single H2D copy
-    # for the offsets, so a deep GPU queue cannot stall the caller.
-    lengths = _lengths_tensor(sequence_lengths, device=None)
-    if lengths.device.type != "cpu":
-        lengths = lengths.to(device=device)
-    lengths = lengths.to(dtype=torch.int32)
+    # All integer math stays on the host; the offsets pay a single H2D copy,
+    # so a deep GPU queue cannot stall the caller.
+    lengths = _lengths_tensor(sequence_lengths, device=None).to(dtype=torch.int32)
     valid_length = int(lengths.sum().item())
     if static_sequence_length < valid_length:
         raise ValueError(
@@ -513,9 +510,12 @@ def flatten_latents(
     else:
         if grid_thw.ndim not in (1, 2) or grid_thw.shape[-1] != 3:
             raise ValueError("RAE grid_thw must have shape (3,) or (B, 3)")
+        if grid_thw.device.type != "cpu":
+            raise ValueError(
+                "RAE grid_thw must be host metadata on the CPU; a device "
+                "tensor would stall the training loop on a D2H readback"
+            )
         if packed:
-            # Token counts come from the incoming grid, so CPU grids validate
-            # on the host without a GPU-stream sync.
             expected_tokens = int(
                 grid_thw.to(dtype=torch.long).prod(dim=-1).sum().item()
             )
@@ -529,11 +529,7 @@ def flatten_latents(
                 )
         else:
             batch_size = tokens.shape[0]
-            host_counts = (
-                grid_thw.to(dtype=torch.long).view(-1, 3).prod(dim=-1)
-                if grid_thw.device.type == "cpu"
-                else None
-            )
+            token_counts = grid_thw.to(dtype=torch.long).view(-1, 3).prod(dim=-1)
             grid_thw = grid_thw.to(
                 device=tokens.device, dtype=torch.long, non_blocking=True
             )
@@ -544,9 +540,6 @@ def flatten_latents(
             )
             if grid.shape[0] != batch_size:
                 raise ValueError("RAE grid_thw batch does not match latents")
-            token_counts = (
-                host_counts if host_counts is not None else grid.prod(dim=-1)
-            )
             if torch.any(token_counts != tokens.shape[1]):
                 raise ValueError(
                     "Every batched RAE grid_thw entry must match the latent token count"
@@ -1078,15 +1071,6 @@ class RAEDecoder(BaseModel):
             patch_size=patch_size,
         )
 
-    def forward_padded(
-        self,
-        latents_TD: torch.Tensor,
-        positions_T3: torch.Tensor,
-        attention_masks: torch.Tensor | VarlenMetadata,
-    ) -> torch.Tensor:
-        """Run the fixed-shape packed decoder used by CUDA graph capture."""
-        return self._forward_padded_impl(latents_TD, positions_T3, attention_masks)
-
     def _apply_blocks(
         self,
         hidden: torch.Tensor,
@@ -1158,11 +1142,7 @@ class RAEDecoder(BaseModel):
                 padded_positions_T3,
                 attention_masks,
             )
-        host_grid = (
-            grid_thw.to(dtype=torch.long)
-            if grid_thw is not None and grid_thw.device.type == "cpu"
-            else None
-        )
+        host_grid = grid_thw.to(dtype=torch.long) if grid_thw is not None else None
         tokens, grid, packed = flatten_latents(
             latents,
             grid_thw,
@@ -1205,7 +1185,8 @@ class RAEDecoder(BaseModel):
                     )
                 elif self.config.attention_backend == "sdpa":
                     attention_masks = create_rae_packed_attention_mask(
-                        sequence_lengths, device=tokens.device
+                        host_lengths if host_lengths is not None else sequence_lengths,
+                        device=tokens.device,
                     )
                 else:
                     attention_masks = create_rae_varlen_metadata(

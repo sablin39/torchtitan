@@ -336,15 +336,6 @@ def pixel_reconstruction_losses(
     return torch.cat(per_image)
 
 
-def pixel_reconstruction_loss(
-    reconstruction_CHW: torch.Tensor,
-    target_CHW: torch.Tensor,
-    kind: str,
-) -> torch.Tensor:
-    """Per-pixel reconstruction loss for one image pair."""
-    return pixel_reconstruction_losses([reconstruction_CHW], [target_CHW], kind)[0]
-
-
 @_precise_loss
 def ssim_loss(
     reconstructions: Sequence[torch.Tensor],
@@ -2459,7 +2450,6 @@ class RAEValidator(BaseValidator):
 __all__ = [
     "DiscriminatorAugmentation",
     "gradient_difference_loss",
-    "pixel_reconstruction_loss",
     "pixel_reconstruction_losses",
     "ssim_loss",
     "wavelet_structure_loss",
