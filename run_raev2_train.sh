@@ -44,4 +44,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
   --config "${RAE_CONFIG}" \
   --epochs "${N_EPOCHS}" \
   --training.steps "${TRAINING_STEPS}" \
-  --checkpoint.folder checkpoint/rae_openimages_v4
+  --checkpoint.folder checkpoint/rae_openimages_$(date +%Y%m%d-%H%M%S)
