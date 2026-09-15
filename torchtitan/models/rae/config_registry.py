@@ -297,7 +297,12 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
             max_pixels=_STATIC_QWEN_MAX_PIXELS,
             token_budget=token_budget,
             max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
-            num_prefetch_batches=4,
+            # One step consumes 8 microbatches per rank, so a 4-deep queue
+            # only covers half a step; 8 absorbs the multi-second read stalls
+            # measured on /mnt/sda1 (4 concurrent tar streams on one SATA
+            # disk: 96% util, r_await >100ms; step-time tail 24s -> 71s).
+            # Each queued batch is ~0.6-0.9 GiB of pinned memory per rank.
+            num_prefetch_batches=8,
             num_processor_workers=num_processor_workers,
             # /mnt/sda1 is a USB-attached NVMe: a single buffered stream tops
             # out far below the device's aggregate bandwidth (the kernel
