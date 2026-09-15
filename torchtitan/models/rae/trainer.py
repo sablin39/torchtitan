@@ -10,6 +10,7 @@ from __future__ import annotations
 
 # Tensor dimensions: B=batch, C=channel, H=height, W=width.
 
+import functools
 import gc
 import math
 import os
@@ -269,6 +270,24 @@ _CHARBONNIER_EPS = 1e-3
 """Charbonnier epsilon, matching the ViTok-v2 pixel-term formulation."""
 
 
+def _precise_loss(fn):
+    """Run a supervision loss outside the trainer's bf16 autocast region.
+
+    The supervision phase executes inside bf16 autocast, which downcasts the
+    fp32 statistics these losses build (their inputs are cast up inside) back
+    to bf16. Near 1.0 the bf16 quantum is 2^-7, so the SSIM term -- whose
+    useful signal starts below 0.01 -- was quantized to exactly 1.0 or
+    0.99219 in both the logs and the gradient.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with torch.autocast(device_type="cuda", enabled=False):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 def _pixel_penalty(difference: torch.Tensor, kind: str) -> torch.Tensor:
     """Elementwise pixel-loss penalty (input must already be fp32)."""
     if kind == "charbonnier":
@@ -278,6 +297,7 @@ def _pixel_penalty(difference: torch.Tensor, kind: str) -> torch.Tensor:
     raise ValueError(f"Unsupported pixel loss kind: {kind}")
 
 
+@_precise_loss
 def pixel_reconstruction_losses(
     reconstructions: Sequence[torch.Tensor],
     targets: Sequence[torch.Tensor],
@@ -318,6 +338,7 @@ def pixel_reconstruction_loss(
     return pixel_reconstruction_losses([reconstruction_CHW], [target_CHW], kind)[0]
 
 
+@_precise_loss
 def ssim_loss(
     reconstructions: Sequence[torch.Tensor],
     targets: Sequence[torch.Tensor],
@@ -396,6 +417,7 @@ def _swt_haar(values_BCHW: torch.Tensor) -> tuple[torch.Tensor, ...]:
     return bands.view(batch, channels, 4, *values_BCHW.shape[-2:]).unbind(dim=2)
 
 
+@_precise_loss
 def wavelet_structure_loss(
     reconstructions: Sequence[torch.Tensor],
     targets: Sequence[torch.Tensor],
@@ -439,6 +461,7 @@ def wavelet_structure_loss(
     return torch.cat(per_image).mean()
 
 
+@_precise_loss
 def gradient_difference_loss(
     reconstructions: Sequence[torch.Tensor],
     targets: Sequence[torch.Tensor],
