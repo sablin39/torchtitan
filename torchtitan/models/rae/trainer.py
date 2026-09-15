@@ -270,6 +270,13 @@ _CHARBONNIER_EPS = 1e-3
 """Charbonnier epsilon, matching the ViTok-v2 pixel-term formulation."""
 
 
+def ema_decay_at_step(ema_decay: float, warmup_steps: int, step: int) -> float:
+    """Effective EMA decay for one training step (ADM-style warmup)."""
+    if warmup_steps <= 0:
+        return ema_decay
+    return min(ema_decay, (1 + step) / (warmup_steps + step))
+
+
 def _precise_loss(fn):
     """Run a supervision loss outside the trainer's bf16 autocast region.
 
@@ -654,6 +661,12 @@ class RAEGANConfig:
     discriminator_loss: str = "hinge"
     max_adaptive_weight: float = 10000.0
     ema_decay: float = 0.9995
+    ema_warmup_steps: int = 10
+    """ADM-style EMA warmup horizon: the effective decay at step t is
+    min(ema_decay, (1 + t) / (ema_warmup_steps + t)), so the EMA tracks the
+    fast-moving early decoder instead of retaining random-init weight
+    (0.9978^1000 = 11% init contamination made early validation images
+    misleading). 0 disables the warmup."""
     discriminator_lr: float = 2e-4
     discriminator_betas: tuple[float, float] = (0.9, 0.95)
     discriminator_weight_decay: float = 0.0
@@ -698,6 +711,8 @@ class RAEGANConfig:
             raise ValueError("gan.dinov3_perceptual_depths must be non-negative")
         if not 0.0 <= self.ema_decay < 1.0:
             raise ValueError("gan.ema_decay must be in [0, 1)")
+        if self.ema_warmup_steps < 0:
+            raise ValueError("gan.ema_warmup_steps must be non-negative")
         for name in (
             "discriminator_start_step",
             "discriminator_update_start_step",
@@ -1086,7 +1101,11 @@ class RAEStage1Trainer(Trainer):
     @torch.no_grad()
     def _update_ema(self) -> None:
         decoder = self.model_parts[0]
-        decay = self.config.gan.ema_decay
+        decay = ema_decay_at_step(
+            self.config.gan.ema_decay,
+            self.config.gan.ema_warmup_steps,
+            self.step,
+        )
         if getattr(decoder, "_dmuon_enabled", False) and hasattr(
             decoder, "_dedicated_comm_ctx"
         ):

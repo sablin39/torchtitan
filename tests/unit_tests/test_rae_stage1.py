@@ -43,6 +43,7 @@ from torchtitan.models.rae.trainer import (
     _swt_haar,
     AugmentationParams,
     DiscriminatorAugmentation,
+    ema_decay_at_step,
     gradient_difference_loss,
     log_stage1_metrics,
     pixel_reconstruction_loss,
@@ -161,6 +162,23 @@ def test_rae_decoder_residual_dropout_is_configurable() -> None:
     with torch.device("meta"):
         model = config.build()
     assert model.layers[0].residual_dropout == 0.25
+
+
+def test_ema_decay_warmup_schedule() -> None:
+    # Warmup disabled: always the configured decay.
+    assert ema_decay_at_step(0.9978, 0, 1) == 0.9978
+    assert ema_decay_at_step(0.9978, 0, 10000) == 0.9978
+    # ADM warmup: tracks the raw model closely early on.
+    assert ema_decay_at_step(0.9978, 10, 1) == pytest.approx(2 / 11)
+    # Nearly no random-init weight remains by step 1000.
+    init_weight = 1.0
+    for step in range(1, 1001):
+        init_weight *= ema_decay_at_step(0.9978, 10, step)
+    assert init_weight < 1e-6
+    # The schedule never exceeds the configured decay and approaches it.
+    for step in (100, 1000, 4070):
+        assert ema_decay_at_step(0.9978, 10, step) <= 0.9978
+    assert ema_decay_at_step(0.9978, 10, 100000) == 0.9978
 
 
 def test_rae_ema_builds_unsharded_copy_from_decoder_state() -> None:
