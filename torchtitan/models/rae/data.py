@@ -41,6 +41,14 @@ class RAEQwenProcessor(SampleProcessor):
         """Host-side dtype for pixel_values and media. bf16 halves the host
         payload and device transfer; the frozen encoder consumes bf16 natively
         and supervision targets meet bf16 reconstructions."""
+        supervision_patch_size: int | None = None
+        """Decoder patch size. When set, media is downsized to the supervision
+        target resolution ((grid / merge) * this) in the worker, so the
+        per-image resizes stay off the trainer's critical path and the media
+        IPC payload shrinks to the resolution actually consumed. The resize
+        runs in fp32 (CPU antialiased bicubic has no bf16 kernel) and clamps
+        before the output cast, one bf16 rounding more precise than the
+        trainer's device-side bf16 resize."""
 
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
         del context
@@ -68,6 +76,12 @@ class RAEQwenProcessor(SampleProcessor):
         self.do_normalize = config.do_normalize
         self.min_pixels = config.min_pixels
         self.max_pixels = config.max_pixels
+        if (
+            config.supervision_patch_size is not None
+            and config.supervision_patch_size <= 0
+        ):
+            raise ValueError("RAE Qwen supervision_patch_size must be positive")
+        self.supervision_patch_size = config.supervision_patch_size
         if config.output_dtype not in {"bfloat16", "float32"}:
             raise ValueError(
                 f"Unsupported RAE Qwen output_dtype: {config.output_dtype}"
@@ -156,9 +170,34 @@ class RAEQwenProcessor(SampleProcessor):
                 align_corners=False,
                 antialias=True,
             )
+        merge_size = int(getattr(image_processor, "merge_size", 1))
+        if self.supervision_patch_size is not None:
+            # Supervision targets live at the decoder's output resolution:
+            # (grid // merge_size) * supervision_patch_size per side, the size
+            # the trainer's _resize_supervision_image would produce -- its
+            # per-image resize then early-returns. The resize runs in fp32
+            # here (CPU antialiased bicubic has no bf16 kernel) and clamps
+            # before the output cast, so targets are one bf16 rounding more
+            # precise than the trainer's device-side bf16 resize, while the
+            # per-image kernels leave the trainer's stream and the media
+            # payload shrinks to the resolution actually consumed.
+            grid_row = grid_thw.reshape(-1, 3)[0]
+            target_size = (
+                int(grid_row[1]) // merge_size * self.supervision_patch_size,
+                int(grid_row[2]) // merge_size * self.supervision_patch_size,
+            )
+            if tuple(media_btchw.shape[-2:]) != target_size:
+                media_btchw = F.interpolate(
+                    media_btchw,
+                    size=target_size,
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                ).clamp(0, 1)
+        media_out = media_btchw.to(self.output_dtype)
         return {
-            "media": media_btchw.to(self.output_dtype).unsqueeze(0),
-            "merge_size": int(getattr(image_processor, "merge_size", 1)),
+            "media": media_out.unsqueeze(0),
+            "merge_size": merge_size,
             "fps": torch.tensor(0.0, dtype=torch.float32),
             "temporal_start": torch.tensor(0.0, dtype=torch.float32),
             "pixel_values": pixel_values,

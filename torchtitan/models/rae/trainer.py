@@ -1334,10 +1334,7 @@ class RAEStage1Trainer(Trainer):
         the decoder moves it on-device itself where needed.
         """
         encoder_source = encoder_input if encoder_input is not None else images
-        encoded = self.encoder(
-            encoder_source,
-            return_grid_thw=True,
-        )
+        encoded = self.encoder(encoder_source, return_grid_thw=True)
         if not isinstance(encoded, tuple):
             raise RuntimeError("RAE encoder must return grid metadata for Stage 1")
         latents, _ = encoded

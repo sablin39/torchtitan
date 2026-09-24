@@ -646,7 +646,7 @@ class FrozenRAEEncoder(nn.Module):
             raise ValueError("Qwen encoder name is required")
         try:
             from safetensors import safe_open
-            from transformers import AutoConfig, AutoImageProcessor, AutoProcessor
+            from transformers import AutoConfig
         except ImportError as error:
             raise RuntimeError(
                 "encoder.kind='qwen' requires the transformers and safetensors "
@@ -715,14 +715,6 @@ class FrozenRAEEncoder(nn.Module):
         visual.load_state_dict(visual_state, strict=True)
         encoder_dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
         self.external = visual.to(device=device, dtype=encoder_dtype).eval()
-        try:
-            self.processor = AutoProcessor.from_pretrained(
-                str(model_directory), local_files_only=True
-            )
-        except (OSError, ValueError):
-            self.processor = AutoImageProcessor.from_pretrained(
-                str(model_directory), local_files_only=True
-            )
         self._qwen_patch_size = int(vision_config.patch_size)
         self._qwen_depth = int(vision_config.depth)
         external_dim = int(vision_config.out_hidden_size)
@@ -762,33 +754,6 @@ class FrozenRAEEncoder(nn.Module):
                 f"expected {self.latent_dim}"
             )
         return value
-
-    @staticmethod
-    def _as_btchw(media: Any) -> torch.Tensor:
-        """Normalize one image to a single-frame (1, C, H, W) float tensor."""
-        if not isinstance(media, torch.Tensor):
-            import io
-
-            import numpy as np
-            from PIL import Image
-
-            if isinstance(media, (bytes, bytearray)):
-                media = Image.open(io.BytesIO(media)).convert("RGB")
-            if hasattr(media, "convert"):
-                media = np.array(media.convert("RGB"), copy=True)
-            media = torch.from_numpy(np.asarray(media))
-        media = media.float()
-        if media.numel() and media.max() > 1:
-            media = media / 255.0
-        if media.ndim != 3:
-            raise ValueError("RAE encoder images must have CHW or HWC dimensions")
-        if media.shape[-1] in (1, 3, 4):
-            media = media[..., :3].permute(2, 0, 1)
-        elif media.shape[0] not in (1, 3, 4):
-            raise ValueError("RAE encoder images must be HWC or CHW with 3 channels")
-        else:
-            media = media[:3]
-        return media.unsqueeze(0)
 
     def forward(
         self,
@@ -850,6 +815,12 @@ class FrozenRAEEncoder(nn.Module):
                 )
             grid_thw = torch.as_tensor(processor_output[grid_key])
             batch_size = int(grid_thw.reshape(-1, 3).shape[0])
+        elif self.kind == "qwen":
+            raise ValueError(
+                "encoder.kind='qwen' encodes preprocessed mappings (the "
+                "collator's pixel_values/input and grid_thw); raw images are "
+                "not accepted"
+            )
         elif isinstance(images_BTCHW, torch.Tensor):
             raw_media = images_BTCHW.float()
             if raw_media.numel() and raw_media.max() > 1:
@@ -858,29 +829,14 @@ class FrozenRAEEncoder(nn.Module):
                 raise ValueError("RAE encoder tensor inputs must be BCHW images")
             images_BCHW = raw_media
             batch_size = raw_media.shape[0]
-            if self.kind == "qwen":
-                processor_output = self.processor(
-                    images=raw_media.detach(),
-                    do_rescale=False,
-                    return_tensors="pt",
-                )
         else:
             media_items = list(images_BTCHW)
             if not media_items:
                 raise ValueError("RAE encoder requires at least one image")
-            if self.kind == "qwen":
-                media_items = [self._as_btchw(item) for item in media_items]
-                batch_size = len(media_items)
-                processor_output = self.processor(
-                    images=[item[0].detach() for item in media_items],
-                    do_rescale=False,
-                    return_tensors="pt",
-                )
-            else:
-                if any(item.ndim != 3 for item in media_items):
-                    raise ValueError("RAE encoder image lists must contain CHW tensors")
-                images_BCHW = torch.stack([item.float() for item in media_items])
-                batch_size = images_BCHW.shape[0]
+            if any(item.ndim != 3 for item in media_items):
+                raise ValueError("RAE encoder image lists must contain CHW tensors")
+            images_BCHW = torch.stack([item.float() for item in media_items])
+            batch_size = images_BCHW.shape[0]
 
         if self.kind != "qwen" and images_BCHW is not None:
             if images_BCHW.shape[1] != 3:
@@ -896,18 +852,9 @@ class FrozenRAEEncoder(nn.Module):
         tokens_BLC: torch.Tensor | None = None
         latents_BCHW: torch.Tensor | None = None
         if self.external is not None and self.kind == "qwen":
+            # pixel_key/grid_key/grid_thw come from the Mapping dispatch above:
+            # kind='qwen' rejects every other input regime.
             assert processor_output is not None
-            pixel_key = next(
-                key
-                for key in ("pixel_values", "input")
-                if processor_output.get(key) is not None
-            )
-            grid_key = next(
-                key
-                for key in ("image_grid_thw", "grid_thw")
-                if processor_output.get(key) is not None
-            )
-            grid_thw = torch.as_tensor(processor_output[grid_key])
             external_device = next(self.external.parameters()).device
             external_dtype = next(self.external.parameters()).dtype
             model_inputs = {

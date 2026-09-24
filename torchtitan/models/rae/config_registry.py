@@ -115,6 +115,7 @@ def _image_dataloader(
     num_prefetch_batches: int = 2,
     num_processor_workers: int = 0,
     readahead_mb: int = 0,
+    supervision_patch_size: int | None = None,
 ) -> GrainDataLoader.Config:
     dataset = SingleDatasetConfig(
         source=HuggingFaceStreamingSource.Config(
@@ -132,6 +133,7 @@ def _image_dataloader(
             image_key=image_key,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
+            supervision_patch_size=supervision_patch_size,
         ),
     )
     return GrainDataLoader.Config(
@@ -243,7 +245,7 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
     token_budget = static_sequence_length - _STATIC_QWEN_MAX_TOKENS_PER_ITEM
     # The Qwen row processor is CPU-heavy; fan it out over spawned worker
     # processes so it does not starve the trainer's main thread.
-    num_processor_workers = 4
+    num_processor_workers = 6
     merge_size = 2
     encoder = RAEEncoderConfig(
         kind="qwen",
@@ -298,17 +300,22 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
             token_budget=token_budget,
             max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
             # One step consumes 8 microbatches per rank, so a 4-deep queue
-            # only covers half a step; 8 absorbs the multi-second read stalls
-            # measured on /mnt/sda1 (4 concurrent tar streams on one SATA
-            # disk: 96% util, r_await >100ms; step-time tail 24s -> 71s).
-            # Each queued batch is ~0.6-0.9 GiB of pinned memory per rank.
+            # only covers half a step. Ablation 2026-09-18 (SuperSpeed link):
+            # prefetch 4 costs ~1 s/step over 8. Each queued batch is
+            # ~0.6-0.9 GiB of pinned memory per rank.
             num_prefetch_batches=8,
             num_processor_workers=num_processor_workers,
-            # /mnt/sda1 is a USB-attached NVMe: a single buffered stream tops
-            # out far below the device's aggregate bandwidth (the kernel
-            # readahead window is latency-bound), so keep the page cache warm
-            # with preads.
-            readahead_mb=2048,
+            # /mnt/sda1 is a USB-attached NVMe: the kernel's per-stream
+            # readahead window stays latency-bound even at SuperSpeed
+            # (ablating the warmer off cost ~2 s/step), so keep the page
+            # cache warm with preads. 512 MB measured best post-link-fix
+            # (2048 was sized for the USB2 era and churns the cache for
+            # nothing).
+            readahead_mb=512,
+            # Media crosses the process boundary at the supervision target
+            # resolution (decoder output size) instead of the full processed
+            # resolution; the trainer's per-image resize then early-returns.
+            supervision_patch_size=model_spec.model.patch_size,
         ),
         optimizer=_dmuon(2e-4),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -343,8 +350,9 @@ def rae_stage1_openimages_static_96k_uvit() -> RAEStage1Trainer.Config:
                 max_pixels=_STATIC_QWEN_MAX_PIXELS,
                 token_budget=token_budget,
                 max_tokens_per_item=_STATIC_QWEN_MAX_TOKENS_PER_ITEM,
-                num_prefetch_batches=4,
+                num_prefetch_batches=8,
                 num_processor_workers=num_processor_workers,
+                supervision_patch_size=model_spec.model.patch_size,
             ),
         ),
         parallelism=ParallelismConfig(
