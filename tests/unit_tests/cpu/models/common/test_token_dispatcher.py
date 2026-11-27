@@ -28,7 +28,7 @@ class TestArgsortExpertIds(unittest.TestCase):
             self.assertTrue(
                 torch.equal(
                     token_indices_experts_sorted_N,
-                    torch.argsort(ids_TK.view(-1), stable=True),
+                    torch.argsort(ids_TK.view(-1), stable=True) // dispatcher.top_k,
                 )
             )
 

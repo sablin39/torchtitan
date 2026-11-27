@@ -25,6 +25,7 @@ optional-dependencies.dev = {file = ["requirements-dev.txt"]}
 optional-dependencies.rl = {file = [".ci/docker/requirements-rl.txt"]}
 optional-dependencies.vlm = {file = [".ci/docker/requirements-vlm.txt"]}
 optional-dependencies.flux = {file = [".ci/docker/requirements-flux.txt"]}
+optional-dependencies.kda-moe-cudnn = {file = [".ci/docker/requirements-kda-moe-cudnn.txt"]}
 
 [tool.codespell]
 skip = ["*.json"]
